@@ -1,0 +1,17 @@
+[package]
+name = "dns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+deku = "0.17.0"
+serde = { version = "1.0.207", features = ["derive"] }
+serde_json = "1.0.124"
+tokio = { version = "1.39.2", features = ["full"] }
+tokio-rustls = "0.26.0"
+webpki-roots = "0.26.3"
+rustls-pki-types = "1.8.0"
+rand = "0.8.5"
+ipnet = "2.10.0"
+async-recursion = "1.1.1"

@@ -1,0 +1,345 @@
+WHITESPACE = _{ (" " | "\t")+ ~ (NEWLINE{0,1} ~ " ")? }
+
+wsp = _{ " " | "\t" }
+fws = _{ (wsp* ~ NEWLINE)? ~ wsp+ }
+us_ascii = _{ '!'..'~'}
+
+//Tokens
+ctext    = { !( "(" | ")" | "\\") ~ ASCII }
+ccontent = { ctext | quoted_pair | comment }
+comment  = @{ "(" ~ (fws? ~ ccontent)* ~ fws? ~ ")" }
+cfws     = _{ ((fws? ~ comment)+ ~ fws?) | fws }
+text     = { '\u{01}'..'\u{09}' | "\u{0B}" | "\u{0C}" | '\u{0E}'..'\u{7F}' }
+
+word   = _{ atom | quoted_string }
+phrase = _{ word+ }
+vchar  = _{ '\u{21}'..'\u{7E}' }
+
+unstructured = _{ (fws? ~ vchar)* ~  wsp* }
+
+//Atom
+atom            = _{ cfws? ~ atext+ ~ cfws? }
+dot_atom        = _{ cfws? ~ dot_atom_text ~ cfws? }
+dot_atom_text   = _{ atext+ ~ ("." ~ atext+)* }
+
+atext =  _{
+    ASCII_ALPHA | ASCII_DIGIT |
+    "!" | "#" |
+    "$" | "%" |
+    "&" | "'" |
+    "*" | "+" |
+    "-" | "/" |
+    "=" | "?" |
+    "^" | "_" |
+    "`" | "{" |
+    "|" | "}" |
+    "~"
+}
+
+specials = _{
+   "(" | ")" |
+   "<" | ">" |
+   "[" | "]" |
+   ":" | ";" |
+   "@" | "\\" |
+   "," | "." |
+   "\""
+}
+
+
+//Quoted Strings
+quoted_pair   = { "\\" ~ text  }
+qtext         = { "\u{20}" | '\u{23}'..'\u{5B}' | '\u{5D}'..'\u{7E}' }
+qcontent      = { qtext | quoted_pair }
+quoted_string = @{ cfws? ~ "\"" ~ (fws? ~ qcontent)* ~ fws? ~ "\"" ~ cfws? }
+
+
+//Date and Time Specification
+date_time    =  _{ (day_of_week ~ ",")? ~ date ~ time ~ cfws? }
+day_of_week  =  { fws? ~ day_name }
+day_name     =  _{ "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun" }
+
+date         =  { day ~ month ~ year }
+year         =  { ASCII_DIGIT{4} }
+month        =  { month_name }
+month_name   =  _{ "Jan" | "Feb" | "Mar" | "Apr" | "May" | "Jun" | "Jul" | "Aug" | "Sep" | "Oct" | "Nov" | "Dec" }
+
+day          =  @{ fws? ~ ASCII_DIGIT{1,2} ~ fws }
+time         =  ${ time_of_day ~ zone }
+time_of_day  =  _{ hour ~ ":" ~ minute ~ (":" ~ second)? }
+hour         =  { ASCII_DIGIT{2} }
+minute       =  { ASCII_DIGIT{2} }
+second       =  { ASCII_DIGIT{2} }
+zone         =  { fws ~ ( "+" | "-" ) ~ ASCII_DIGIT{4} }
+
+//Address spec
+address         = _{ mailbox | group }
+mailbox         = _{ name_addr | addr_spec }
+name_addr       = _{ display_name? ~ angle_addr }
+angle_addr      = _{ cfws? ~ "<" ~ addr_spec ~ ">" ~ cfws? }
+group           = _{ display_name ~ ":" ~ (mailbox_list | cfws)? ~ ";" ~ cfws? }
+display_name    = { phrase }
+mailbox_list    = _{ mailbox ~ ("," ~ mailbox)* }
+address_list    = _{ address ~ ("," ~ address)* }
+
+//Addr-spec
+addr_spec       = _{ local_part ~ "@" ~ domain }
+local_part      = { dot_atom | quoted_string }
+domain          = { dot_atom | domain_literal }
+domain_literal  = { cfws? ~ "[" ~ (fws? ~ dcontent)* ~ fws? ~ "]" ~ cfws? }
+dcontent        = { dtext | quoted_pair }
+dtext           = { '\u{21}'..'\u{5A}' | '\u{5E}'..'\u{7E}' }
+
+
+//Originator fields
+orig_date = { ^"Date:" ~ date_time ~ NEWLINE }
+from      = { ^"From" ~ ":" ~ mailbox_list ~ NEWLINE }
+sender    = { ^"Sender:" ~ mailbox ~ NEWLINE }
+reply_to  = { ^"Reply-To:" ~ address_list ~ NEWLINE }
+
+//Destination address fields
+to  = { ^"To:" ~ address_list ~ NEWLINE }
+cc  = { ^"Cc:" ~ address_list ~ NEWLINE }
+bcc = { ^"Bcc:" ~ (address_list | cfws)? ~ NEWLINE }
+
+
+//Identification fields
+message_id      = { ^"Message-ID:" ~ msg_id  ~ NEWLINE }
+in_reply_to     = { ^"In-Reply-To:" ~ msg_id+ ~ NEWLINE }
+references      = { ^"References:" ~ msg_id+ ~ NEWLINE }
+msg_id          = _{ cfws? ~ "<" ~ id_left ~ "@" ~ id_right ~ ">" ~ cfws? }
+id_left         = { dot_atom_text | no_fold_quote }
+id_right        = { dot_atom_text | no_fold_literal }
+no_fold_quote   = _{ "\"" ~ (qtext | quoted_pair)* ~ "\"" }
+no_fold_literal = _{ "[" ~ dtext* ~ "]" }
+
+
+//Informational fields
+subject  = { ^"Subject:" ~ unstructured ~ NEWLINE }
+comments = { ^"Comments:" ~ unstructured ~ NEWLINE } 
+keywords = { ^"Keywords:" ~ phrase ~ ("," ~ phrase)* ~ NEWLINE }
+
+
+//Resent fields
+resent_date   = { ^"Resent-Date:" ~ date_time ~ NEWLINE }
+resent_from   = { ^"Resent-From:" ~ mailbox_list ~ NEWLINE }
+resent_sender = { ^"Resent-Sender:" ~ mailbox ~ NEWLINE }
+resent_to     = { ^"Resent-To:" ~ address_list ~ NEWLINE }
+resent_cc     = { ^"Resent-Cc:" ~ address_list ~ NEWLINE }
+resent_bcc    = { ^"Resent-Bcc:" ~ (address_list | cfws)? ~ NEWLINE }
+resent_msg_id = { ^"Resent-Message-ID:" ~ msg_id ~ NEWLINE }
+
+//Trace fields
+trace          = { return_path? ~ received+ }
+return_path    = { ^"Return-Path:" ~ path ~ NEWLINE }
+path           = _{ angle_addr | cfws? ~ "<" ~ cfws? ~ ">" ~ cfws? }
+received       = { ^"Received:" ~ received_token* ~ ";" ~ received_date ~ NEWLINE }
+received_token = @{ domain | word | angle_addr | addr_spec }
+received_date = { date_time }
+
+//Optional fields
+optional_field  = { field_name ~ ":" ~ field_value ~ NEWLINE }
+field_name      = { ftext+ }
+field_value     = { unstructured }
+ftext           = _{ '\u{21}'..'\u{39}' | '\u{3B}'..'\u{7E}'}
+
+
+
+// RFC2045 MIME
+quoted_printable  = { qp_line ~ (NEWLINE ~ qp_line)* }
+qp_line           = { (qp_segment ~ transport_padding ~ NEWLINE)* ~ qp_part ~ transport_padding }
+qp_part           = { qp_section }
+qp_segment        = { qp_section ~ (" " |  "\t")* ~ "=" }
+qp_section        = { ((ptext | " " | "\t")* ~ ptext)? }
+ptext             = { hex_octet | safe_char }
+safe_char         = { '!'..'<' | '>'..'-' }
+hex_octet         = { "=" ~ (ASCII_DIGIT | "A" | "B" | "C" | "D" | "E" | "F"){2} }
+transport_padding = { wsp* }
+
+//mime version
+mime_header = {
+  mime_version |
+  content_type |
+  content_encoding |
+  content_id |
+  content_description |
+  content_disposition
+}
+
+mime_version = { ^"MIME-Version" ~ ":" ~ version_header ~ NEWLINE }
+version_header = _{
+    ( comment? ~ major ~ comment? ~ "." ~ comment? ~ minor ~ comment?)
+}
+
+major = { ASCII_DIGIT+ }
+minor = { ASCII_DIGIT+ }
+
+version_major = _{ (major ~ "." | major) }
+version_minor = _{ (minor | "." ~ minor)}
+unwanted = _{ !(version_major | version_minor | NEWLINE) ~ comment }
+
+//Content Type header
+content_type = { ^"Content-Type" ~ ":" ~ type ~ "/" ~ subtype ~ (";" ~ parameter)* ~ NEWLINE}
+type         = { discrete_type | composite_type }
+
+discrete_type   = _{ "text" | "image" | "audio" | "video" | "application" | extension_token }
+composite_type  = { "message" | "multipart" | extension_token }
+extension_token = _{ ietf_token | x_token }
+
+ietf_token = _{ token }
+x_token    = @{ ("X-" | "x-") ~ token }
+subtype    = { extension_token | iana_token }
+iana_token = { token }
+parameter  = { attribute ~ "=" ~ value }
+attribute  = { token }
+value      = { (ASCII_ALPHANUMERIC | ")" | "(" | "." | quoted_string)+ }
+token      = _{ (!( tspecials | " " ) ~ us_ascii )+ }
+
+tspecials =  _{
+    "(" | ")" | "<" | ">" | "@" | "," | ";" | ":" | "\"" | "\\" | "/" | "[" | "]" | "?" | "="
+}
+
+//Content-Transfer-Encoding Syntax
+content_encoding  = { ^"Content-Transfer-Encoding" ~ ":" ~ mechanism ~ NEWLINE}
+mechanism = { "7bit" | "8bit" | "binary" | "quoted_printable" | "base64" | ietf_token | x_token }
+
+//Content Id, Description
+content_id = { ^"Content-ID" ~ ":" ~ msg_id ~ NEWLINE }
+content_description = { ^"Content-Description" ~ ":" ~ description ~ NEWLINE }
+description         = @{ text* }
+
+//Content Disposition
+content_disposition    = { ^"Content-Disposition" ~ ":" ~ disposition_type ~ (";" ~ disposition_param)* ~ NEWLINE}
+disposition_type       = { ^"inline" | ^"attachment" | extension_token }
+disposition_param       = { filename_param | creation_date_param | modification_date_param | read_date_param | size_param | parameter }
+filename_param          = { ^"filename" ~ "=" ~ value }
+creation_date_param     = { ^"creation-date" ~ "=" ~ quoted_date_time }
+modification_date_param = { ^"modification-date" ~ "=" ~ quoted_date_time }
+read_date_param         = { ^"read-date" ~ "=" ~ quoted_date_time }
+size_param              = { ^"size" ~ "=" ~ ASCII_DIGIT+ }
+quoted_date_time       = _{ quoted_string }
+
+
+
+//DKIM-Signature
+dkim_header = { ^"DKIM-Signature:"  ~ dkim_tags ~ (";" ~ (fws | NEWLINE)? ~ dkim_tags)+ }
+
+hyphenated_word = { ASCII_ALPHA ~ ( (ASCII_ALPHA | ASCII_DIGIT | "-")* ~ (ASCII_ALPHA | ASCII_DIGIT) )? }
+base64string    = { (ASCII_ALPHA | ASCII_DIGIT | "+" | "/" )+ ~ ("=" ~ "="?)? }
+sub_domain      = { (ASCII_ALPHA | ASCII_DIGIT) ~ ldh_str? }
+ldh_str         = _{ (ASCII_ALPHA | ASCII_DIGIT | "-" ) ~ (ASCII_ALPHA | ASCII_DIGIT)* }
+selector        = { sub_domain ~ ( "." ~ sub_domain )* }
+
+dkim_field_name = { dkim_ftext+ }
+dkim_ftext      = _{ '\u{21}'..'\u{39}' | '\u{3C}'..'\u{7E}'}
+
+dkim_quoted_printable = @{ (fws | hex_octet | dkim_safe_char)* }
+dkim_safe_char        = { '!'..':' | "<" | '>'..'~' }
+
+dkim_tags = _{
+    sig_v_tag |
+    sig_a_tag |
+    sig_b_tag |
+    sig_bh_tag |
+    sig_c_tag |
+    sig_d_tag |
+    sig_h_tag |
+    sig_i_tag |
+    sig_l_tag |
+    sig_q_tag |
+    sig_s_tag |
+    sig_t_tag |
+    sig_x_tag |
+    sig_z_tag
+}
+
+//version
+sig_v_tag = { "v" ~ "=" ~ dkim_version }
+dkim_version = { "1" }
+
+//algorithm
+sig_a_tag       = { "a" ~ "=" ~ sig_a_tag_alg }
+sig_a_tag_alg   = { sig_a_tag_k ~ "-" ~ sig_a_tag_h }
+sig_a_tag_k     = _{ "rsa" | x_sig_a_tag_k }
+sig_a_tag_h     = _{ "sha1" | "sha256" | x_sig_a_tag_h }
+x_sig_a_tag_k   = { ASCII_ALPHA ~ (ASCII_ALPHA | ASCII_DIGIT)* }
+x_sig_a_tag_h   = { ASCII_ALPHA ~ (ASCII_ALPHA | ASCII_DIGIT)* }
+
+//signature data
+sig_b_tag       = { "b" ~ "=" ~ base64string }
+
+//body hash
+sig_bh_tag      = { "bh" ~ "=" ~ base64string }
+
+//message canonicalization
+sig_c_tag       = { "c" ~ "=" ~ sig_c_tag_alg ~ ("/" ~ sig_c_tag_alg)? }
+sig_c_tag_alg   = { "simple" | "relaxed" | x_sig_c_tag_alg }
+x_sig_c_tag_alg = { hyphenated_word }
+
+//signing entity domain
+sig_d_tag       = { "d" ~ "=" ~ domain }
+//domain_name     = { sub_domain ~ ("." ~ sub_domain)+ }
+
+//signed header
+sig_h_tag       = { "h" ~ "=" ~ hdr_name ~ ( fws? ~ ":" ~ fws? ~ hdr_name )* }
+hdr_name        = _{ dkim_field_name }
+
+//identity of user/agent
+sig_i_tag = { "i" ~ "=" ~ local_part? ~ "@" ~ domain }
+
+//body length count
+sig_l_tag = { "l" ~ "=" ~ ASCII_DIGIT{1,76} }
+
+//query methods
+sig_q_tag        = { "q" ~ "=" ~ sig_q_tag_method ~ (":" ~ sig_q_tag_method)* }
+sig_q_tag_method = { "dns/txt" | x_sig_q_tag_type ~ ("/" ~ x_sig_q_tag_args)? }
+x_sig_q_tag_type = { hyphenated_word }
+x_sig_q_tag_args = { qp_hdr_value }
+
+//selector method
+sig_s_tag    = { "s" ~ "=" ~ selector }
+
+//timestamp
+sig_t_tag    = { "t" ~ "=" ~ ASCII_DIGIT{1,12} }
+
+//signature expiration
+sig_x_tag    = {"x" ~ "=" ~ ASCII_DIGIT{1,12} }
+
+//copied header fields
+sig_z_tag      = { "z" ~ "=" ~ sig_z_tag_copy ~ ("|" ~ sig_z_tag_copy )* }
+sig_z_tag_copy = _{ hdr_name ~ ":" ~ qp_hdr_value }
+qp_hdr_value   = { dkim_quoted_printable }
+
+
+//Fields
+fields = _{
+    (trace |
+     resent_date |
+     resent_from |
+     resent_sender |
+     resent_to |
+     resent_cc |
+     resent_bcc |
+     resent_msg_id |
+     dkim_header
+     )* ~
+    (orig_date |
+      from |
+      sender |
+      reply_to |
+      to |
+      cc |
+      bcc |
+      message_id |
+      in_reply_to |
+      references |
+      subject |
+      comments |
+      keywords |
+
+      //MIME
+      mime_header |
+
+      optional_field
+    )*
+}

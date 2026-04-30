@@ -1,0 +1,8 @@
+Return-Path: <foo@example.net>
+Received: from x.y.test
+   by example.net
+   via TCP
+   with ESMTP
+   id ABC12345
+   for <mary@example.net>;  21 Nov 1997 10:05:43 -0600
+

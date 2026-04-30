@@ -1,0 +1,20 @@
+[package]
+name = "dnsq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.15", features = ["derive"] }
+deku = "0.17.0"
+dns = { path = "../dns" }
+serde_json = "1.0.124"
+tokio = { version = "1.39.2", features = ["full"] }
+tokio-rustls = "0.26.0"
+webpki-roots = "0.26.3"
+rustls-pki-types = "1.8.0"
+rand = "0.8.5"
+serde = { version = "1.0.218", features = ["derive"] }
+
+[lints.clippy]
+upper_case_acronyms = "allow"

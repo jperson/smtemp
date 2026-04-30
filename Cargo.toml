@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "mailserv",
+    "dnsq",
+    "smtp",
+    "dns",
+    "sendmail",
+    "spf",
+    "dkim",
+    "imfpest",
+    "mimepest",
+    "mailparse",
+]
+
+[workspace.dependencies]
+thiserror = "2.0.12"
+pest = "2.7.15"
+pest_derive = { version = "2.7.15", features = ["grammar-extras"] }
+jiff = "0.2.5"
+

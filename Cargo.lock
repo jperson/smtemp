@@ -478,13 +478,9 @@ name = "dkim"
 version = "0.1.0"
 dependencies = [
  "base64",
- "hex-literal",
- "mail-parser",
- "regex",
- "serde",
- "serde_json",
+ "mailparse",
  "sha2",
- "tokio",
+ "thiserror 2.0.12",
 ]
 
 [[package]]
@@ -642,12 +638,6 @@ name = "hermit-abi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
-
-[[package]]
-name = "hex-literal"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 
 [[package]]
 name = "home"
@@ -883,7 +873,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93c3b9e5d8b17faf573330bbc43b37d6e918c0a3bf8a88e7d0a220ebc84af9fc"
 dependencies = [
  "encoding_rs",
- "serde",
 ]
 
 [[package]]

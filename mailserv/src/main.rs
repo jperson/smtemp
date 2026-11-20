@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::str;
 use std::time::Duration;
 use tokio::io::BufReader;
@@ -50,6 +50,7 @@ struct UserSession<'session> {
 
     pub session_id: Uuid,
     domain: &'session str,
+    dns: Ipv4Addr,
     peer: SocketAddr,
 
     #[serde(skip_serializing)]
@@ -71,6 +72,7 @@ impl<'session> UserSession<'session> {
 
             domain,
             greet: format!("220 {} SMTP service ready\n", domain),
+            dns: "1.1.1.1".parse::<Ipv4Addr>().unwrap(),
             peer,
 
             helo: None,
@@ -82,7 +84,7 @@ impl<'session> UserSession<'session> {
     }
 }
 
-impl smtp::SmtpSession for UserSession {
+impl smtp::SmtpSession for UserSession<'_> {
     #[instrument(skip(self), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     fn server_greet(
         &self,
@@ -101,6 +103,7 @@ impl smtp::SmtpSession for UserSession {
 
                 self.spf_result = Some(
                     spf::check_host(
+                        &self.dns,
                         self.peer.ip(),
                         &h.to_string(),
                         self.domain.to_string(),
@@ -133,6 +136,7 @@ impl smtp::SmtpSession for UserSession {
                 self.mail_from = Some(mail_from.to_string());
                 self.spf_result = Some(
                     spf::check_host(
+                        &self.dns,
                         self.peer.ip(),
                         &mail_from.to_string(),
                         self.domain.to_string(),

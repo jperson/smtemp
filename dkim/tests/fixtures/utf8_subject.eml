@@ -1,0 +1,6 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=From:Subject; bh=XUmXo+WyFo3pfhQ/D2RLsAM3dO/mZ+KWer5w9NnImC8=; b=dXRmOC1zdWJqZWN0
+From: Ivan Example <ivan@example.org>
+Subject: Réunion — naïve café ☕
+
+UTF-8 subject test body.

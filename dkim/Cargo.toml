@@ -5,10 +5,6 @@ edition = "2021"
 
 [dependencies]
 base64 = "0.22.1"
-hex-literal = "0.4.1"
-mail-parser = {version = "0.9.4", features = ["serde_support", "full_encoding"] }
-regex = "1.11.1"
 sha2 = "0.10.8"
-tokio = { version = "1.39.2", features = ["full"] }
-serde_json = "1.0.132"
-serde = { version = "1.0.214", features = ["derive"] }
+thiserror = { workspace = true }
+mailparse = { path = "../mailparse" }

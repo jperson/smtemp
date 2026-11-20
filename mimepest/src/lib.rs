@@ -23,7 +23,7 @@ pub struct MimeHeaderVersion {
 }
 
 impl<'p> TryFrom<Pairs<'p, Rule>> for MimeHeaderVersion {
-    type Error = MimeParsreError;
+    type Error = MimeParserError;
     fn try_from(pairs: Pairs<'p, Rule>) -> Result<Self, Self::Error> {
         let mut ret: MimeHeaderVersion = Default::default();
 

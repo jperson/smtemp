@@ -1,0 +1,6 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+ h=From:Subject; bh=hF8a5YGDgpB6SbuRwdHFbRGBjByin0J0kbLUngcsTBQ=; b=bGFyZS1sZg==
+From: Heidi Example <heidi@example.org>
+Subject: Bare LF
+
+LF only body.

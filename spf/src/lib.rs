@@ -1,4 +1,4 @@
-#![feature(addr_parse_ascii)]
+//#![feature(addr_parse_ascii)]
 use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
 use fqdn::FQDN;
@@ -51,7 +51,7 @@ pub async fn query_spf_record(dest: &Ipv4Addr, domain: &str, subs: &SpfMacroSubs
 
 #[async_recursion]
 pub async fn check_host(
-    server: &Ipv4Addr,
+    dns: &Ipv4Addr,
     peer: IpAddr,
     sender: &String,
     domain: String,
@@ -62,7 +62,7 @@ pub async fn check_host(
     let mut exp: Option<&SpfModifier> = None;
 
     let subs = SpfMacroSubs::new(peer, sender, &domain, helo);
-    let spf = query_spf_record(server, domain.as_str(), &subs).await?;
+    let spf = query_spf_record(dns, domain.as_str(), &subs).await?;
 
     for term in spf.terms.iter() {
         match term {
@@ -80,7 +80,7 @@ pub async fn check_host(
             }
             SpfTerm::Modifier(_) => continue,
             SpfTerm::Directive(d) => {
-                result = check_directive(server, peer, sender, helo, d).await;
+                result = check_directive(dns, peer, sender, helo, d).await;
                 if result.is_some() {
                     break;
                 }
@@ -90,7 +90,7 @@ pub async fn check_host(
 
     if result.is_none() {
         if let Some(m) = redirect {
-            result = check_host(server, peer, sender, m.value.clone(), helo)
+            result = check_host(dns, peer, sender, m.value.clone(), helo)
                 .await
                 .ok();
         }
@@ -99,7 +99,7 @@ pub async fn check_host(
     match result {
         Some(SpfResult::Fail) if exp.is_some() => {
             if let Some(d) = exp {
-                check_host(server, peer, sender, d.value.clone(), helo).await
+                check_host(dns, peer, sender, d.value.clone(), helo).await
             } else {
                 Err(anyhow!("check_host failed"))
             }
@@ -207,7 +207,7 @@ async fn check_ptr_record(
 }
 
 async fn check_directive(
-    server: &Ipv4Addr,
+    dns: &Ipv4Addr,
     peer: IpAddr,
     sender: &String,
     helo: &Option<String>,
@@ -224,7 +224,7 @@ async fn check_directive(
 
         //TODO need to check qualifier for each branch
         (SpfQualifier::Plus, SpfMechanism::Include(s)) => {
-            match check_host(server, peer, sender, s.to_string(), helo)
+            match check_host(dns, peer, sender, s.to_string(), helo)
                 .await
                 .ok()?
             {
@@ -238,7 +238,7 @@ async fn check_directive(
             }
         }
         (SpfQualifier::Dash, SpfMechanism::Include(s)) => {
-            match check_host(server, peer, sender, s.to_string(), helo)
+            match check_host(dns, peer, sender, s.to_string(), helo)
                 .await
                 .ok()?
             {
@@ -252,7 +252,7 @@ async fn check_directive(
             }
         }
         (SpfQualifier::Question, SpfMechanism::Include(s)) => {
-            match check_host(server, peer, sender, s.to_string(), helo)
+            match check_host(dns, peer, sender, s.to_string(), helo)
                 .await
                 .ok()?
             {
@@ -266,7 +266,7 @@ async fn check_directive(
             }
         }
         (SpfQualifier::Tilde, SpfMechanism::Include(s)) => {
-            match check_host(server, peer, sender, s.to_string(), helo)
+            match check_host(dns, peer, sender, s.to_string(), helo)
                 .await
                 .ok()?
             {
@@ -281,42 +281,42 @@ async fn check_directive(
         }
 
         (SpfQualifier::Plus, SpfMechanism::A(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Pass).await
+            check_a_record(dns, peer, s, &SpfResult::Pass).await
         }
         (SpfQualifier::Dash, SpfMechanism::A(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Fail).await
+            check_a_record(dns, peer, s, &SpfResult::Fail).await
         }
         (SpfQualifier::Question, SpfMechanism::A(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Neutral).await
+            check_a_record(dns, peer, s, &SpfResult::Neutral).await
         }
         (SpfQualifier::Tilde, SpfMechanism::A(s)) => {
-            check_a_record(server, peer, s, &SpfResult::SoftFail).await
+            check_a_record(dns, peer, s, &SpfResult::SoftFail).await
         }
         //
         (SpfQualifier::Plus, SpfMechanism::Mx(s)) => {
-            check_mx_record(server, peer, s, &SpfResult::Pass).await
+            check_mx_record(dns, peer, s, &SpfResult::Pass).await
         }
         (SpfQualifier::Dash, SpfMechanism::Mx(s)) => {
-            check_mx_record(server, peer, s, &SpfResult::Fail).await
+            check_mx_record(dns, peer, s, &SpfResult::Fail).await
         }
         (SpfQualifier::Question, SpfMechanism::Mx(s)) => {
-            check_mx_record(server, peer, s, &SpfResult::Neutral).await
+            check_mx_record(dns, peer, s, &SpfResult::Neutral).await
         }
         (SpfQualifier::Tilde, SpfMechanism::Mx(s)) => {
-            check_mx_record(server, peer, s, &SpfResult::SoftFail).await
+            check_mx_record(dns, peer, s, &SpfResult::SoftFail).await
         }
 
         (SpfQualifier::Plus, SpfMechanism::Ptr(s)) => {
-            check_ptr_record(server, peer, s, &SpfResult::Pass).await
+            check_ptr_record(dns, peer, s, &SpfResult::Pass).await
         }
         (SpfQualifier::Dash, SpfMechanism::Ptr(s)) => {
-            check_ptr_record(server, peer, s, &SpfResult::Fail).await
+            check_ptr_record(dns, peer, s, &SpfResult::Fail).await
         }
         (SpfQualifier::Question, SpfMechanism::Ptr(s)) => {
-            check_ptr_record(server, peer, s, &SpfResult::Neutral).await
+            check_ptr_record(dns, peer, s, &SpfResult::Neutral).await
         }
         (SpfQualifier::Tilde, SpfMechanism::Ptr(s)) => {
-            check_ptr_record(server, peer, s, &SpfResult::SoftFail).await
+            check_ptr_record(dns, peer, s, &SpfResult::SoftFail).await
         }
 
         (SpfQualifier::Plus, SpfMechanism::Ip4(ip)) => check_ipv4(peer, ip, &SpfResult::Pass),
@@ -334,16 +334,16 @@ async fn check_directive(
         (SpfQualifier::Tilde, SpfMechanism::Ip6(ip)) => check_ipv6(peer, ip, &SpfResult::SoftFail),
 
         (SpfQualifier::Plus, SpfMechanism::Exists(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Pass).await
+            check_a_record(dns, peer, s, &SpfResult::Pass).await
         }
         (SpfQualifier::Dash, SpfMechanism::Exists(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Fail).await
+            check_a_record(dns, peer, s, &SpfResult::Fail).await
         }
         (SpfQualifier::Question, SpfMechanism::Exists(s)) => {
-            check_a_record(server, peer, s, &SpfResult::Neutral).await
+            check_a_record(dns, peer, s, &SpfResult::Neutral).await
         }
         (SpfQualifier::Tilde, SpfMechanism::Exists(s)) => {
-            check_a_record(server, peer, s, &SpfResult::SoftFail).await
+            check_a_record(dns, peer, s, &SpfResult::SoftFail).await
         }
     }
 }

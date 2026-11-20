@@ -25,6 +25,197 @@ pub enum MailHeaderError {
 
     #[error("Unknown")]
     Unknown,
+
+    #[error("Missing header/body separator")]
+    MissingSeparator,
+
+    #[error("Header block is not valid UTF-8")]
+    InvalidUtf8,
+}
+
+// ---------------------------------------------------------------------------
+// Public parsing API
+// ---------------------------------------------------------------------------
+
+/// A single message header with its raw, unparsed bytes preserved.
+///
+/// Order and duplicates are retained in [`ParsedMessage::headers`]; this is
+/// the representation to use for byte-exact operations such as DKIM
+/// canonicalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawHeader<'m> {
+    /// Field name without the trailing colon, exactly as it appeared.
+    pub name: &'m [u8],
+    /// Everything after the colon up to the end of the last (folded) line,
+    /// excluding the final line terminator. Embedded CRLF/LF of folded
+    /// continuation lines and all whitespace are preserved verbatim.
+    pub raw_value: &'m [u8],
+}
+
+impl RawHeader<'_> {
+    /// ASCII case-insensitive comparison of this header's name against
+    /// `name` (header field names are case-insensitive per RFC 5322).
+    pub fn name_eq(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_bytes())
+    }
+}
+
+/// A fully parsed message: ordered raw headers, the typed header view, and
+/// the raw body.
+#[derive(Debug)]
+pub struct ParsedMessage<'m> {
+    /// All headers in their original order, duplicates preserved.
+    pub headers: Vec<RawHeader<'m>>,
+    /// Best-effort typed (RFC 5322/MIME) view. Headers that fail typed
+    /// parsing are still available in `headers`.
+    pub typed: MailHeaders<'m>,
+    /// Raw body bytes: everything after the blank line separating headers
+    /// from the body. Line terminators are preserved verbatim (CRLF or LF).
+    pub body: &'m [u8],
+}
+
+/// Parse a complete RFC 5322 message: header block, blank-line separator, and
+/// body.
+///
+/// The header block must be valid UTF-8 (typical for mail headers). For
+/// byte-level access on messages with non-UTF-8 headers, use
+/// [`split_message`] and [`extract_raw_headers`] directly.
+///
+/// # Example
+///
+/// ```
+/// let raw = b"From: Alice <alice@example.com>\r\nSubject: Hi\r\n\r\nHello\r\n";
+/// let msg = mailparse::parse_message(raw).unwrap();
+///
+/// assert_eq!(msg.headers.len(), 2);
+/// assert!(msg.headers[0].name_eq("from"));
+/// assert_eq!(msg.headers[1].raw_value, b" Hi");
+/// assert_eq!(msg.body, b"Hello\r\n");
+/// assert_eq!(msg.typed.from.as_ref().unwrap()[0].local_part, "alice");
+/// ```
+pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage<'_>, MailHeaderError> {
+    let (header_block, body) = split_message(raw)?;
+    let headers = extract_raw_headers(header_block);
+    let header_str =
+        std::str::from_utf8(header_block).map_err(|_| MailHeaderError::InvalidUtf8)?;
+    let typed = parse_headers(header_str)?;
+    Ok(ParsedMessage {
+        headers,
+        typed,
+        body,
+    })
+}
+
+/// Parse a header block (each header terminated by CRLF or LF) into the
+/// typed [`MailHeaders`] view.
+///
+/// Lenient: unknown or malformed headers fall back to `optional_field` or are
+/// skipped, so a best-effort typed view is returned for most inputs.
+pub fn parse_headers(src: &str) -> Result<MailHeaders<'_>, MailHeaderError> {
+    let pairs = MailParser::parse(Rule::fields, src).map_err(|_| MailHeaderError::InvalidHeader)?;
+    pairs.try_into()
+}
+
+/// Split a raw message at the first blank line into `(header_block, body)`.
+///
+/// The header block retains the line terminator of its final header (each
+/// header grammar rule consumes its own terminator). Accepts CRLF, LF, or
+/// mixed line endings. An empty input yields empty headers and body; an
+/// input beginning with a blank line yields an empty header block. An input
+/// with no blank line is rejected with [`MailHeaderError::MissingSeparator`].
+pub fn split_message(raw: &[u8]) -> Result<(&[u8], &[u8]), MailHeaderError> {
+    if raw.is_empty() {
+        return Ok((&[], &[]));
+    }
+    if let Some(body) = raw.strip_prefix(b"\r\n") {
+        return Ok((&[], body));
+    }
+    if let Some(body) = raw.strip_prefix(b"\n") {
+        return Ok((&[], body));
+    }
+
+    for i in 0..raw.len() {
+        if raw[i] != b'\n' {
+            continue;
+        }
+        match raw.get(i + 1) {
+            // Last header ended with LF; the blank line is a bare LF.
+            Some(b'\n') => return Ok((&raw[..i + 1], &raw[i + 2..])),
+            // Last header ended with CRLF (or LF); the blank line is CRLF.
+            Some(b'\r') if raw.get(i + 2) == Some(&b'\n') => {
+                return Ok((&raw[..i + 1], &raw[i + 3..]))
+            }
+            _ => {}
+        }
+    }
+
+    Err(MailHeaderError::MissingSeparator)
+}
+
+/// Split a header block into [`RawHeader`]s, preserving order, duplicates,
+/// folding, and exact bytes.
+///
+/// Lines that neither contain a colon nor continue a previous header are
+/// malformed and skipped.
+pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
+    struct HeaderAcc<'a> {
+        name: &'a [u8],
+        value_start: usize,
+        value_end: usize,
+    }
+
+    let mut acc: Vec<HeaderAcc> = Vec::new();
+    let mut line_start = 0usize;
+
+    for (i, &b) in header_block.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        let content_end = if i > line_start && header_block[i - 1] == b'\r' {
+            i - 1
+        } else {
+            i
+        };
+        let line = &header_block[line_start..content_end];
+
+        if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
+            // Folded continuation: extend the previous header's raw value.
+            if let Some(last) = acc.last_mut() {
+                last.value_end = content_end;
+            }
+        } else if let Some(colon) = line.iter().position(|&c| c == b':') {
+            acc.push(HeaderAcc {
+                name: &header_block[line_start..line_start + colon],
+                value_start: line_start + colon + 1,
+                value_end: content_end,
+            });
+        }
+
+        line_start = i + 1;
+    }
+
+    // Tolerate a final header line without a line terminator.
+    if line_start < header_block.len() {
+        let line = &header_block[line_start..];
+        if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
+            if let Some(last) = acc.last_mut() {
+                last.value_end = header_block.len();
+            }
+        } else if let Some(colon) = line.iter().position(|&c| c == b':') {
+            acc.push(HeaderAcc {
+                name: &header_block[line_start..line_start + colon],
+                value_start: line_start + colon + 1,
+                value_end: header_block.len(),
+            });
+        }
+    }
+
+    acc.into_iter()
+        .map(|h| RawHeader {
+            name: h.name,
+            raw_value: &header_block[h.value_start..h.value_end],
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -32,64 +223,73 @@ pub struct DateZoned;
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Mailbox<'p> {
-    display_name: &'p str,
-    local_part: &'p str,
-    domain: &'p str,
+    pub display_name: &'p str,
+    pub local_part: &'p str,
+    pub domain: &'p str,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MsgId<'p> {
-    id_left: &'p str,
-    id_right: &'p str,
+    pub id_left: &'p str,
+    pub id_right: &'p str,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Trace<'p> {
-    return_path: Option<&'p str>,
-    received_tokens: Vec<&'p str>,
-    date_time: Zoned,
+    pub return_path: Option<&'p str>,
+    pub received_tokens: Vec<&'p str>,
+    pub date_time: Zoned,
+}
+
+/// A parsed `DKIM-Signature` header. The raw tag list is retained verbatim
+/// (with folding); consumers parse the individual tags per RFC 6376.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DkimHeader<'p> {
+    /// Everything after the `DKIM-Signature:` colon, trimmed of surrounding
+    /// whitespace. Folded lines are preserved.
+    pub raw: &'p str,
 }
 
 #[derive(Debug, Default)]
-pub struct DkimHeader;
-
-#[derive(Debug, Default)]
 pub struct MimeVersion<'p> {
-    major: &'p str,
-    minor: &'p str,
+    pub major: &'p str,
+    pub minor: &'p str,
 }
 
 #[derive(Debug, Default)]
 pub struct ContentType<'p> {
-    content_type: &'p str,
-    content_subtype: &'p str,
-    attribute: &'p str,
-    value: &'p str,
+    pub content_type: &'p str,
+    pub content_subtype: &'p str,
+    /// Last-seen parameter's attribute and value.
+    pub attribute: &'p str,
+    pub value: &'p str,
+    /// All parameters in order of appearance.
+    pub parameters: Vec<(&'p str, &'p str)>,
 }
 
 #[derive(Debug, Default)]
 pub struct ContentEncoding<'p> {
-    mechanism: &'p str,
+    pub mechanism: &'p str,
 }
 
 #[derive(Debug, Default)]
 pub struct ContentDescription<'p> {
-    description: &'p str,
+    pub description: &'p str,
 }
 
 #[derive(Debug, Default)]
 pub struct ContentDisposition<'p> {
-    disposition: &'p str,
+    pub disposition: &'p str,
 }
 
 #[derive(Debug, Default)]
 pub struct MimeHeader<'p> {
-    mime_version: Option<MimeVersion<'p>>,
-    content_type: Option<ContentType<'p>>,
-    content_encoding: Option<ContentEncoding<'p>>,
-    content_id: Option<MsgId<'p>>,
-    content_description: Option<ContentDescription<'p>>,
-    content_disposition: Option<ContentDisposition<'p>>,
+    pub mime_version: Option<MimeVersion<'p>>,
+    pub content_type: Option<ContentType<'p>>,
+    pub content_encoding: Option<ContentEncoding<'p>>,
+    pub content_id: Option<MsgId<'p>>,
+    pub content_description: Option<ContentDescription<'p>>,
+    pub content_disposition: Option<ContentDisposition<'p>>,
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +305,7 @@ pub struct MailHeaders<'h> {
     pub resent_bcc: Vec<Mailbox<'h>>,
     pub resent_msg_id: Vec<MsgId<'h>>,
 
-    pub dkim: Option<DkimHeader>,
+    pub dkim: Vec<DkimHeader<'h>>,
 
     pub orig_date: Option<Zoned>,
     pub from: Option<Vec<Mailbox<'h>>>,
@@ -126,43 +326,79 @@ pub struct MailHeaders<'h> {
     pub optional_field: HashMap<&'h str, &'h str>,
 }
 
-macro_rules! mailbox {
-    ($rules:ident) => {
-        Mailbox {
-            display_name: $rules
-                .next()
-                .ok_or(MailHeaderError::InvalidMailbox)?
-                .as_str()
-                .trim(),
-            local_part: $rules
-                .next()
-                .ok_or(MailHeaderError::InvalidMailbox)?
-                .as_str()
-                .trim(),
-            domain: $rules
-                .next()
-                .ok_or(MailHeaderError::InvalidMailbox)?
-                .as_str()
-                .trim(),
+/// Collect every mailbox (local_part/domain pair) reachable in `pairs`,
+/// skipping display names, comments, folding whitespace, and other noise
+/// pairs. `display_name` pairs attach to the next mailbox. Groups are
+/// recursed into, yielding their member mailboxes.
+macro_rules! mailboxes {
+    ($rules:ident) => {{
+        fn walk<'p, I>(pairs: I, out: &mut Vec<Mailbox<'p>>)
+        where
+            I: IntoIterator<Item = Pair<'p, Rule>>,
+        {
+            let mut pending_display: Option<&'p str> = None;
+            let mut current: Option<Mailbox<'p>> = None;
+
+            for p in pairs {
+                match p.as_rule() {
+                    Rule::display_name => pending_display = Some(p.as_str().trim()),
+                    Rule::local_part => {
+                        current = Some(Mailbox {
+                            display_name: pending_display.take().unwrap_or(""),
+                            local_part: p.as_str().trim(),
+                            domain: "",
+                        });
+                    }
+                    Rule::domain => {
+                        if let Some(mut m) = current.take() {
+                            m.domain = p.as_str().trim();
+                            out.push(m);
+                        }
+                    }
+                    _ => walk(p.into_inner(), out),
+                }
+            }
         }
-    };
+
+        let mut out: Vec<Mailbox> = Vec::new();
+        walk($rules, &mut out);
+        out
+    }};
 }
 
-macro_rules! msg_id {
-    ($rules:ident) => {
-        MsgId {
-            id_left: $rules
-                .next()
-                .ok_or(MailHeaderError::InvalidHeader)?
-                .as_str()
-                .trim(),
-            id_right: $rules
-                .next()
-                .ok_or(MailHeaderError::InvalidHeader)?
-                .as_str()
-                .trim(),
+/// Collect every msg-id (`id_left`/`id_right` pair) reachable in `pairs`,
+/// skipping comments, folding whitespace, and other noise pairs.
+macro_rules! msg_ids {
+    ($rules:ident) => {{
+        fn walk<'p, I>(pairs: I, out: &mut Vec<MsgId<'p>>)
+        where
+            I: IntoIterator<Item = Pair<'p, Rule>>,
+        {
+            let mut current: Option<MsgId<'p>> = None;
+
+            for p in pairs {
+                match p.as_rule() {
+                    Rule::id_left => {
+                        current = Some(MsgId {
+                            id_left: p.as_str().trim(),
+                            id_right: "",
+                        })
+                    }
+                    Rule::id_right => {
+                        if let Some(mut m) = current.take() {
+                            m.id_right = p.as_str().trim();
+                            out.push(m);
+                        }
+                    }
+                    _ => walk(p.into_inner(), out),
+                }
+            }
         }
-    };
+
+        let mut out: Vec<MsgId> = Vec::new();
+        walk($rules, &mut out);
+        out
+    }};
 }
 
 impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
@@ -173,14 +409,18 @@ impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
         for item in pairs.into_iter() {
             match item.as_rule() {
                 // Trace fields
-                // Rule::trace => trace(&mut mh)?,
+                Rule::trace => trace(&mut mh, item)?,
+                Rule::return_path => return_path(&mut mh, item)?,
+                Rule::received => received(&mut mh, item)?,
+
                 Rule::resent_date => resent_date(&mut mh, item)?,
                 Rule::resent_from => resent_from(&mut mh, item)?,
+                Rule::resent_sender => resent_sender(&mut mh, item)?,
                 Rule::resent_to => resent_to(&mut mh, item)?,
                 Rule::resent_cc => resent_cc(&mut mh, item)?,
                 Rule::resent_bcc => resent_bcc(&mut mh, item)?,
                 Rule::resent_msg_id => resent_msg_id(&mut mh, item)?,
-                // Rule::dkim_header => dkim_header(&mut mh)?,
+                Rule::dkim_header => dkim_header(&mut mh, item)?,
 
                 // Originator fields
                 Rule::orig_date => orig_date(&mut mh, item)?,
@@ -209,7 +449,9 @@ impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
                 //Optional fields
                 Rule::optional_field => optional_field(&mut mh, item)?,
 
-                _ => println!("none"),
+                // The `fields` grammar only produces the rules above;
+                // new grammar rules must be handled here.
+                _ => {}
             }
         }
 
@@ -218,23 +460,81 @@ impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
 }
 
 fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut th = Trace::default();
+    let mut return_path: Option<&'p str> = None;
+    let mut receiveds: Vec<Pair<'p, Rule>> = Vec::new();
 
     for rule in item.into_inner() {
         match rule.as_rule() {
-            Rule::received => {
-                for token in rule.into_inner() {
-                    match token.as_rule() {
-                        Rule::received_token => th.received_tokens.push(token.as_str().trim()),
-                        Rule::received_date => {
-                            th.date_time = rfc2822::parse(token.as_str().trim())
-                                .map_err(|_| MailHeaderError::InvalidHeader)?
-                        }
-                        _ => continue,
-                    }
-                }
+            Rule::return_path => {
+                return_path = Some(
+                    rule.as_str()
+                        .split_once(':')
+                        .map(|(_, v)| v)
+                        .unwrap_or("")
+                        .trim(),
+                )
             }
-            Rule::return_path => th.return_path = Some(rule.as_str()[13..].trim()),
+            Rule::received => receiveds.push(rule),
+            _ => continue,
+        }
+    }
+
+    // Each Received line is its own trace entry, as in real messages.
+    let no_receiveds = receiveds.is_empty();
+    for received in receiveds {
+        let mut th = Trace {
+            return_path,
+            ..Default::default()
+        };
+        for token in received.into_inner() {
+            match token.as_rule() {
+                Rule::received_token => th.received_tokens.push(token.as_str().trim()),
+                Rule::received_date => {
+                    th.date_time = rfc2822::parse(token.as_str().trim())
+                        .map_err(|_| MailHeaderError::InvalidDate)?
+                }
+                _ => continue,
+            }
+        }
+        mh.trace.push(th);
+    }
+
+    // A trace block may be just a Return-Path with no Received lines.
+    if no_receiveds && return_path.is_some() {
+        mh.trace.push(Trace {
+            return_path,
+            ..Default::default()
+        });
+    }
+
+    Ok(())
+}
+
+/// Standalone `Return-Path` header (not part of a trace block).
+fn return_path<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
+    let value = item
+        .as_str()
+        .split_once(':')
+        .map(|(_, v)| v)
+        .unwrap_or("")
+        .trim();
+    mh.trace.push(Trace {
+        return_path: Some(value),
+        ..Default::default()
+    });
+    Ok(())
+}
+
+/// Standalone `Received` header (not part of a trace block).
+fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
+    let mut th = Trace::default();
+    for token in item.into_inner() {
+        match token.as_rule() {
+            Rule::received_token => th.received_tokens.push(token.as_str().trim()),
+            Rule::received_date => {
+                th.date_time =
+                    rfc2822::parse(token.as_str().trim()).map_err(|_| MailHeaderError::InvalidDate)?
+            }
             _ => continue,
         }
     }
@@ -251,34 +551,26 @@ fn resent_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
 }
 
 fn resent_from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    while rules.peek().is_some() {
-        mh.resent_from.push(mailbox!(rules));
-    }
+    let rules = item.into_inner();
+    mh.resent_from.extend(mailboxes!(rules));
     Ok(())
 }
 
 fn resent_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    while rules.peek().is_some() {
-        mh.resent_to.push(mailbox!(rules));
-    }
+    let rules = item.into_inner();
+    mh.resent_to.extend(mailboxes!(rules));
     Ok(())
 }
 
 fn resent_cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    while rules.peek().is_some() {
-        mh.resent_cc.push(mailbox!(rules));
-    }
+    let rules = item.into_inner();
+    mh.resent_cc.extend(mailboxes!(rules));
     Ok(())
 }
 
 fn resent_bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    while rules.peek().is_some() {
-        mh.resent_bcc.push(mailbox!(rules));
-    }
+    let rules = item.into_inner();
+    mh.resent_bcc.extend(mailboxes!(rules));
     Ok(())
 }
 
@@ -286,14 +578,29 @@ fn resent_msg_id<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
 ) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    while rules.peek().is_some() {
-        mh.resent_msg_id.push(msg_id!(rules));
-    }
+    let rules = item.into_inner();
+    mh.resent_msg_id.extend(msg_ids!(rules));
     Ok(())
 }
 
-fn dkim_header(_mh: &mut MailHeaders) -> Result<(), MailHeaderError> {
+fn dkim_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
+    let raw = item
+        .as_str()
+        .split_once(':')
+        .map(|(_, v)| v)
+        .unwrap_or("")
+        .trim();
+    mh.dkim.push(DkimHeader { raw });
+    Ok(())
+}
+
+fn resent_sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
+    let rules = item.into_inner();
+    let m = mailboxes!(rules)
+        .into_iter()
+        .next()
+        .ok_or(MailHeaderError::InvalidMailbox)?;
+    mh.resent_sender.push(m);
     Ok(())
 }
 
@@ -310,14 +617,8 @@ fn orig_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), M
 
 fn from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.from.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<Mailbox> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(mailbox!(rules));
-        }
-
-        mh.from = Some(vs);
+        let rules = item.into_inner();
+        mh.from = Some(mailboxes!(rules));
     } else {
         return Err(MailHeaderError::InvalidMailbox);
     }
@@ -327,8 +628,12 @@ fn from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHe
 
 fn sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.sender.is_none() {
-        let mut rules = item.into_inner();
-        mh.sender = Some(mailbox!(rules));
+        let rules = item.into_inner();
+        let m = mailboxes!(rules)
+            .into_iter()
+            .next()
+            .ok_or(MailHeaderError::InvalidMailbox)?;
+        mh.sender = Some(m);
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -337,13 +642,8 @@ fn sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Mail
 
 fn reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.reply_to.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<Mailbox<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(mailbox!(rules));
-        }
-        mh.reply_to = Some(vs);
+        let rules = item.into_inner();
+        mh.reply_to = Some(mailboxes!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -353,13 +653,8 @@ fn reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
 //Destination fields
 fn to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.to.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<Mailbox<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(mailbox!(rules));
-        }
-        mh.to = Some(vs);
+        let rules = item.into_inner();
+        mh.to = Some(mailboxes!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -369,13 +664,8 @@ fn to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHead
 
 fn cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.cc.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<Mailbox<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(mailbox!(rules));
-        }
-        mh.cc = Some(vs);
+        let rules = item.into_inner();
+        mh.cc = Some(mailboxes!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -385,13 +675,8 @@ fn cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHead
 
 fn bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.bcc.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<Mailbox<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(mailbox!(rules));
-        }
-        mh.bcc = Some(vs);
+        let rules = item.into_inner();
+        mh.bcc = Some(mailboxes!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -402,8 +687,12 @@ fn bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHea
 //Identification fields
 fn message_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.message_id.is_none() {
-        let mut rules = item.into_inner();
-        mh.message_id = Some(msg_id!(rules));
+        let rules = item.into_inner();
+        let m = msg_ids!(rules)
+            .into_iter()
+            .next()
+            .ok_or(MailHeaderError::InvalidHeader)?;
+        mh.message_id = Some(m);
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -413,13 +702,8 @@ fn message_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), 
 
 fn in_reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.in_reply_to.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<MsgId<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(msg_id!(rules));
-        }
-        mh.in_reply_to = Some(vs);
+        let rules = item.into_inner();
+        mh.in_reply_to = Some(msg_ids!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -429,13 +713,8 @@ fn in_reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
 
 fn references<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.references.is_none() {
-        let mut rules = item.into_inner();
-        let mut vs: Vec<MsgId<'p>> = Vec::new();
-
-        while rules.peek().is_some() {
-            vs.push(msg_id!(rules));
-        }
-        mh.references = Some(vs);
+        let rules = item.into_inner();
+        mh.references = Some(msg_ids!(rules));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -466,7 +745,7 @@ fn keywords<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
 
 //MIME
 fn mime_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
+    let rules = item.into_inner();
 
     if mh.mime_header.is_none() {
         mh.mime_header = Some(MimeHeader::default());
@@ -514,15 +793,18 @@ fn content_type<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<()
             Rule::r#type => ctype.content_type = rule.as_str().trim(),
             Rule::subtype => ctype.content_subtype = rule.as_str().trim(),
             Rule::parameter => {
-                let rules = rule.into_inner();
-
-                for rule in rules {
+                let mut attr = "";
+                let mut val = "";
+                for rule in rule.into_inner() {
                     match rule.as_rule() {
-                        Rule::attribute => ctype.attribute = rule.as_str().trim(),
-                        Rule::value => ctype.value = rule.as_str().trim(),
+                        Rule::attribute => attr = rule.as_str().trim(),
+                        Rule::value => val = rule.as_str().trim(),
                         _ => continue,
-                    };
+                    }
                 }
+                ctype.attribute = attr;
+                ctype.value = val;
+                ctype.parameters.push((attr, val));
             }
             _ => continue,
         }
@@ -555,10 +837,13 @@ fn content_encoding<'p>(
 }
 
 fn content_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-
     if let Some(mh) = &mut mh.mime_header {
-        mh.content_id = Some(msg_id!(rules));
+        let rules = item.into_inner();
+        let m = msg_ids!(rules)
+            .into_iter()
+            .next()
+            .ok_or(MailHeaderError::InvalidHeader)?;
+        mh.content_id = Some(m);
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -570,7 +855,7 @@ fn content_description<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
 ) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
+    let rules = item.into_inner();
 
     if let Some(mh) = &mut mh.mime_header {
         for rule in rules {
@@ -592,19 +877,8 @@ fn content_disposition<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
 ) -> Result<(), MailHeaderError> {
-    let mut rules = item.into_inner();
-    let mut dis = ContentDisposition::default();
-
-    println!("{:#?}", rules);
-
-    // if let Some(mh) = &mut mh.mime_header {
-    //     for rule in rules {
-    //         match rule.as_rule() {
-    //             Rule::disposition_type => continue,
-    //             _ => continue,
-    //         }
-    //     }
-    // }
+    // TODO: parse disposition type and parameters
+    let _ = (mh, item);
     Ok(())
 }
 
@@ -1023,7 +1297,13 @@ mod tests {
         assert!(mh.mime_header.is_some());
 
         let h = mh.mime_header.unwrap();
-        assert!(h.content_type.is_some());
+        let ct = h.content_type.expect("content_type should be parsed");
+        assert_eq!(ct.content_type, "text");
+        assert_eq!(ct.content_subtype, "plain");
+        assert_eq!(ct.attribute, "charset");
+        assert_eq!(ct.value, "us-ascii");
+        assert_eq!(ct.parameters.len(), 1);
+        assert_eq!(ct.parameters[0], ("charset", "us-ascii"));
     }
 
     #[test]
@@ -1108,4 +1388,160 @@ mod tests {
         optional_field(&mut mh, item).unwrap();
         assert_eq!(mh.optional_field[&"Optional"], "test");
     }
+
+    // A realistic message: folded DKIM-Signature, trace headers interleaved
+    // with optional fields, duplicates, MIME headers, and a multipart body.
+    const TEST_MESSAGE: &str = r#"Delivered-To: jrperson@gmail.com
+Received: by mx.google.com with SMTP id mh7csp748466nlc;
+        Fri, 1 Nov 2024 18:16:08 -0700 (PDT)
+Authentication-Results: mx.google.com;
+       dkim=pass header.i=@protonmail.com;
+       spf=pass smtp.mailfrom=jason.person@protonmail.com
+Return-Path: <jason.person@protonmail.ch>
+Received: from mail-40140.protonmail.ch by mx.google.com with ESMTPS id abc123;
+        Fri, 01 Nov 2024 18:16:08 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=protonmail.com; s=protonmail3; t=1730510168; x=1730769368; bh=evU+ZAhaA7uoDunwy9tpxgyXQlVvxX0ZJTSDyRIcuew=; h=Date:To:From:Subject:Message-ID:Feedback-ID:From:To:Cc:Date:
+ Subject:Reply-To:Feedback-ID:Message-ID:
+ List-Unsubscribe:List-Unsubscribe-Post; b=OcGMbHQ7D6awrQVpP/eSLuPPz8cUpAuPS+IegdH602vdGJcgEHHGGG2VSghVbIX
+ 9R51b1Jcuf23BFIClp/mpdaGQSNOJ2YLiS9iE0MG+NeO2nMTDui8mObGj5g0ZmSlCV
+ dXMlV6KdvNXpA==
+Date: Sat, 02 Nov 2024 01:16:06 +0000
+To: "jrperson@gmail.com" <jrperson@gmail.com>
+From: Jason Person <jason.person@protonmail.com>
+Subject: Test
+Message-ID: <zuZRjJOl1NxzLHjkiYvxLU6XuKH9KZ2UnlMXEZmWnFTHP9Qyh5XX71DDO9WerlL4O2@protonmail.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4"
+
+--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+VGVzdA==
+--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4--
+"#;
+
+    #[test]
+    fn parse_message_full() {
+        let raw = TEST_MESSAGE.replace('\n', "\r\n").into_bytes();
+
+        let msg = parse_message(&raw).unwrap();
+
+        // Raw headers: order and duplicates preserved.
+        assert_eq!(msg.headers.len(), 13);
+        assert!(msg.headers[0].name_eq("delivered-to"));
+        assert_eq!(
+            msg.headers.iter().filter(|h| h.name_eq("received")).count(),
+            2
+        );
+
+        // Raw values preserve folding whitespace verbatim.
+        let dkim = msg
+            .headers
+            .iter()
+            .find(|h| h.name_eq("dkim-signature"))
+            .unwrap();
+        let dkim_val = String::from_utf8_lossy(dkim.raw_value);
+        assert!(dkim_val.starts_with(" v=1; a=rsa-sha256"));
+        assert!(dkim_val.ends_with("dXMlV6KdvNXpA=="));
+        assert!(dkim_val.contains("\r\n 9R51b1")); // fold preserved
+
+        let subject = msg
+            .headers
+            .iter()
+            .find(|h| h.name_eq("subject"))
+            .unwrap();
+        assert_eq!(subject.raw_value, b" Test");
+
+        // Typed view: DKIM-Signature retained with its raw tag list.
+        assert_eq!(msg.typed.dkim.len(), 1);
+        assert!(msg.typed.dkim[0].raw.starts_with("v=1; a=rsa-sha256"));
+
+        let from = msg.typed.from.as_ref().unwrap();
+        assert_eq!(from[0].local_part, "jason.person");
+        assert_eq!(from[0].domain, "protonmail.com");
+
+        assert!(msg.typed.subject.is_some_and(|s| s == "Test"));
+
+        // Trace: one entry per Received, with Return-Path attached to its block.
+        assert_eq!(msg.typed.trace.len(), 2);
+        assert_eq!(msg.typed.trace[0].return_path, None);
+        assert_eq!(
+            msg.typed.trace[1].return_path,
+            Some("<jason.person@protonmail.ch>")
+        );
+        assert!(!msg.typed.trace[1].received_tokens.is_empty());
+
+        // MIME headers.
+        let mh = msg.typed.mime_header.as_ref().unwrap();
+        assert!(mh.mime_version.is_some());
+        let ct = mh.content_type.as_ref().unwrap();
+        assert_eq!(ct.content_type, "multipart");
+        assert_eq!(ct.content_subtype, "alternative");
+        assert_eq!(ct.parameters[0].0, "boundary");
+
+        // Body: raw bytes after the blank line, verbatim.
+        assert!(msg
+            .body
+            .starts_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4\r\n"));
+        assert!(msg
+            .body
+            .ends_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4--\r\n"));
+        assert!(msg.body.windows(7).any(|w| w == b"VGVzdA="));
+    }
+
+    #[test]
+    fn parse_message_lf_only() {
+        let raw =
+            b"From: foo@bar.com\nSubject: Hi\nX-Folded: one\n two\n\nbody line\nstill body\n";
+        let msg = parse_message(raw).unwrap();
+
+        assert_eq!(msg.headers.len(), 3);
+        let folded = msg
+            .headers
+            .iter()
+            .find(|h| h.name_eq("x-folded"))
+            .unwrap();
+        assert_eq!(folded.raw_value, b" one\n two");
+
+        assert_eq!(msg.body, b"body line\nstill body\n");
+    }
+
+    #[test]
+    fn test_split_message() {
+        // CRLF throughout
+        let (h, b) = split_message(b"A: 1\r\nB: 2\r\n\r\nbody").unwrap();
+        assert_eq!(h, b"A: 1\r\nB: 2\r\n");
+        assert_eq!(b, b"body");
+
+        // LF throughout
+        let (h, b) = split_message(b"A: 1\nB: 2\n\nbody").unwrap();
+        assert_eq!(h, b"A: 1\nB: 2\n");
+        assert_eq!(b, b"body");
+
+        // CRLF headers, LF-only separator
+        let (h, b) = split_message(b"A: 1\r\n\nbody").unwrap();
+        assert_eq!(h, b"A: 1\r\n");
+        assert_eq!(b, b"body");
+
+        // Empty body
+        let (h, b) = split_message(b"A: 1\r\n\r\n").unwrap();
+        assert_eq!(h, b"A: 1\r\n");
+        assert!(b.is_empty());
+
+        // Empty header block
+        let (h, b) = split_message(b"\r\nbody").unwrap();
+        assert!(h.is_empty());
+        assert_eq!(b, b"body");
+
+        // Empty message
+        let (h, b) = split_message(b"").unwrap();
+        assert!(h.is_empty());
+        assert!(b.is_empty());
+
+        // No separator
+        assert!(split_message(b"A: 1\r\nB: 2\r\n").is_err());
+    }
 }
+
+

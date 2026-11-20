@@ -1,0 +1,5 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=From:Subject; bh=frcCV1k9oG9oKj3dpUqdJg1PxRT2RSN/XKdLCPjaYaY=; b=ZW1wdHktYm9keQ==
+From: Dave Example <dave@example.org>
+Subject: No body
+

@@ -1,0 +1,9 @@
+Received: from a.example by mail.example.net; Sat, 01 Nov 2025 10:00:00 +0000
+Received: from b.example by mail.example.net; Sat, 01 Nov 2025 10:00:01 +0000
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=Received:received:Subject:X-Missing:SUBJECT:From;
+        bh=TMjRPF+lRbe66TVWU5OHToHDVFwyiswAh6O7ASFDhkY=; b=b3ZlcnNpZ25lZA==
+From: Gina Example <gina@example.org>
+Subject: Over-signing
+
+Over-signing test.

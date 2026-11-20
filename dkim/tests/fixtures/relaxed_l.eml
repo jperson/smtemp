@@ -1,0 +1,7 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=From:Subject; l=20; bh=7vYxeV6J5+PCsDs9e74L+BIFlp4h8Y5pXiD2f2M0y60=; b=c2hvcnQtc2lnbmF0dXJl
+From: Carol Example <carol@example.org>
+Subject: Body length test
+
+Truncated body test.
+Second line.

@@ -1,7 +1,9 @@
 WHITESPACE = _{ (" " | "\t")+ ~ (NEWLINE{0,1} ~ " ")? }
 
 wsp = _{ " " | "\t" }
-fws = _{ (wsp* ~ NEWLINE)? ~ wsp+ }
+// Atomic so the surrounding WHITESPACE rule cannot be implicitly inserted
+// inside it (which would consume the WSP this rule requires after a fold).
+fws = @{ (wsp* ~ NEWLINE)? ~ wsp+ }
 us_ascii = _{ '!'..'~'}
 
 //Tokens
@@ -190,9 +192,9 @@ ietf_token = _{ token }
 x_token    = @{ ("X-" | "x-") ~ token }
 subtype    = { extension_token | iana_token }
 iana_token = { token }
-parameter  = { attribute ~ "=" ~ value }
+parameter  = { attribute ~ "=" ~ value ~ cfws? }
 attribute  = { token }
-value      = { (ASCII_ALPHANUMERIC | ")" | "(" | "." | quoted_string)+ }
+value      = { token | quoted_string }
 token      = _{ (!( tspecials | " " ) ~ us_ascii )+ }
 
 tspecials =  _{
@@ -222,10 +224,12 @@ quoted_date_time       = _{ quoted_string }
 
 
 //DKIM-Signature
-dkim_header = { ^"DKIM-Signature:"  ~ dkim_tags ~ (";" ~ (fws | NEWLINE)? ~ dkim_tags)+ }
+dkim_header = { ^"DKIM-Signature:"  ~ dkim_tags ~ (";" ~ (fws | NEWLINE)? ~ dkim_tags)+ ~ NEWLINE }
 
 hyphenated_word = { ASCII_ALPHA ~ ( (ASCII_ALPHA | ASCII_DIGIT | "-")* ~ (ASCII_ALPHA | ASCII_DIGIT) )? }
-base64string    = { (ASCII_ALPHA | ASCII_DIGIT | "+" | "/" )+ ~ ("=" ~ "="?)? }
+// FWS-tolerant base64 (RFC 6376 allows folding inside b=/bh= values; the
+// whitespace is not part of the decoded data and is stripped by consumers).
+base64string    = @{ ( (ASCII_ALPHA | ASCII_DIGIT | "+" | "/" )+ ~ fws? )+ ~ ("=" ~ "="?)? }
 sub_domain      = { (ASCII_ALPHA | ASCII_DIGIT) ~ ldh_str? }
 ldh_str         = _{ (ASCII_ALPHA | ASCII_DIGIT | "-" ) ~ (ASCII_ALPHA | ASCII_DIGIT)* }
 selector        = { sub_domain ~ ( "." ~ sub_domain )* }
@@ -281,7 +285,7 @@ sig_d_tag       = { "d" ~ "=" ~ domain }
 //domain_name     = { sub_domain ~ ("." ~ sub_domain)+ }
 
 //signed header
-sig_h_tag       = { "h" ~ "=" ~ hdr_name ~ ( fws? ~ ":" ~ fws? ~ hdr_name )* }
+sig_h_tag       = { "h" ~ "=" ~ hdr_name ~ ( (fws | NEWLINE)? ~ ":" ~ (fws | NEWLINE)? ~ hdr_name )* }
 hdr_name        = _{ dkim_field_name }
 
 //identity of user/agent
@@ -312,34 +316,35 @@ qp_hdr_value   = { dkim_quoted_printable }
 
 
 //Fields
-fields = _{
-    (trace |
-     resent_date |
-     resent_from |
-     resent_sender |
-     resent_to |
-     resent_cc |
-     resent_bcc |
-     resent_msg_id |
-     dkim_header
-     )* ~
-    (orig_date |
-      from |
-      sender |
-      reply_to |
-      to |
-      cc |
-      bcc |
-      message_id |
-      in_reply_to |
-      references |
-      subject |
-      comments |
-      keywords |
-
-      //MIME
-      mime_header |
-
-      optional_field
-    )*
+// A single field (or trace block), allowed in any position. Unrecognized or
+// malformed fields fall through to `optional_field`.
+field = _{
+    trace |
+    return_path |
+    received |
+    resent_date |
+    resent_from |
+    resent_sender |
+    resent_to |
+    resent_cc |
+    resent_bcc |
+    resent_msg_id |
+    dkim_header |
+    orig_date |
+    from |
+    sender |
+    reply_to |
+    to |
+    cc |
+    bcc |
+    message_id |
+    in_reply_to |
+    references |
+    subject |
+    comments |
+    keywords |
+    mime_header |
+    optional_field
 }
+
+fields = _{ field* }

@@ -1,0 +1,16 @@
+Return-Path: <bounce@example.org>
+Received: from sender.example.com (sender.example.com [192.0.2.1])
+        by mail.example.net with ESMTP id abc123;
+        Sat, 01 Nov 2025 10:00:00 +0000
+DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=example.org; s=sel1;
+        h=From:To:Subject:Date;
+        bh=tj78mUdSaA5MWaJY1tTybSq1DUJPMapwk6mvr9SsYBM=; b=dGVzdCBzaWduYXR1cmUgcGxhY2Vob2xkZXI=
+From: Alice Example <alice@example.org>
+To: Bob Example <bob@example.net>
+Subject: Simple canonicalization test
+Date: Sat, 01 Nov 2025 09:59:59 +0000
+Message-ID: <20251101095959.example@node1.example.org>
+
+Hello, this is the body.
+
+It has two paragraphs.

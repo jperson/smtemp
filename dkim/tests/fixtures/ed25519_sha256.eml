@@ -1,0 +1,6 @@
+DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=From:Subject; bh=qW3qOWmcRLbx/9/SkVPbW8CPWGSh6laweZP/jTL01MQ=; b=ZWQyNTUxOWk=
+From: Grace Example <grace@example.org>
+Subject: Ed25519
+
+Ed25519 test body.

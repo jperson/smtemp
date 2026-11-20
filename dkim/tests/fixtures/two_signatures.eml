@@ -1,0 +1,9 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org; s=sel1;
+        h=From:To:Subject; bh=0K/+Bqv5QVSIjrxkIFW/s5RVfPmW7tOUSrSTPPNSVa0=; b=c2lnbmF0dXJlLW9uZQ==
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.net; s=sel2;
+        h=From:To:Subject; bh=0K/+Bqv5QVSIjrxkIFW/s5RVfPmW7tOUSrSTPPNSVa0=; b=c2lnbmF0dXJlLXR3bw==
+From: Eve Example <eve@example.org>
+To: Frank Example <frank@example.net>
+Subject: Two signatures
+
+Two signature test body.

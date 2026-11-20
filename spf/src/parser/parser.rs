@@ -271,24 +271,34 @@ fn parse_ptr(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
 
 fn parse_ip4(lex: &mut SpfLexer) -> Result<SpfMechanism> {
     if let Some(Ok(Token::Ip4(s))) = lex.next() {
-        if s.contains(":") {
-            let (_, ip) = s.split_once(":").ok_or(anyhow!("Failed to parse Ip4"))?;
-            let ipv4 = Ipv4Net::from(ip.parse::<Ipv4Addr>()?);
-            Ok(SpfMechanism::Ip4(ipv4))
-        } else {
-            Err(anyhow!("Failed to parse Ip4"))
+        if let Some((_, ip)) = s.split_once(":") {
+            // "a.b.c.d" or "a.b.c.d/prefix-length" (RFC 7208 Section 5.1).
+            if let Some((addr, prefix)) = ip.split_once('/') {
+                let addr: Ipv4Addr = addr.parse()?;
+                let prefix: u8 = prefix
+                    .parse()
+                    .map_err(|_| anyhow!("invalid ip4 prefix length"))?;
+                if prefix > 32 {
+                    return Err(anyhow!("ip4 prefix length exceeds 32"));
+                }
+                return Ok(SpfMechanism::Ip4(Ipv4Net::new(addr, prefix)?));
+            }
+            return Ok(SpfMechanism::Ip4(Ipv4Net::from(ip.parse::<Ipv4Addr>()?)));
         }
+        Err(anyhow!("Failed to parse Ip4, missing ':'"))
     } else {
-        Err(anyhow!("Failed to parse Include directive"))
+        Err(anyhow!("Failed to parse Ip4 token"))
     }
 }
 
 fn parse_ip6(lex: &mut SpfLexer) -> Result<SpfMechanism> {
     if let Some(Ok(Token::Ip6(s))) = lex.next() {
-        let ipv6 = Ipv6Net::from_str(s)?;
-        Ok(SpfMechanism::Ip6(ipv6))
+        if let Some((_, ip)) = s.split_once(":") {
+            return Ok(SpfMechanism::Ip6(Ipv6Net::from_str(ip)?));
+        }
+        Err(anyhow!("Failed to parse Ip6, missing ':'"))
     } else {
-        Err(anyhow!("Failed to parse Include directive"))
+        Err(anyhow!("Failed to parse Ip6 token"))
     }
 }
 

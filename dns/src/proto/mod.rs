@@ -27,7 +27,8 @@ impl DnsMessage {
             rd: 0x01,
             ra: 0x00,
             z: 0x00,
-            ad: 0x01,
+            ad: 0x00,
+            cd: 0x00,
             rcode: 0x00,
             question_count: questions.len() as u16,
             answer_count: 0x00,
@@ -137,10 +138,12 @@ pub struct DnsHeader {
     pub rd: u8,
     #[deku(bits = 1)]
     pub ra: u8,
-    #[deku(bits = 2)]
+    #[deku(bits = 1)]
     pub z: u8,
     #[deku(bits = 1)]
     pub ad: u8,
+    #[deku(bits = 1)]
+    pub cd: u8,
     #[deku(bits = 4)]
     pub rcode: u8,
 
@@ -220,8 +223,11 @@ impl DnsResourceRecord {
         let _ = data.write_all(&self.record_type.to_be_bytes());
         let _ = data.write_all(&self.record_class.to_be_bytes());
         let _ = data.write_all(&self.ttl.to_be_bytes());
-        let _ = data.write_all(&self.rdlength.to_be_bytes());
-        let _ = data.write_all(self.rdata.to_bytes()?.as_slice());
+        // rdlength is recomputed from the rdata so it can never disagree
+        // with the encoded bytes.
+        let rdata = self.rdata.to_bytes()?;
+        let _ = data.write_all(&(rdata.len() as u16).to_be_bytes());
+        let _ = data.write_all(rdata.as_slice());
 
         Ok(data)
     }
@@ -404,10 +410,25 @@ impl QType {
                 QType::MX(preference, name)
             }
             16 => {
-                let len = data[offset] as usize;
-                let s: String =
-                    String::from_utf8_lossy(&data[offset + 1..offset + 1 + len]).to_string();
-                QType::TXT(s)
+                // TXT rdata is one or more character-strings, each a
+                // one-byte length followed by that many bytes (RFC 1035
+                // Section 3.3.14). Long values (DKIM keys, long SPF records)
+                // are split across multiple strings and must be
+                // concatenated.
+                let mut value = String::new();
+                let mut pos = offset;
+                while pos < end {
+                    let Some(&len_byte) = data.get(pos) else {
+                        return Err(anyhow!("TXT rdata truncated"));
+                    };
+                    let len = len_byte as usize;
+                    if pos + 1 + len > end {
+                        return Err(anyhow!("TXT character-string overruns rdata"));
+                    }
+                    value.push_str(&String::from_utf8_lossy(&data[pos + 1..pos + 1 + len]));
+                    pos += 1 + len;
+                }
+                QType::TXT(value)
             }
             _ => QType::EMPTY,
         })
@@ -458,8 +479,10 @@ impl QType {
             }
             QType::TXT(s) => {
                 let mut data: Vec<u8> = vec![];
-                data.push(s.len() as u8);
-                let _ = data.write_all(s.as_bytes());
+                for chunk in s.as_bytes().chunks(255) {
+                    data.push(chunk.len() as u8);
+                    let _ = data.write_all(chunk);
+                }
                 data
             }
             _ => vec![],
@@ -479,13 +502,47 @@ mod tests {
             record_class: 0x01,
         };
 
+        // Header: id=0x1032, flags=0x0100 (rd=1), 1 question, 1 additional
+        // (the EDNS0 OPT pseudo-RR), then the question, then the OPT RR:
+        // root name, type 41, class 4096 (payload size), ttl 0, rdlength 0.
         let expected: Vec<u8> = vec![
-            0x10, 0x32, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x67,
+            0x10, 0x32, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x06, 0x67,
             0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x10, 0x00, 0x01,
+            0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let data = DnsMessage::new(0x1032, vec![question]).to_vec().unwrap();
         assert_eq!(expected, data);
+    }
+
+    #[test]
+    fn test_txt_multistring_roundtrip() {
+        // A DKIM-sized TXT value (SPKI keys are regularly > 255 bytes) must
+        // survive serialization as multiple character-strings and parse back
+        // as the concatenated value.
+        let long = format!("v=DKIM1; k=rsa; p={}", "ABCD".repeat(200)); // 823 bytes
+
+        let rr = DnsResourceRecord {
+            name: Label::new("sel1._domainkey.example.org".to_string()),
+            record_type: 0x10,
+            record_class: 0x01,
+            ttl: 300,
+            rdlength: 0, // recomputed by to_bytes
+            rdata: QType::TXT(long.clone()),
+        };
+
+        let mut msg = DnsMessage::new(0x0102, vec![]);
+        msg.header.answer_count = 1;
+        msg.answers = vec![rr];
+
+        let bytes = msg.to_vec().unwrap();
+        let (_, parsed) = DnsMessage::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.answers.len(), 1);
+        match &parsed.answers[0].rdata {
+            QType::TXT(txt) => assert_eq!(txt, &long),
+            other => panic!("expected TXT rdata, got {:?}", other),
+        }
     }
 
     #[test]

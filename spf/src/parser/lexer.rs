@@ -17,7 +17,10 @@ pub enum Token<'source> {
     #[regex(r"a(:|\/)?[^\s]*\s*", |lex| lex.slice().trim())]
     A(&'source str),
 
-    #[regex(r"mx(:?%)[^\s]*\s*", |lex| lex.slice().trim())]
+    // "mx" or "mx:<domain-spec>". (TODO: dual-cidr forms like mx/24 or
+    // mx:domain/24 are not yet split into domain + prefix; the trailing
+    // cidr must not reach the resolver.)
+    #[regex(r"mx(:[^\s]*)?\s*", |lex| lex.slice().trim())]
     Mx(&'source str),
 
     #[regex(r"ptr(:?|/?)[^\s]*\s*", |lex| lex.slice().trim())]

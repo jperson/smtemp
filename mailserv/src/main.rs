@@ -21,6 +21,8 @@ use uuid::Uuid;
 use smtp::SmtpSession;
 use spf::SpfResult;
 
+mod spool;
+
 /// One DKIM verification outcome, summarized for structured logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DkimSummary {
@@ -33,8 +35,8 @@ struct DkimSummary {
     error: Option<String>,
 }
 
-/// A small, secure SMTP server: accepts, verifies (SPF/DKIM/DMARC), and
-/// spools mail; supports STARTTLS, AUTH, and a closed relay policy.
+/// A small, secure SMTP server: accepts and verifies mail (SPF, DKIM,
+/// DMARC); supports STARTTLS, AUTH, and a closed relay policy.
 #[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -71,6 +73,17 @@ struct Args {
     #[arg(long)]
     auth_users: Option<String>,
 
+    /// DNS resolver address (DNS-over-TLS on port 853) used for SPF,
+    /// DKIM key, and DMARC lookups.
+    #[arg(long)]
+    resolver: Option<Ipv4Addr>,
+
+    /// Queue directory where accepted messages are spooled before
+    /// delivery. Spooling is part of the acceptance contract: the 250 is
+    /// only sent after a durable write.
+    #[arg(long, value_name = "DIR")]
+    spool_dir: Option<String>,
+
     /// Domains whose recipients we accept mail for (comma-separated;
     /// defaults to --domain only). Relay access is closed regardless of
     /// authentication.
@@ -80,7 +93,9 @@ struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, local-domains); every key optional.
+    /// tls-cert, tls-key, auth-users, resolver, spool-dir,
+    /// local-domains); every key
+    /// optional.
     #[arg(long, value_name = "FILE")]
     config: Option<String>,
 }
@@ -98,6 +113,8 @@ struct FileConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
+    resolver: Option<Ipv4Addr>,
+    spool_dir: Option<String>,
     local_domains: Option<String>,
 }
 
@@ -113,8 +130,15 @@ struct Config {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
+    /// DNS-over-TLS resolver address; always resolved (default 1.1.1.1).
+    resolver: Ipv4Addr,
+    /// Queue directory for accepted messages (default "spool").
+    spool_dir: String,
     local_domains: Option<String>,
 }
+
+/// The default DNS-over-TLS resolver.
+const DEFAULT_RESOLVER: &str = "1.1.1.1";
 
 /// Merge CLI arguments over config-file values over built-in defaults.
 fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
@@ -143,6 +167,15 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         tls_cert: cli.tls_cert.or(file.tls_cert),
         tls_key: cli.tls_key.or(file.tls_key),
         auth_users: cli.auth_users.or(file.auth_users),
+        resolver: cli.resolver.or(file.resolver).unwrap_or_else(|| {
+            DEFAULT_RESOLVER
+                .parse()
+                .expect("DEFAULT_RESOLVER is a valid IPv4 address")
+        }),
+        spool_dir: cli
+            .spool_dir
+            .or(file.spool_dir)
+            .unwrap_or_else(|| "spool".to_string()),
         local_domains: cli.local_domains.or(file.local_domains),
     })
 }
@@ -208,7 +241,7 @@ struct DmarcSummary {
     action: String,
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 struct UserSession<'session> {
     #[serde(skip_serializing)]
     pub max_data: usize,
@@ -250,26 +283,22 @@ struct UserSession<'session> {
     /// Local domains we accept recipients for.
     #[serde(skip_serializing)]
     local_domains: Arc<HashSet<String>>,
+    /// Disk spool for accepted messages; None drops them (tests).
+    #[serde(skip_serializing)]
+    spool: Option<Arc<spool::Spool>>,
     /// DMARC verdict of the last completed message, for the session log.
     dmarc: Option<DmarcSummary>,
 }
 
 impl<'session> UserSession<'session> {
-    fn new(
-        domain: &'session str,
-        peer: SocketAddr,
-        max_data: usize,
-        starttls_available: bool,
-        auth_users: Option<Arc<HashMap<String, String>>>,
-        local_domains: Arc<HashSet<String>>,
-    ) -> Self {
+    fn new(peer: SocketAddr, starttls_available: bool, cfg: &'session SessionConfig) -> Self {
         UserSession {
-            max_data,
+            max_data: cfg.max_data,
             total_data: 0,
             session_id: Uuid::new_v4(),
 
-            domain,
-            dns: "1.1.1.1".parse::<Ipv4Addr>().unwrap(),
+            domain: &cfg.domain,
+            dns: cfg.resolver,
             peer,
 
             helo: None,
@@ -282,11 +311,12 @@ impl<'session> UserSession<'session> {
             message_count: 0,
             tls_active: false,
             starttls_available,
-            auth_users,
+            auth_users: cfg.auth_users.clone(),
             authenticated: None,
             auth_login_user: None,
             auth_pending: None,
-            local_domains,
+            local_domains: cfg.local_domains.clone(),
+            spool: cfg.spool.clone(),
             dmarc: None,
         }
     }
@@ -629,6 +659,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         // line endings exactly as the client sent them.
         let raw = self.data.clone();
         let results = dkim::verify_dkim(&raw, &self.dns).await;
+        let mut dkim_summaries: Vec<DkimSummary> = Vec::new();
 
         for result in &results {
             let summary = DkimSummary {
@@ -648,14 +679,9 @@ impl smtp::SmtpSession for UserSession<'_> {
                 dkim_error = ?summary.error,
                 "dkim verification"
             );
-            self.dkim.push(summary);
+            dkim_summaries.push(summary);
         }
-
-        // The transaction is complete: clear the envelope so another
-        // message can be sent on the same connection. (This also keeps
-        // message bodies out of the session's structured log.)
-        self.clear_envelope();
-        self.message_count += 1;
+        self.dkim.extend(dkim_summaries.iter().cloned());
 
         // DMARC (RFC 7489): evaluate the From-header domain against the
         // SPF and DKIM results, and apply the published policy. Authenticated
@@ -668,6 +694,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                 .from
                 .and_then(|from| from.first().map(|mb| mb.domain.to_string()))
         });
+        let mut dmarc_summary: Option<DmarcSummary> = None;
 
         if let Some(from_domain) = from_domain {
             let resolver = spf::DotResolver::new(self.dns);
@@ -715,18 +742,62 @@ impl smtp::SmtpSession for UserSession<'_> {
                     dmarc_action = %summary.action,
                     "dmarc evaluation"
                 );
-                self.dmarc = Some(summary);
+                self.dmarc = Some(summary.clone());
+                dmarc_summary = Some(summary);
 
                 let exempt = self.authenticated.is_some();
                 if action == dmarc::Action::Reject && !exempt {
-                    // The transaction is over either way (the envelope was
-                    // cleared); the reply refuses the message.
+                    // The transaction is over either way; the envelope is
+                    // cleared below. Rejected mail is not spooled.
+                    self.clear_envelope();
+                    self.message_count += 1;
                     return smtp::Control::reject(
                         b"550 5.7.1 This message does not comply with the required DMARC policy\r\n",
                     );
                 }
             }
         }
+
+        // Spool before accepting: the 250 is only sent after a durable
+        // write (Phase 7). A failed spool is a temporary failure — the
+        // client is invited to retry, nothing is lost.
+        if let Some(spool) = self.spool.clone() {
+            let meta = spool::SpoolMeta {
+                queue_id: String::new(), // assigned by the spool
+                session_id: self.session_id.to_string(),
+                received_at: jiff::Timestamp::now().to_string(),
+                peer: self.peer.to_string(),
+                helo: self.helo.clone(),
+                mail_from: self.mail_from.clone(),
+                rcpt_to: self.rcpt_to.clone(),
+                spf_result: self.spf_result.as_ref().map(|r| format!("{r:?}")),
+                spf_helo: self.spf_helo.as_ref().map(|r| format!("{r:?}")),
+                dkim: dkim_summaries,
+                dmarc: dmarc_summary,
+                authenticated: self.authenticated.clone(),
+                tls_active: self.tls_active,
+                message_size: raw.len(),
+            };
+            match spool.write(meta, &raw).await {
+                Ok(queue_id) => {
+                    info!(queue_id = %queue_id, recipients = self.rcpt_to.len(), "message spooled");
+                }
+                Err(e) => {
+                    error!(error = %e, "spool write failed; refusing with a temporary error");
+                    self.clear_envelope();
+                    self.message_count += 1;
+                    return smtp::Control::tempfail(
+                        b"451 4.3.0 Error: queueing failed, try again later\r\n",
+                    );
+                }
+            }
+        }
+
+        // The transaction is complete: clear the envelope so another
+        // message can be sent on the same connection. (This also keeps
+        // message bodies out of the session's structured log.)
+        self.clear_envelope();
+        self.message_count += 1;
 
         smtp::Control::accept(UserSession::OK)
     }
@@ -803,12 +874,16 @@ async fn main() -> Result<()> {
     local_domains.insert(config.domain.to_ascii_lowercase());
     let local_domains = Arc::new(local_domains);
 
+    let spool = Arc::new(spool::Spool::open(&config.spool_dir).await?);
+
     let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
 
     info!(
         host = %config.host,
         port = config.port,
         domain = %config.domain,
+        resolver = %config.resolver,
+        spool_dir = %config.spool_dir,
         "listening"
     );
 
@@ -823,25 +898,21 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let domain = config.domain.clone();
         let acceptor = acceptor.clone();
-        let max_data = config.max_data_bytes;
         let max_read_ms = config.max_read_duration_ms;
-        let auth_users = auth_users.clone();
-        let local_domains = local_domains.clone();
+        let session_cfg = SessionConfig {
+            domain: config.domain.clone(),
+            max_data: config.max_data_bytes,
+            auth_users: auth_users.clone(),
+            local_domains: local_domains.clone(),
+            resolver: config.resolver,
+            spool: Some(spool.clone()),
+        };
 
         tokio::spawn(async move {
             let result = timeout_at(
                 Instant::now() + Duration::from_millis(config.max_conn_duration_ms),
-                handle_connection(
-                    stream,
-                    acceptor,
-                    auth_users,
-                    local_domains,
-                    domain,
-                    max_data,
-                    max_read_ms,
-                ),
+                handle_connection(stream, acceptor, max_read_ms, session_cfg),
             )
             .await;
 
@@ -855,27 +926,31 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Per-connection policy configuration, cheap to clone from the resolved
+/// server config for each accepted connection.
+#[derive(Clone)]
+struct SessionConfig {
+    domain: String,
+    max_data: usize,
+    auth_users: Option<Arc<HashMap<String, String>>>,
+    local_domains: Arc<HashSet<String>>,
+    /// DNS-over-TLS resolver used for SPF, DKIM key, and DMARC lookups.
+    resolver: Ipv4Addr,
+    /// Disk spool for accepted messages; None drops them (tests).
+    spool: Option<Arc<spool::Spool>>,
+}
+
 /// Serve one connection, including a possible STARTTLS upgrade: the
 /// protocol loop runs over the plaintext stream, pauses for the TLS
 /// handshake when the policy upgrades, and resumes over the TLS stream.
 async fn handle_connection(
     stream: TcpStream,
     acceptor: Option<Arc<TlsAcceptor>>,
-    auth_users: Option<Arc<HashMap<String, String>>>,
-    local_domains: Arc<HashSet<String>>,
-    domain: String,
-    max_data: usize,
     max_read_ms: u64,
+    cfg: SessionConfig,
 ) -> Result<()> {
     let peer = stream.peer_addr()?;
-    let mut session = UserSession::new(
-        &domain,
-        peer,
-        max_data,
-        acceptor.is_some(),
-        auth_users,
-        local_domains,
-    );
+    let mut session = UserSession::new(peer, acceptor.is_some(), &cfg);
     let mut session_state = smtp::SessionState::default();
     let mut stream = BufReader::new(stream);
 
@@ -883,7 +958,7 @@ async fn handle_connection(
         .run(
             &mut stream,
             &peer,
-            &domain,
+            &cfg.domain,
             &max_read_ms,
             &mut session_state,
         )
@@ -923,7 +998,7 @@ async fn handle_connection(
             .run(
                 &mut tls_stream,
                 &peer,
-                &domain,
+                &cfg.domain,
                 &max_read_ms,
                 &mut session_state,
             )
@@ -1048,6 +1123,8 @@ mod tests {
         assert_eq!(resolved.max_data_bytes, 2048);
         assert_eq!(resolved.max_conn_duration_ms, 30 * 1000);
         assert_eq!(resolved.tls_cert.as_deref(), Some("cert.pem"));
+        // The resolver defaults to 1.1.1.1 when nothing is configured.
+        assert_eq!(resolved.resolver, "1.1.1.1".parse::<Ipv4Addr>().unwrap());
 
         // CLI flags win over the file.
         let resolved = resolve_config(
@@ -1059,6 +1136,8 @@ mod tests {
                 "2527",
                 "--max-data-bytes",
                 "4096",
+                "--resolver",
+                "9.9.9.9",
             ]),
             file,
         )
@@ -1066,6 +1145,7 @@ mod tests {
         assert_eq!(resolved.domain, "cli.example");
         assert_eq!(resolved.port, 2527);
         assert_eq!(resolved.max_data_bytes, 4096);
+        assert_eq!(resolved.resolver, "9.9.9.9".parse::<Ipv4Addr>().unwrap());
         // File value survives where the CLI is silent.
         assert_eq!(resolved.tls_cert.as_deref(), Some("cert.pem"));
 
@@ -1073,11 +1153,27 @@ mod tests {
         assert!(resolve_config(Args::parse_from(["mailserv"]), FileConfig::default()).is_err());
     }
 
+    #[test]
+    fn resolver_from_config_file_wins_over_default() {
+        use clap::Parser as _;
+
+        let file: FileConfig = toml::from_str(
+            r#"
+            domain = "file.example"
+            resolver = "8.8.8.8"
+            "#,
+        )
+        .unwrap();
+        let resolved = resolve_config(Args::parse_from(["mailserv"]), file).unwrap();
+        assert_eq!(resolved.resolver, "8.8.8.8".parse::<Ipv4Addr>().unwrap());
+    }
+
     /// Spawn handle_connection on an ephemeral port. Returns the address.
     async fn spawn_server(
         acceptor: Option<Arc<TlsAcceptor>>,
         auth_users: Option<Arc<HashMap<String, String>>>,
         local_domains: Option<Vec<String>>,
+        spool: Option<Arc<spool::Spool>>,
     ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1093,11 +1189,19 @@ mod tests {
                 let _ = handle_connection(
                     stream,
                     acceptor,
-                    auth_users,
-                    local,
-                    "mail.example.org".to_string(),
-                    1024 * 1024,
                     5000,
+                    SessionConfig {
+                        domain: "mail.example.org".to_string(),
+                        max_data: 1024 * 1024,
+                        auth_users,
+                        local_domains: local,
+                        // The integration tests exercise the real resolver
+                        // path: the sender domains used below
+                        // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
+                        // evaluates to None and DMARC has no policy.
+                        resolver: "1.1.1.1".parse().unwrap(),
+                        spool,
+                    },
                 )
                 .await;
             }
@@ -1134,7 +1238,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let addr = spawn_server(Some(acceptor), None, None).await;
+        let addr = spawn_server(Some(acceptor), None, None, None).await;
 
         // --- Plaintext phase.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1215,7 +1319,7 @@ mod tests {
     /// session continues in the clear.
     #[tokio::test]
     async fn starttls_unavailable_is_refused() {
-        let addr = spawn_server(None, None, None).await;
+        let addr = spawn_server(None, None, None, None).await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
         let mut client = BufReader::new(tcp);
         read_reply(&mut client).await;
@@ -1251,7 +1355,7 @@ mod tests {
         );
         let mut users = HashMap::new();
         users.insert("alice".to_string(), "secret".to_string());
-        let addr = spawn_server(Some(acceptor), Some(Arc::new(users)), None).await;
+        let addr = spawn_server(Some(acceptor), Some(Arc::new(users)), None, None).await;
 
         // --- Plaintext: AUTH is neither advertised nor accepted.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1376,6 +1480,7 @@ mod tests {
             None,
             None,
             Some(vec!["example.org".to_string(), "example.net".to_string()]),
+            None,
         )
         .await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1425,7 +1530,7 @@ mod tests {
     /// The recipient cap (RFC 5321 Section 4.5.3.1.8: at least 100).
     #[tokio::test]
     async fn recipient_cap() {
-        let addr = spawn_server(None, None, None).await;
+        let addr = spawn_server(None, None, None, None).await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
         let mut client = BufReader::new(tcp);
         read_reply(&mut client).await;
@@ -1454,5 +1559,71 @@ mod tests {
             "452 4.5.3 Too many recipients\r\n"
         );
         client.write_all(b"QUIT\r\n").await.unwrap();
+    }
+
+    /// Accepted messages are durably spooled: payload byte-exact, metadata
+    /// complete, and the 250 only after the write (Phase 7).
+    #[tokio::test]
+    async fn accepted_message_is_spooled() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = Arc::new(spool::Spool::open(dir.path()).await.unwrap());
+        let addr = spawn_server(None, None, None, Some(spool)).await;
+
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<sender@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client
+            .write_all(b"RCPT TO:<user@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"DATA\r\n").await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "354 End data with <CR>.<CR><LF>\r\n"
+        );
+        client
+            .write_all(b"Subject: spool test\r\n\r\nbody line\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+
+        // Exactly one message in new/: payload + metadata, nothing in tmp/.
+        let new = dir.path().join("new");
+        let mut names: Vec<String> = Vec::new();
+        let mut rd = tokio::fs::read_dir(&new).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        assert_eq!(names.len(), 2, "spool contents: {names:?}");
+        assert!(names[0].ends_with(".eml"));
+        assert!(names[1].ends_with(".json"));
+        let id = names[0].trim_end_matches(".eml");
+        assert_eq!(names[1], format!("{id}.json"));
+
+        // Payload is exactly the (unstuffed) DATA bytes.
+        let payload = tokio::fs::read(new.join(&names[0])).await.unwrap();
+        assert_eq!(payload, b"Subject: spool test\r\n\r\nbody line\r\n");
+
+        // Metadata is complete and consistent.
+        let meta: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(new.join(&names[1])).await.unwrap()).unwrap();
+        assert_eq!(meta["queue_id"], id);
+        assert_eq!(meta["helo"], "client.test");
+        assert_eq!(meta["mail_from"], "sender@spfless-domain-xyz.test");
+        assert_eq!(meta["rcpt_to"][0], "user@example.org");
+        assert_eq!(meta["message_size"], payload.len());
+        assert!(meta["received_at"].is_string());
+        assert!(meta["peer"].is_string());
     }
 }

@@ -7,8 +7,23 @@
 > (RSA + Ed25519), DMARC, and closed-relay recipient policy** — every check
 > binding, wired into the live pipeline, and validated against real-world
 > clients (`openssl s_client -starttls smtp`, spoofed `p=reject` DMARC
-> rejection). Workspace state: **143 tests, 0 failures, clippy-clean
-> (0 warnings), fmt-clean, stable Rust 1.100.0.**
+> rejection). The DNS resolver is configurable (`--resolver` / config
+> file, default 1.1.1.1). Phase 7 has begun: accepted messages are
+> **durably spooled to disk** (the `250` is only sent after the write)
+> with a queue ID in the logs; local delivery is the next open item.
+> Workspace state: **149 tests, 0 failures,
+> clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
+>
+> **V1 scope: receive-only.** The product is a hosted receive-only
+> email service: users point their domain's MX records at us and
+> receive mail at addresses created in the management console.
+> Addresses are permanent unless the admin gives them an optional
+> expiry (disposable addresses are the flagship use case, not the
+> only one). Everything send-side (submission/MSA,
+> DKIM signing, relay) is documented but **post-V1, low priority** —
+> see Phase 8 and Phase 12. The architecture keeps the sending hooks
+> (AUTH, policy profiles, `DeliverySink`) so sending can be added
+> later without rework.
 >
 > **The frontier is now delivery**: the server accepts, verifies, and drops
 > mail. Queue/spool/delivery is the actual finish line for an MTA
@@ -130,26 +145,57 @@ architecture.
 
 The server verifies mail and drops it. This phase makes it an MTA.
 
-- [ ] **Spool to disk**: on end-of-data acceptance, write the raw message
-      plus envelope metadata (session id, peer, HELO, sender, recipients,
-      SPF/DKIM/DMARC verdicts) to a durable queue directory; reply `250`
-      only after a successful spool; crash-safe enough for a PoC (write +
-      rename).
-- [ ] **Queue identity**: generate a queue ID; include it in logs and (in
-      Phase 8) in the `Received:` header.
+- [x] **Spool to disk**: on end-of-data acceptance, the raw message plus
+      envelope metadata (session id, peer, HELO, sender, recipients,
+      SPF/DKIM/DMARC verdicts, TLS state, auth identity) is written to a
+      durable queue directory (`--spool-dir` / `spool-dir`, default
+      `spool`); the reply `250` is only sent after a successful write — a
+      failed write replies `451 4.3.0` so nothing is silently dropped.
+      Maildir-style `tmp/`+`new/` layout, fsync before rename, metadata
+      renamed last (its presence in `new/` is the commit point). Payload
+      is byte-exact raw DATA, ready for Phase 12's user-held encryption
+      at this boundary.
+- [x] **Queue identity**: maildir-style queue ID (`<hex-millis>.<uuid>`,
+      sortable, unique); logged on spool and stored in the metadata
+      (Phase 8 will put it in the `Received:` header).
 - [ ] **Local delivery**: maildir-style delivery for local domains (one
       directory per recipient), with a clear failure→`451` path.
+      *Design note (Phase 12):* keep the delivery step behind a
+      `DeliverySink`-style trait (maildir being the first implementation)
+      so a hosted backend (API/queue/DB/LMTP to an external mailbox
+      system) can replace it without touching the protocol or policy
+      layers.
 - [ ] **Message fixing on delivery**: prepend `Received:` (from, by, with,
       id, date) and `Return-Path:`.
 - [ ] **Queue drain/retry**: minimal retry loop with backoff for spool
       items that failed delivery; dead-letter directory after N attempts.
+      *Design note (Phase 12, gap 9):* express the queue as a
+      `SpoolWriter`-style backend trait (write/read/delete/list) — the
+      local-disk spool is the first implementation, an object-storage
+      backend a planned evolution.
 
-### Phase 8 — Submission semantics (MSA)
+### Phase 8 — Submission semantics (MSA) — **post-V1, low priority**
+
+Everything in this phase serves *sending* mail. V1 is a receive-only
+hosted-address service (Phase 12): users never send from these
+addresses, so none of this blocks V1. It is documented and kept on the
+plan because the receive-only design deliberately preserves its hooks
+(AUTH exists and is TLS-gated; the policy layer already distinguishes
+authenticated senders; DKIM's canonicalization core is shared with the
+future signer). Do not invest here until after V1 ships.
 
 - [ ] **DKIM signing** for authenticated submissions (sign with the
       authenticated domain's key; the `dkim` crate gains a signer).
 - [ ] **`From:` validation** for authenticated submissions (user's domain
       or configured aliases; refuse spoofed From headers at MAIL time).
+- [ ] **Production-grade credential storage.** `--auth-users` currently
+      takes plaintext `user:password` pairs on the CLI or in the config
+      file — the credentials land in shell history, `ps` output, and
+      world-readable config. Fine for a PoC, **not suitable for
+      production**: replace with a password file holding salted hashes
+      (e.g. argon2), or an external auth backend, plus a way to reload
+      credentials without restarting. Until then, treat any deployment
+      with `auth-users` set as non-production.
 - [ ] OAUTHBEARER (optional).
 - [ ] Implicit TLS on 465 (shares the acceptor; separate listener).
 
@@ -173,8 +219,12 @@ The server verifies mail and drops it. This phase makes it an MTA.
 - [ ] DNS result caching + connection reuse in `DotResolver` (currently a
       fresh TLS connection and rustls config **per query** — a per-message
       DoS amplifier).
-- [ ] Configurable resolver (not hardcoded 1.1.1.1); IPv6 resolver
-      destinations; IPv6 listener validation.
+- [x] Configurable resolver: `--resolver <IP>` / `resolver` config-file
+      key (CLI > file > default); default 1.1.1.1; resolved once in
+      `resolve_config`, threaded through `SessionConfig` into
+      `UserSession`, and logged at startup. IPv6 resolver destinations
+      and IPv6 listener validation **still open** (`--resolver` and
+      `DotResolver` take `Ipv4Addr`).
 - [ ] Rate limiting / connection caps per source IP.
 - [ ] UDP production hardening (retries/timeout) or retire `query_udp`.
 - [ ] EDNS0 handling in `dns`.
@@ -182,6 +232,20 @@ The server verifies mail and drops it. This phase makes it an MTA.
 
 ### Phase 11 — Later / optional
 
+- [ ] **Multiple MX domains.** The server currently assumes a single
+      identity: `--domain` is one required scalar value used for the
+      banner, EHLO replies, the implicit local recipient domain, and (in
+      Phase 7) `Received:`/`Return-Path:` generation. V1 keeps this
+      simple; long-term, the server should accept mail for several
+      domains as distinct MX identities. That means: a list of hosted
+      domains in the config (each with its own recipient policy at
+      minimum), banner/EHLO derived from the per-connection
+      `RCPT TO`/HELO context rather than one global domain, per-domain
+      delivery paths (maildir roots, aliases), and per-domain DMARC
+      alignment assumptions reviewed. The recipient-policy side is
+      already close (the local-domain set), so the real work is identity
+      selection in the protocol layer and per-domain delivery/queueing in
+      Phase 7's output.
 - [ ] DMARC aggregate reporting (`rua`/`ruf`), `pct` sampling, PSL for
       org-domain discovery.
 - [ ] ARC (needed before any forwarding role).
@@ -189,20 +253,217 @@ The server verifies mail and drops it. This phase makes it an MTA.
 - [ ] mailparse: RFC 2047 decoding, Content-Disposition (for user-facing
       tooling).
 
+### Phase 12 — Hosted address service (BYO domain, multi-tenant) — planning only
+
+Long-term product direction: a hosted service where users (provisioned
+through a **separate management console**, out of scope for this repo)
+bring their own domain, point its MX records at us, and create unlimited
+addresses that land in their account. **Addresses are permanent by
+default; an admin may optionally give an address an expiry** (the
+disposable/temp-address use case is a subset — create-and-expire — not
+the default lifecycle). This server becomes the
+**MX edge** of a platform; the authoritative knowledge of
+"which domains are hosted, which users belong to them, and which
+addresses belong to which user" lives in the **external system**, not in
+static config. The protocol/policy split (§DESIGN 3) was chosen exactly
+so an SMTP session implementation can hook into such an external system.
+
+**V1 is receive-only.** These addresses exist to *receive*; users will
+not send from them. Concretely for
+V1: no outbound relay, no submission/MSA role (Phase 8 deferred), no
+DKIM signing, no bounce/NDR generation — undeliverable mail is refused
+at RCPT time by the recipient authority (fail-closed), so senders'
+servers generate their own bounces. The design keeps the sending path
+open (AUTH, policy profiles, submission semantics, `DeliverySink`), but
+V1 priority order is: recipient authority → delivery → multi-domain →
+scale hardening.
+
+**What the current design already gets right:** the `SmtpSession` trait
+seam is the correct foundation — the state machine is policy-agnostic,
+verdict-based, and the driver is generic over streams, so an alternative
+session implementation can consult an external authority at every
+decision point without touching the `smtp` crate. Per-connection policy
+state is cheaply clonable (`SessionConfig`), which fits replacing static
+lookups with dynamic ones.
+
+**Gaps and issues in the current code, to close before this feature:**
+
+1. **No recipient authority seam.** `rcpt_to` validates only the
+   *domain* against a static `Arc<HashSet<String>>`; any local-part at a
+   local domain is accepted. The product needs an async
+   `RecipientResolver` trait ("is this domain hosted? does this address
+   map to a mailbox?") consulted at RCPT time, with caching
+   (aliases are unlimited — per-RCPT lookups must not hit the authority
+   every time), a timeout, and a **fail-closed** outage policy (`451`,
+   never accept-then-fail). Failure semantics matter: accepting mail the
+   platform cannot route produces backscatter once delivery exists.
+
+   **Per-domain recipient policy** (decided): the authority answers per
+   domain with one of three modes —
+
+   | Mode | RCPT behavior |
+   |---|---|
+   | `reject` (default) | `550` unless the address resolves to a mailbox |
+   | `catch-all` | accept any local-part → route to a designated inbox |
+   | `grace` | accept for recently-valid addresses for N days, then reject |
+
+   Catch-all is gated by storage quotas/retention and the Phase 10
+   rate-limiting/probe caps (catch-all makes every dictionary probe a
+   valid recipient). The disposable-address UX is `catch-all` per domain;
+   `reject` is the safe default. Note `grace` composes with optional
+   address expiry: an expired address accepts for N days, then rejects —
+   permanent addresses never age out.
+
+   **Never self-bounce (invariant):** undeliverable mail is refused at
+   RCPT time so the *sender's* infrastructure generates its own NDRs —
+   this service (receive-only) never emits a bounce itself, in V1 or
+   later.
+
+   **Refusal observability** (decided): every refusal emits a structured
+   event (timestamp, peer IP, MAIL FROM, refused address, mode, reason:
+   no-such-mailbox / expired / lookup-failure). The authority is
+   consulted on every miss, so the **console platform is the system of
+   record** for refusal stats per domain (the server's bunyan logs are
+   the ops-side mirror). This lets admins start on `reject` and graduate
+   to `catch-all` based on observed traffic. Metadata is always logged;
+   message *bodies* of refused mail are not stored by default (refused
+   traffic is mostly spam/probes — a storage and privacy liability); an
+   optional per-domain, short-retention sample capture may be offered
+   for admins evaluating catch-all.
+
+   **Per-domain admin event stream** (decided): observability is a
+   product feature, not just server logs — the platform maintains a
+   per-domain event feed surfaced to the domain's admin user in their
+   dashboard. Events are generated platform-side from the authority's
+   RCPT-consultation results (so the SMTP server stays thin: it emits
+   structured data, the console decides what is event-worthy). Likely
+   event kinds: refused-mail summaries (per address/sender, with
+   volume), delivery activity for a domain's inboxes, catch-all bucket
+   traffic, abuse signals (dictionary-attack/refusal spikes, probe
+   patterns), quota/retention warnings, and alias-expiry notices. The
+   server-side contract is therefore: emit rich structured refusal and
+   delivery metadata on every decision; keep event aggregation,
+   deduplication, and notification policy (e.g. digests vs. realtime)
+   entirely in the console.
+
+   *Known caveat — cache-induced undercounting:* if the server's
+   recipient cache answers a refusal from a cached miss, the authority
+   is never consulted and the event stream loses that refusal. V1
+   decision: **cache successes only, never refusals** — every miss
+   consults the authority, giving the invariant *every refusal reaches
+   the platform exactly once* (the per-bad-RCPT authority round-trip is
+   bounded by the Phase 10 rate-limit/probe caps). If refusal volume
+   ever makes this too expensive, evolve to server-side event emission
+   to a platform ingest queue (option noted, not planned for V1).
+2. **Hosted domains are static config.** BYO domains are provisioned
+   live via the console; the server needs a domain catalog that updates
+   without restart (reload signal, watcher, or per-connection authority
+   query). The `Arc<HashSet>` shape is already swap-friendly.
+3. **User-held encryption keys for stored mail** (planned feature).
+   Users may register a public key in the console; every message written
+   to storage for that user is **encrypted at write time** (in the
+   spool/delivery path) to that key. The private key never touches the
+   server: the future front-end decrypts inbox contents client-side.
+   Design points:
+
+   - **Mechanism**: envelope encryption — per-message symmetric key
+     (AEAD), wrapped with the user's public key. Format TBD (age/
+     X25519, OpenPGP, or a WebCrypto-friendly scheme for the browser
+     front-end; decide at implementation time). Support **key rotation**
+     by wrapping with the current key and any still-active previous
+     keys.
+   - **Integration point**: the `DeliverySink`/spool boundary (Phase 7).
+     Encryption happens *after* SMTP processing (SPF/DKIM/DMARC,
+     `Received:` prepending are already done) and *before* the bytes
+     hit storage. Queue/routing metadata (recipient identity, verdicts,
+     timestamps) stays plaintext — the server must still be able to
+     route and expire the message it cannot read.
+   - **Honest guarantee — encrypted at rest, not end-to-end.** The
+     server necessarily sees the plaintext during SMTP reception and
+     policy evaluation; what this removes is the *server-side ability
+     to read stored mail after delivery* (and anyone dumping the disk,
+     DB, or backups). Say this plainly in user-facing copy.
+   - **Consequences that are features, not bugs**: no server-side
+     search (front-end decrypts and searches locally); no post-delivery
+     content scanning; lost private key = permanently unreadable stored
+     mail (offer no recovery, state it up front).
+   - **Lifecycle still works**: retention/expiry is enforced on the
+     ciphertext — the server can delete encrypted blobs on schedule
+     without ever decrypting them.
+
+4. **Delivery model mismatch (shapes Phase 7).** Planned maildir
+   delivery assumes local OS-style recipients; platform mailboxes live
+   in the external system. Phase 7 must define the `DeliverySink` seam
+   (see Phase 7 note) and the spool metadata must carry the resolved
+   tenant/user/address identity from RCPT time, not just the raw
+   envelope.
+5. **Single-domain identity becomes required multi-domain (promote the
+   Phase 11 item).** Banner/EHLO/`Received:` must derive from the
+   hosted domain in play, not one global `--domain`; the single-cert
+   TLS acceptor needs SNI-based cert selection for BYO domains.
+6. **Submission credentials.** The static plaintext `--auth-users` map
+   (already flagged in Phase 8) is doubly wrong here: credentials must
+   come from the authority (hashed), and submission accounts are created
+   in the console, not in server config.
+7. **MX-scale economics.** At real MX volume, the per-query DoT
+   connection in `DotResolver` (one fresh TLS connection + rustls config
+   per SPF/DKIM/DMARC query) is the dominant cost — the Phase 10 DNS
+   caching/reuse item becomes a prerequisite, not an optimization.
+   Rate limiting / RCPT-probing caps (Phase 10) likewise: catch-all
+   domains make every probe a valid recipient, which is precisely what
+   dictionary attackers want.
+8. **Verdict semantics are MSA-flavored.** Rejecting `p=reject` DMARC at
+   end-of-data and the authenticated-sender exemptions make sense for
+   the MSA role; a consumer MX whose users *expect* the mail may want
+   configurable per-domain policy (accept-and-tag/quarantine vs.
+   reject). Policy profiles should be a parameter, not hard-coded
+   behavior.
+
+9. **Spool backend abstraction (object-storage queue).** Planned
+   evolution: the queue behind `SpoolWriter` is pluggable — local disk
+   first, an S3-compatible store as a hosted-service backend. The chosen
+   pattern is **staged sync, not direct-to-S3** in the SMTP path: accept
+   to the durable local spool exactly as today (fast, no object-storage
+   dependency in the `250` contract), then a backend process uploads
+   each message (S3 key = queue ID, so retries are idempotent) and
+   deletes the local copy on confirmed upload. Consequences to design
+   for: the local disk becomes a *cache with an upload backlog* (needs
+   space monitoring and a backlog metric in the admin event stream); the
+   read path (drain/retry/dead-letter/admin inspection) must fetch from
+   the backend on local miss; an upload manifest/marker makes the
+   uploaded-but-not-deleted state recoverable; and Phase 12's user-held
+   encryption composes naturally — the object store only ever holds
+   ciphertext. Never stage in `/tmp` (often tmpfs: lost on reboot,
+   defeating durability); the configured `--spool-dir` is the staging
+   area.
+
+Sequencing note: Phases 7 (delivery + spool identity), 8 (credential
+storage), 10 (DNS caching, rate limiting), and 11 (multi-domain
+identity) are all prerequisites for this phase; the Phase 7 design
+choices in particular should be made with this consumer in mind so the
+work is additive rather than a rewrite.
+
 ---
 
 ## 6. Quick-reference: current priority list
 
 1. **Phase 7 — Delivery** (spool, maildir, `Received:`/`Return-Path`,
    queue ID). The security stack is complete; delivery is the finish line.
-2. **Phase 8 — Submission semantics** (DKIM signing, `From:` policy) —
-   completes the MSA role started by STARTTLS+AUTH.
-3. **Phase 10 — Ops** (DNS caching — the biggest remaining performance/DoS
-   item; graceful shutdown; resolver config). CI, `RUST_LOG`, the config
-   file, and the accept loop are done.
-4. **Phase 9 — Extensions**, then **Phase 11** as needed.
+   *For the receive-only V1 this is the critical path; the `DeliverySink`
+   seam should anticipate the Phase 12 hosted backend.*
+2. **Phase 10 — Ops** (DNS caching — a prerequisite at MX scale, not an
+   optimization; rate limiting/RCPT-probe caps — catch-all domains make
+   every probe a valid recipient; graceful shutdown; IPv6
+   resolver/listener support). CI, `RUST_LOG`, the config file, the accept
+   loop, and resolver configuration are done.
+3. **Phase 12 — Hosted address service (receive-only V1)**: recipient
+   authority seam, dynamic domain catalog, multi-domain identity (Phase
+   11 item), verdict policy profiles.
+4. **Phase 9 — Extensions** (the inbound-relevant parts: 8BITMIME/
+   SMTPUTF8/PIPELINING advertisement; SIZE parameter enforcement), then
+   **Phase 11** remainders as needed.
+5. **Phase 8 — Submission semantics (sending)** — **post-V1, low
+   priority**. Kept documented so the receive-only design continues to
+   preserve its hooks.
 
 — End of plan.
-
-To resume this session: pi --session 01a1f700-53b6-714d-a210-19c9f103b16f
-

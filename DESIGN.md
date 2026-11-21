@@ -15,6 +15,13 @@ closed-relay recipient policy, optionally authenticates submitters, and
 structurally logs every decision. It does **not** yet deliver mail — the
 security pipeline is ahead of the MTA pipeline (see PLAN §Phase 7).
 
+**V1 product scope is receive-only**: a hosted email service —
+inbound MX delivery to user-owned addresses on BYO domains (permanent
+by default, optional per-address expiry), no sending. Send-side
+features (submission/MSA, DKIM signing) are post-V1 and low priority;
+the architecture keeps their hooks so they can be added later (PLAN
+§Phase 8, §Phase 12).
+
 Design goals, in order:
 
 1. **Correctness over features.** Every protocol behavior is pinned by a
@@ -24,8 +31,10 @@ Design goals, in order:
 3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
    canonicalization inputs are preserved exactly where security checks
    depend on them.
-4. **Deterministic tests.** The suite (144 tests) runs offline; live
-   network behavior is behind `#[ignore]` opt-ins and fixture mocks.
+4. **Deterministic tests.** The suite (145 tests) runs offline; live
+   network behavior is behind `#[ignore]` opt-ins and fixture mocks
+   (the `mailserv` integration tests exercise the real resolver path —
+   see README, Testing).
 
 ---
 
@@ -142,14 +151,19 @@ results, DMARC verdict, authenticated identity, TLS state.
 "." → end_data():
     1. dkim::verify_dkim(raw bytes)          → per-signature verdicts
     2. dmarc::fetch_policy + evaluate        → alignment + policy action
-    3. clear envelope; message_count += 1
-    4. return Control (Accept, or Reject on DMARC p=reject failure)
+    3. spool (if configured)                 → durable write, queue ID
+    4. clear envelope; message_count += 1
+    5. return Control (Accept, Reject on DMARC p=reject, or
+       Tempfail if the spool write failed)
 ```
 
-Ordering matters: DKIM runs first (DMARC consumes its results), the
-envelope is cleared before the verdict is returned (a rejected transaction
-is still over — the state machine enforces MAIL-before-RCPT again next
-time).
+Ordering matters: DKIM runs first (DMARC consumes its results), and the
+spool write happens on the acceptance path only — the `250` is sent
+after a durable write, so accepted mail is never silently dropped (a
+failed write is a `451` retryable tempfail). Rejected mail (DMARC
+`p=reject`) is never spooled. The envelope is cleared before the verdict
+is returned (a rejected transaction is still over — the state machine
+enforces MAIL-before-RCPT again next time).
 
 ---
 
@@ -172,6 +186,8 @@ time).
   plaintext, advertised only over TLS), credentials via `--auth-users`.
   Authenticated senders (MSA semantics): SPF skipped, DMARC rejection
   exempt (they passed local authentication), relay still closed.
+  *Known limitation:* credentials are stored in plaintext (CLI/config
+  file) — fine for a PoC, not for production (PLAN.md, Phase 8).
 - **Recipient policy**: `--local-domains` (closed relay regardless of
   auth — no outbound relay exists to relay to), 100-recipient cap,
   MAIL-before-RCPT sequence enforcement.
@@ -194,9 +210,11 @@ tested systematically (every truncation length + ~5,800 bit-flips of a
 real response must parse to Ok/Err, never panic).
 
 SPF evaluation goes through the `SpfResolver` **trait** (`txt`, `a`, `mx`,
-`ptr`): production uses `DotResolver` (DoT, per-query timeout), tests use
-fixture mocks — the same property that makes DKIM's fixture corpus
-openssl-anchored makes the SPF suite deterministic. The RFC 7208 §4.6.4
+`ptr`): production uses `DotResolver` (DoT, per-query timeout) against the
+resolver address chosen at startup (`--resolver` / config-file `resolver`
+key, default 1.1.1.1, threaded through `SessionConfig` into
+`UserSession`); tests use fixture mocks — the same property that makes
+DKIM's fixture corpus openssl-anchored makes the SPF suite deterministic. The RFC 7208 §4.6.4
 budget (10 lookups / 2 void, shared across include/redirect/a/mx/ptr/
 exists) bounds every evaluation regardless of record hostility.
 
@@ -238,7 +256,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-144 tests, four layers:
+149 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -262,14 +280,16 @@ One opt-in live test (`#[ignore]`) fetches protonmail's real DKIM key.
 
 Honest, tracked list (details in PLAN):
 
-- **No delivery** — accepted mail is verified and dropped (Phase 7).
-- No `Received:`/`Return-Path` generation yet (Phase 7).
+- **No local delivery** — accepted mail is verified and durably spooled
+  to disk (`--spool-dir`, maildir-style `tmp/`+`new/`), but not yet
+  delivered to mailboxes (Phase 7); no `Received:`/`Return-Path`
+  generation yet.
 - DKIM signing does not exist (Phase 8); the crate verifies only.
 - SPF macro expansion is incomplete (transformers, `%{p}`); `exp=`
   explanations are not fetched.
 - DNS: no caching/connection reuse (a fresh DoT connection per query),
-  no EDNS0 semantics, UDP is not production-hardened, resolver hardcoded
-  to 1.1.1.1.
+  no EDNS0 semantics, UDP is not production-hardened; the resolver address
+  is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only.
 - No rate limiting, no metrics, no graceful shutdown, no ARC.
 - mailparse: `Content-Disposition` is a stub; no RFC 2047 decoding;
   `Received` with comments/IPv6 literals falls back to the raw view.

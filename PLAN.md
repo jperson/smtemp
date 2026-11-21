@@ -11,7 +11,7 @@
 > file, default 1.1.1.1). Phase 7 has begun: accepted messages are
 > **durably spooled to disk** (the `250` is only sent after the write)
 > with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **156 tests, 0 failures,
+> Workspace state: **164 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -234,9 +234,24 @@ future signer). Do not invest here until after V1 ships.
       `UserSession`, and logged at startup. IPv6 resolver destinations
       and IPv6 listener validation **still open** (`--resolver` and
       `DotResolver` take `Ipv4Addr`).
-- [ ] Rate limiting / connection caps per source IP.
-- [ ] UDP production hardening (retries/timeout) or retire `query_udp`.
-- [ ] EDNS0 handling in `dns`.
+- [x] Rate limiting / connection caps per source IP: per-IP concurrent
+      cap and fixed-window connection-rate budget
+      (`--max-conn-per-ip` 10, `--max-conn-rate-per-ip` 60/min) plus a
+      server-wide semaphore (`--max-connections` 500), all enforced in
+      the accept loop before any session work — refusals answer `421`
+      and close (with a graceful drain so the client actually reads the
+      421; dropping a socket with unread inbound data would RST and
+      discard it). *Still open: RCPT-command rate limiting inside a
+      session and per-subnet (IPv6 prefix) aggregation.*
+- [x] UDP retired: `query_udp` deleted (single unauthenticated datagram
+      with no retry/timeout could never be production-safe); production
+      queries go over DoT, `dnsq` offers TCP and DoT.
+- [x] EDNS0 handling in `dns`: queries advertise a 1232-byte payload
+      (DNS flag day 2020; was 4096 — fragmentation territory), responses
+      are validated for conformance on every transport (at most one OPT,
+      root owner name, version 0; violations fail the query), and the
+      parsed EDNS0 fields (payload size, extended RCODE, version, DO
+      bit) are exposed for future use.
 - [x] `sendmail` → `smtp-client` rename.
 
 ### Phase 11 — Later / optional

@@ -93,6 +93,9 @@ file — there is no default, and its absence is a hard error at startup.
 | `--max-data-bytes <N>` | `max-data-bytes` | `1048576` (1 MiB) | Per-message size limit; enforced across the whole DATA phase, advertised as `SIZE` in EHLO, overruns get `552`. |
 | `--max-conn-duration-ms <MS>` | `max-conn-duration-ms` | `30000` (30 s) | Hard wall-clock cap per connection, including STARTTLS and AUTH. |
 | `--max-read-duration-ms <MS>` | `max-read-duration-ms` | `15000` (15 s) | Per-read timeout; a silent client is dropped. |
+| `--max-connections <N>` | `max-connections` | `500` | Server-wide cap on simultaneous connections; over-capacity connections are answered `421` and closed. |
+| `--max-conn-per-ip <N>` | `max-conn-per-ip` | `10` | Maximum simultaneous connections from a single source IP. |
+| `--max-conn-rate-per-ip <N>` | `max-conn-rate-per-ip` | `60` | Maximum new connections per 60-second window from a single source IP (flood/churn budget). Both per-IP refusals answer `421 4.7.0` and close. |
 | `--tls-cert <FILE>` | `tls-cert` | *(none)* | PEM certificate enabling STARTTLS (RFC 3207). Must be given together with `--tls-key`. When absent, STARTTLS is refused with `454` and never advertised. |
 | `--tls-key <FILE>` | `tls-key` | *(none)* | PEM private key for STARTTLS. |
 | `--auth-users <SPEC>` | `auth-users` | *(none)* | SASL credentials for AUTH PLAIN/LOGIN, as comma-separated `user:password` pairs (e.g. `alice:secret,bob:hunter2`). When set, `AUTH PLAIN LOGIN` is advertised **only over TLS** (RFC 8310); AUTH on a plaintext session is refused with `538`. ⚠️ Credentials are stored **in plaintext** in the process arguments/config file (shell history, `ps` output) — acceptable for testing only, not for production (see PLAN.md, Phase 8). |
@@ -116,6 +119,9 @@ domain = "example.org"
 max-data-bytes = 1048576
 max-conn-duration-ms = 30000
 max-read-duration-ms = 15000
+max-connections = 500
+max-conn-per-ip = 10
+max-conn-rate-per-ip = 60
 
 tls-cert = "/etc/mailserv/cert.pem"
 tls-key = "/etc/mailserv/key.pem"
@@ -156,6 +162,12 @@ local-domains = "example.org,example.net"
 - **Framing limits:** commands capped at 512 octets, data lines at 64 KiB,
   dot-unstuffing per RFC 5321 §4.5.2, up to 100 recipients (RFC 5321
   §4.5.3.1.8).
+- **Connection caps:** server-wide concurrency, per-IP concurrency, and
+  a per-IP connection-rate window (all configurable, see the table);
+  over-budget connections are answered `421 4.7.0` and closed before
+  any session starts. DNS resolution goes over DNS-over-TLS with EDNS0
+  (1232-byte payload, RFC 6891 conformance validated on every
+  response).
 - **Durable spool + local delivery:** accepted messages are written to
   the spool directory before the `250` is sent — accepted mail is never
   silently dropped. Delivery to per-recipient maildirs happens

@@ -22,6 +22,7 @@ use smtp::SmtpSession;
 use spf::SpfResult;
 
 mod delivery;
+mod limit;
 mod spool;
 
 /// One DKIM verification outcome, summarized for structured logging.
@@ -59,6 +60,19 @@ struct Args {
 
     #[arg(long)]
     max_read_duration_ms: Option<u64>,
+
+    /// Maximum simultaneous connections, server-wide.
+    #[arg(long, value_name = "N")]
+    max_connections: Option<u32>,
+
+    /// Maximum simultaneous connections from a single source IP.
+    #[arg(long, value_name = "N")]
+    max_conn_per_ip: Option<u32>,
+
+    /// Maximum new connections per 60-second window from a single
+    /// source IP (connection churn / flood budget).
+    #[arg(long, value_name = "N")]
+    max_conn_rate_per_ip: Option<u32>,
 
     /// PEM certificate for STARTTLS (requires --tls-key).
     #[arg(long)]
@@ -101,6 +115,7 @@ struct Args {
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users, resolver, spool-dir, maildir-dir,
+    /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
     /// local-domains); every key
     /// optional.
     #[arg(long, value_name = "FILE")]
@@ -117,6 +132,9 @@ struct FileConfig {
     max_data_bytes: Option<usize>,
     max_conn_duration_ms: Option<u64>,
     max_read_duration_ms: Option<u64>,
+    max_connections: Option<u32>,
+    max_conn_per_ip: Option<u32>,
+    max_conn_rate_per_ip: Option<u32>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
@@ -135,6 +153,9 @@ struct Config {
     max_data_bytes: usize,
     max_conn_duration_ms: u64,
     max_read_duration_ms: u64,
+    max_connections: u32,
+    max_conn_per_ip: u32,
+    max_conn_rate_per_ip: u32,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
@@ -174,6 +195,12 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .max_read_duration_ms
             .or(file.max_read_duration_ms)
             .unwrap_or(15 * 1000),
+        max_connections: cli.max_connections.or(file.max_connections).unwrap_or(500),
+        max_conn_per_ip: cli.max_conn_per_ip.or(file.max_conn_per_ip).unwrap_or(10),
+        max_conn_rate_per_ip: cli
+            .max_conn_rate_per_ip
+            .or(file.max_conn_rate_per_ip)
+            .unwrap_or(60),
         tls_cert: cli.tls_cert.or(file.tls_cert),
         tls_key: cli.tls_key.or(file.tls_key),
         auth_users: cli.auth_users.or(file.auth_users),
@@ -1005,12 +1032,25 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
 
+    // Connection caps (Phase 10): a server-wide semaphore plus per-IP
+    // concurrency and connection-rate budgets, enforced in the accept
+    // loop before any session work.
+    let limiter = Arc::new(limit::ConnectionLimiter::new(
+        config.max_conn_per_ip,
+        config.max_conn_rate_per_ip,
+        Duration::from_secs(60),
+    ));
+    let global_capacity = Arc::new(tokio::sync::Semaphore::new(config.max_connections as usize));
+
     info!(
         host = %config.host,
         port = config.port,
         domain = %config.domain,
         resolver = %config.resolver,
         spool_dir = %config.spool_dir,
+        max_connections = config.max_connections,
+        max_conn_per_ip = config.max_conn_per_ip,
+        max_conn_rate_per_ip = config.max_conn_rate_per_ip,
         "listening"
     );
 
@@ -1025,8 +1065,35 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+
+        let ip = peer.ip();
+
+        // Server-wide concurrency cap: over-capacity connections get a
+        // 421 and are closed without entering a session.
+        let permit = match global_capacity.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(peer = %peer, "connection refused: server at capacity");
+                refuse(
+                    stream,
+                    b"421 4.7.0 Service not available, try again later\r\n",
+                )
+                .await;
+                continue;
+            }
+        };
+
+        // Per-IP concurrency and connection-rate budgets.
+        if let Err(reason) = limiter.admit(ip).await {
+            warn!(peer = %peer, "connection refused: per-IP limit reached");
+            refuse(stream, reason.reply()).await;
+            drop(permit);
+            continue;
+        }
+
         let acceptor = acceptor.clone();
         let max_read_ms = config.max_read_duration_ms;
+        let limiter = limiter.clone();
         let session_cfg = SessionConfig {
             domain: config.domain.clone(),
             max_data: config.max_data_bytes,
@@ -1050,8 +1117,40 @@ async fn main() -> Result<()> {
                 Ok(Err(e)) => error!(peer = %peer, error = %e, "connection handler failed"),
                 Err(_) => warn!(peer = %peer, "connection exceeded the duration limit"),
             }
+
+            // Free the connection's capacity, whoever ended it.
+            drop(permit);
+            limiter.release(ip).await;
         });
     }
+}
+
+/// Answer a refused connection with an SMTP error and close it. The
+/// write is capped so a client that never reads cannot stall the accept
+/// loop; afterwards the socket is drained briefly so the client can
+/// read the reply before close — dropping a socket with unread inbound
+/// data makes Linux send RST, which discards the client's pending
+/// receive buffer (it would never see the 421). Failures are ignored —
+/// the connection is being dropped anyway.
+async fn refuse(stream: TcpStream, reply: &[u8]) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut stream = stream;
+        if tokio::io::AsyncWriteExt::write_all(&mut stream, reply)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+        // Read until EOF (or the cap) so no inbound data triggers RST.
+        let mut sink = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            use tokio::io::AsyncReadExt as _;
+            let _ = stream.read_to_end(&mut sink).await;
+        })
+        .await;
+    })
+    .await;
 }
 
 /// Per-connection policy configuration, cheap to clone from the resolved

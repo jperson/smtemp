@@ -6,6 +6,48 @@ use std::io::BufReader;
 use std::io::Write;
 use std::net::Ipv4Addr;
 
+/// The EDNS0 payload size we advertise in queries (bytes): the DNS flag
+/// day 2020 recommendation — large enough for realistic responses, small
+/// enough that responses never need IP fragmentation.
+pub const EDNS0_PAYLOAD_SIZE: u16 = 1232;
+
+/// The EDNS0 OPT pseudo-RR parsed from a response (RFC 6891).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edns0 {
+    /// The responder's advertised UDP payload size (the OPT class). On
+    /// stream transports this is informational only.
+    pub payload_size: u16,
+    /// The upper 8 bits of the OPT TTL: extended RCODE (combined with
+    /// the header RCODE for modern response codes).
+    pub extended_rcode: u8,
+    /// EDNS0 version implemented by the responder (must be 0 when we
+    /// queried with version 0).
+    pub version: u8,
+    /// DNSSEC OK flag (TTL bit 15).
+    pub dnssec_ok: bool,
+}
+
+impl Edns0 {
+    /// Decode the OPT pseudo-RR fields from a record's owner name,
+    /// type, class, and TTL. The OPT name must be the root (RFC 6891
+    /// §6.1.2); options in `rdata` carry no semantics for this client
+    /// and are ignored.
+    fn from_fields(name: &str, record_type: u16, record_class: u16, ttl: u32) -> Result<Self> {
+        if record_type != 0x29 {
+            return Err(anyhow!("not an OPT record (type {record_type})"));
+        }
+        if !name.is_empty() {
+            return Err(anyhow!("EDNS0 OPT record name is not the root"));
+        }
+        Ok(Edns0 {
+            payload_size: record_class,
+            extended_rcode: ((ttl >> 24) & 0xff) as u8,
+            version: ((ttl >> 16) & 0xff) as u8,
+            dnssec_ok: (ttl >> 15) & 0x1 == 0x1,
+        })
+    }
+}
+
 #[allow(dead_code)]
 /// A DNS message: header, question section, and the three answer
 /// sections. Parsed from (or written to) the wire format.
@@ -63,8 +105,10 @@ fn slice(data: &[u8], offset: usize, end: usize) -> Result<&[u8]> {
 }
 
 impl DnsMessage {
-    /// Build a standard query with EDNS0 OPT pseudo-RR in the additional
-    /// section.
+    /// Build a standard query with an EDNS0 OPT pseudo-RR in the
+    /// additional section, advertising a 1232-byte payload size (the
+    /// DNS flag-day 2020 recommendation: large enough for modern
+    /// responses, small enough to avoid IP fragmentation).
     pub fn new(id: u16, questions: Vec<DnsQuestion>) -> Self {
         let header = DnsHeader {
             transaction_id: id,
@@ -87,7 +131,7 @@ impl DnsMessage {
         let opt_rr = DnsResourceRecord {
             name: Label(String::from("")),
             record_type: 0x29,
-            record_class: 4096,
+            record_class: EDNS0_PAYLOAD_SIZE,
             ttl: 0x00,
             rdlength: 0x00,
             rdata: QType::EMPTY,
@@ -101,6 +145,43 @@ impl DnsMessage {
             additionals: vec![opt_rr],
         }
     }
+
+    /// Extract and validate the EDNS0 OPT pseudo-RR from the additional
+    /// section (RFC 6891).
+    ///
+    /// Returns `Ok(None)` when the responder sent no OPT record (it may
+    /// not support EDNS0 even though we queried with it). Returns `Err`
+    /// on conformance violations: more than one OPT record, or an OPT
+    /// with a non-root owner name, or an OPT version greater than the 0
+    /// we requested — each means the responder is misbehaving, and the
+    /// answer is not trustworthy.
+    pub fn edns0(&self) -> Result<Option<Edns0>> {
+        let mut found: Option<Edns0> = None;
+        for rr in &self.additionals {
+            if rr.record_type != 0x29 {
+                continue;
+            }
+            if found.is_some() {
+                return Err(anyhow!("EDNS0 violation: more than one OPT record"));
+            }
+            found = Some(Edns0::from_fields(
+                &rr.name.0,
+                rr.record_type,
+                rr.record_class,
+                rr.ttl,
+            )?);
+        }
+        if let Some(edns) = &found {
+            if edns.version > 0 {
+                return Err(anyhow!(
+                    "EDNS0 violation: responder answered with version {} (we requested 0)",
+                    edns.version
+                ));
+            }
+        }
+        Ok(found)
+    }
+
     /// Parse a full DNS message (header, questions, records) from raw
     /// bytes. Total: every malformed input is an `Err`, never a panic.
     pub fn from_bytes(data: &[u8]) -> Result<(usize, Self)> {
@@ -755,11 +836,11 @@ mod tests {
 
         // Header: id=0x1032, flags=0x0100 (rd=1), 1 question, 1 additional
         // (the EDNS0 OPT pseudo-RR), then the question, then the OPT RR:
-        // root name, type 41, class 4096 (payload size), ttl 0, rdlength 0.
+        // root name, type 41, class 1232 (payload size), ttl 0, rdlength 0.
         let expected: Vec<u8> = vec![
             0x10, 0x32, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x06, 0x67,
             0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x10, 0x00, 0x01,
-            0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let data = DnsMessage::new(0x1032, vec![question]).to_vec().unwrap();
@@ -802,6 +883,79 @@ mod tests {
 
         let (_, dq) = DnsMessage::from_bytes(&data).unwrap();
         println!("{:?}", dq);
+    }
+
+    /// Queries advertise the flag-day-2020 payload size, and a parsed
+    /// roundtrip preserves a conformant OPT record.
+    #[test]
+    fn edns0_query_advertises_1232_and_roundtrips() {
+        let q = DnsMessage::new(
+            0x1234,
+            vec![DnsQuestion {
+                name: Label::new("example.test".into()),
+                record_type: 0x10,
+                record_class: 0x01,
+            }],
+        );
+        assert_eq!(q.additionals.len(), 1);
+        assert_eq!(q.additionals[0].record_class, EDNS0_PAYLOAD_SIZE);
+        assert_eq!(q.additionals[0].record_type, 0x29);
+
+        // Roundtrip: the response's OPT decodes to version 0, no DO bit,
+        // and the payload size it was built with.
+        let resp = DnsMessage::new(0x1234, vec![]);
+        let bytes = resp.to_vec().unwrap();
+        let (_, parsed) = DnsMessage::from_bytes(&bytes).unwrap();
+        let edns = parsed.edns0().unwrap().expect("OPT must be found");
+        assert_eq!(edns.payload_size, EDNS0_PAYLOAD_SIZE);
+        assert_eq!(edns.version, 0);
+        assert_eq!(edns.extended_rcode, 0);
+        assert!(!edns.dnssec_ok);
+    }
+
+    /// A response without an OPT record is allowed (the responder may
+    /// not support EDNS0): edns0() returns Ok(None).
+    #[test]
+    fn edns0_absent_opt_is_ok() {
+        let mut resp = DnsMessage::new(1, vec![]);
+        resp.additionals.clear();
+        assert!(resp.edns0().unwrap().is_none());
+    }
+
+    /// EDNS0 conformance violations are hard errors: two OPT records,
+    /// a non-root owner name, and a version above the requested 0.
+    #[test]
+    fn edns0_violations_are_errors() {
+        let base = || DnsMessage::new(1, vec![]);
+
+        // Two OPTs.
+        let mut resp = base();
+        resp.additionals.push(resp.additionals[0].clone());
+        assert!(resp.edns0().is_err());
+
+        // Non-root owner name (RFC 6891 §6.1.2).
+        let mut resp = base();
+        resp.additionals[0].name = Label::new("evil.test".into());
+        assert!(resp.edns0().is_err());
+
+        // Version above 0.
+        let mut resp = base();
+        resp.additionals[0].ttl = 1 << 16; // version = 1
+        assert!(resp.edns0().is_err());
+    }
+
+    /// The DO bit and extended RCODE decode from their TTL positions.
+    #[test]
+    fn edns0_decodes_ttl_fields() {
+        let mut resp = DnsMessage::new(1, vec![]);
+        // ext-rcode = 5, version = 0, DO = 1, class = 1232.
+        resp.additionals[0].ttl = (5 << 24) | (1 << 15);
+        resp.additionals[0].record_class = 1232;
+        let edns = resp.edns0().unwrap().unwrap();
+        assert_eq!(edns.extended_rcode, 5);
+        assert_eq!(edns.version, 0);
+        assert!(edns.dnssec_ok);
+        assert_eq!(edns.payload_size, 1232);
     }
 }
 

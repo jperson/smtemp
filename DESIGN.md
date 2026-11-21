@@ -204,8 +204,12 @@ but passes; `pct=` is treated as 100.
 
 ## 6. DNS layer
 
-`dns` is a hostile-input-hardened wire codec plus three transports
-(DoT preferred, TCP, UDP). Response parsing is **total**: every index and
+`dns` is a hostile-input-hardened wire codec plus two transports (DoT
+preferred, TCP; the unauthenticated single-datagram UDP path was retired
+— it could not be made production-safe). Queries advertise a 1232-byte
+EDNS0 payload (flag day 2020), and responses are validated for EDNS0
+conformance on every transport (one OPT, root owner name, version 0).
+Response parsing is **total**: every index and
 slice is bounds-checked; rdata is bounded by the record's own `rdlength`;
 compression pointers are range-checked and depth-limited. The property is
 tested systematically (every truncation length + ~5,800 bit-flips of a
@@ -258,7 +262,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-156 tests, four layers:
+164 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -290,9 +294,11 @@ Honest, tracked list (details in PLAN):
 - DKIM signing does not exist (Phase 8); the crate verifies only.
 - SPF macro expansion is incomplete (transformers, `%{p}`); `exp=`
   explanations are not fetched.
-- DNS: no caching/connection reuse (a fresh DoT connection per query),
-  no EDNS0 semantics, UDP is not production-hardened; the resolver address
+- DNS: no caching/connection reuse (a fresh DoT connection per query);
+  the resolver address
   is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only.
-- No rate limiting, no metrics, no graceful shutdown, no ARC.
+- Per-IP limits are per-address, not per-subnet (IPv6 prefix aggregation
+  is future hardening); no RCPT-command rate limiting inside a session.
+- No metrics, no graceful shutdown, no ARC.
 - mailparse: `Content-Disposition` is a stub; no RFC 2047 decoding;
   `Received` with comments/IPv6 literals falls back to the raw view.

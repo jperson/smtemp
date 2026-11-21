@@ -12,7 +12,7 @@ use std::net::Ipv4Addr;
 // use tokio_rustls::TlsConnector;
 // use webpki_roots;
 
-use dns::{query_tcp, query_tls, query_udp};
+use dns::{query_tcp, query_tls};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Default, clap::ValueEnum, Serialize)]
@@ -97,11 +97,8 @@ async fn main() -> Result<()> {
     if args.tls {
         let dq = query_tls(&args.server, &args.domain, query_type, args.record_class).await?;
         println!("{}", serde_json::to_string(&dq)?);
-    } else if args.tcp {
-        let dq = query_tcp(&args.server, &args.domain, query_type, args.record_class).await?;
-        println!("{}", serde_json::to_string(&dq)?);
     } else {
-        let dq = query_udp(&args.server, &args.domain, query_type, args.record_class).await?;
+        let dq = query_tcp(&args.server, &args.domain, query_type, args.record_class).await?;
         println!("{}", serde_json::to_string(&dq)?);
     }
 

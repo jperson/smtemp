@@ -191,11 +191,14 @@ future signer). Do not invest here until after V1 ships.
 - [ ] **Production-grade credential storage.** `--auth-users` currently
       takes plaintext `user:password` pairs on the CLI or in the config
       file — the credentials land in shell history, `ps` output, and
-      world-readable config. Fine for a PoC, **not suitable for
-      production**: replace with a password file holding salted hashes
-      (e.g. argon2), or an external auth backend, plus a way to reload
-      credentials without restarting. Until then, treat any deployment
-      with `auth-users` set as non-production.
+      world-readable config. This is a deliberate interim design (the
+      AUTH mechanism and policy exemptions are the hard parts and are
+      done; storage is intentionally minimal until the console
+      integration lands) — but it must be replaced before any
+      production submission role: a password file holding salted hashes
+      (e.g. argon2) or an external auth backend, plus credential reload
+      without restart. Until replaced, do not expose `auth-users` on
+      internet-facing deployments.
 - [ ] OAUTHBEARER (optional).
 - [ ] Implicit TLS on 465 (shares the acceptor; separate listener).
 

@@ -187,7 +187,9 @@ enforces MAIL-before-RCPT again next time).
   Authenticated senders (MSA semantics): SPF skipped, DMARC rejection
   exempt (they passed local authentication), relay still closed.
   *Known limitation:* credentials are stored in plaintext (CLI/config
-  file) — fine for a PoC, not for production (PLAN.md, Phase 8).
+  file) — an interim design, to be replaced by hashed storage or an
+  external auth backend before production submission use (PLAN.md,
+  Phase 8).
 - **Recipient policy**: `--local-domains` (closed relay regardless of
   auth — no outbound relay exists to relay to), 100-recipient cap,
   MAIL-before-RCPT sequence enforcement.

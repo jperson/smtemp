@@ -199,10 +199,13 @@ impl SpoolWriter for DiskSpool {
     /// (if any) *before* the first write; an encryption failure aborts
     /// before any bytes reach disk, so there is nothing to roll back.
     ///
-    /// Crash safety (PoC-grade, per the Phase 7 plan): payload and
-    /// metadata are each written under `tmp/` and fsynced, then renamed
-    /// into `new/` — metadata last. Only the final rename is the commit;
-    /// anything left in `tmp/` is an incomplete write.
+    /// Crash safety (per the Phase 7 plan): payload and metadata are
+    /// each written under `tmp/` and fsynced, then renamed into `new/`
+    /// — metadata last. Only the final rename is the commit; anything
+    /// left in `tmp/` is an incomplete write. Known simplifications
+    /// versus a fully hardened production queue (no write-ahead journal,
+    /// single-disk assumption, best-effort rollback on error paths) are
+    /// deliberate scope cuts tracked for later hardening.
     ///
     /// Returns `Ok(queue_id)` once both files are committed under
     /// `new/`. Returns `Err` if any step fails (encryption,

@@ -222,13 +222,17 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
     for queued in spool.list()? {
         let meta = &queued.meta;
         let mut all_delivered = true;
-        for recipient in &meta.rcpt_to {
-            let message = prepare_for_delivery(meta, recipient, &queued.payload);
-            if let Err(e) = sink.deliver(recipient, &meta.queue_id, &message) {
+        for rcpt in &meta.rcpt_to {
+            // The trace headers name the envelope address; the copy goes
+            // to the authority-resolved routing mailbox (which differs
+            // from the address only under catch-all).
+            let message = prepare_for_delivery(meta, &rcpt.address, &queued.payload);
+            if let Err(e) = sink.deliver(&rcpt.mailbox, &meta.queue_id, &message) {
                 all_delivered = false;
                 tracing::warn!(
                     queue_id = %meta.queue_id,
-                    recipient = %recipient,
+                    recipient = %rcpt.address,
+                    mailbox = %rcpt.mailbox,
                     error = %e,
                     "delivery failed; message stays queued"
                 );
@@ -261,7 +265,7 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::{SpoolMeta, SpoolWriter as _};
+    use crate::spool::{SpoolMeta, SpoolRcpt, SpoolWriter as _};
 
     /// A metadata record with plausible values; tests override the
     /// fields they care about via struct update syntax.
@@ -274,7 +278,13 @@ mod tests {
             peer: "127.0.0.1:40000".into(),
             helo: Some("client.test".into()),
             mail_from: Some("sender@example.test".into()),
-            rcpt_to: vec!["user@example.org".into()],
+            rcpt_to: vec![SpoolRcpt {
+                address: "user@example.org".into(),
+                mailbox: "user@example.org".into(),
+                user: Some("alice".into()),
+                public_key: None,
+                key_generation: None,
+            }],
             spf_result: Some("Pass".into()),
             spf_helo: None,
             dkim: Vec::new(),
@@ -363,7 +373,22 @@ mod tests {
         spool
             .write(
                 SpoolMeta {
-                    rcpt_to: vec!["a@example.org".into(), "b@example.org".into()],
+                    rcpt_to: vec![
+                        SpoolRcpt {
+                            address: "a@example.org".into(),
+                            mailbox: "a@example.org".into(),
+                            user: Some("alice".into()),
+                            public_key: None,
+                            key_generation: None,
+                        },
+                        SpoolRcpt {
+                            address: "b@example.org".into(),
+                            mailbox: "b@example.org".into(),
+                            user: Some("bob".into()),
+                            public_key: None,
+                            key_generation: None,
+                        },
+                    ],
                     ..sample_meta()
                 },
                 &raw,

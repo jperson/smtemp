@@ -99,6 +99,27 @@ pub trait PayloadEncryptor: Send + Sync {
     fn encrypt(&self, payload: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// One accepted recipient with its authority-resolved routing target
+/// (Phase 12 gap 1: the resolved identity is captured at RCPT time and
+/// travels with the message through the queue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SpoolRcpt {
+    /// Envelope address exactly as the client sent it (used for the
+    /// `for <...>` clause of the generated `Received:` header).
+    pub address: String,
+    /// Routing mailbox chosen by the authority: the addressed mailbox
+    /// itself, or the designated inbox under catch-all. This is where
+    /// delivery goes.
+    pub mailbox: String,
+    /// Owning account (platform user), when the authority knows one.
+    pub user: Option<String>,
+    /// Public key registered for this mailbox (Phase 12 payload
+    /// encryption wraps the content key with every recipient's key).
+    pub public_key: Option<String>,
+    /// Key-rotation generation for [`SpoolRcpt::public_key`].
+    pub key_generation: Option<u32>,
+}
+
 /// Envelope and verdict metadata for one accepted message.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SpoolMeta {
@@ -119,8 +140,9 @@ pub struct SpoolMeta {
     /// Envelope sender (None only for authenticated submissions, where
     /// SPF was skipped).
     pub mail_from: Option<String>,
-    /// Accepted envelope recipients.
-    pub rcpt_to: Vec<String>,
+    /// Accepted envelope recipients with their authority-resolved
+    /// routing targets.
+    pub rcpt_to: Vec<SpoolRcpt>,
     /// SPF verdict for the MAIL FROM identity.
     pub spf_result: Option<String>,
     /// SPF verdict for the HELO/EHLO identity.
@@ -470,7 +492,13 @@ mod tests {
             peer: "127.0.0.1:40000".into(),
             helo: Some("client.test".into()),
             mail_from: Some("sender@example.test".into()),
-            rcpt_to: vec!["user@example.org".into()],
+            rcpt_to: vec![SpoolRcpt {
+                address: "user@example.org".into(),
+                mailbox: "user@example.org".into(),
+                user: Some("alice".into()),
+                public_key: None,
+                key_generation: None,
+            }],
             spf_result: Some("Pass".into()),
             spf_helo: None,
             dkim: Vec::new(),
@@ -563,7 +591,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta["queue_id"], queue_id.as_str());
-        assert_eq!(meta["rcpt_to"][0], "user@example.org");
+        assert_eq!(meta["rcpt_to"][0]["address"], "user@example.org");
         assert_eq!(meta["spf_result"], "Pass");
         assert_eq!(meta["message_size"], raw.len());
         assert!(meta["encryption"].is_null());

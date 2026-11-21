@@ -11,7 +11,7 @@
 > file, default 1.1.1.1). Phase 7 has begun: accepted messages are
 > **durably spooled to disk** (the `250` is only sent after the write)
 > with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **164 tests, 0 failures,
+> Workspace state: **174 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -312,21 +312,27 @@ lookups with dynamic ones.
 
 **Gaps and issues in the current code, to close before this feature:**
 
-1. **No recipient authority seam.** `rcpt_to` validates only the
-   *domain* against a static `Arc<HashSet<String>>`; any local-part at a
-   local domain is accepted. The product needs an async
-   `RecipientResolver` trait ("is this domain hosted? does this address
-   map to a mailbox?") consulted at RCPT time, with caching
-   (aliases are unlimited — per-RCPT lookups must not hit the authority
-   every time), a timeout, and a **fail-closed** outage policy (`451`,
-   never accept-then-fail). Failure semantics matter: accepting mail the
-   platform cannot route produces backscatter once delivery exists.
-   *Implementation note (encryption, gap 3):* design the resolver's
-   result to include — or be joinable with — the **user's public key**
-   (and key-rotation generation), not just mailbox routing info. The
-   multi-recipient container encryption needs the recipient key set at
-   end-of-data; retrofitting the key into the lookup result later would
-   be a second schema/API migration.
+1. **No recipient authority seam.** ~~`rcpt_to` validates only the
+   *domain* against a static `Arc<HashSet<String>>`~~ **SEAM IMPLEMENTED**
+   (Phase 12 groundwork): the blocking `RecipientResolver` trait is
+   consulted at RCPT time (via `spawn_blocking` under a 5 s timeout);
+   its `Resolution` covers NotHosted / Accept(Recipient) / Refuse{mode,
+   reason}; accepted resolutions are cached per connection
+   (**successes only** — every refusal re-consults the authority),
+   failures are fail-closed `451`, and the `Recipient` carries the
+   owning user + mailbox + **public key and rotation generation** (the
+   gap-3 implementation note is realized). The resolved routing target
+   travels in the spool metadata (`SpoolRcpt`) and drives delivery, so
+   catch-all mail lands in the designated inbox. Two implementations:
+   `FileAuthority` (JSON, hot-reloaded on mtime — the console's first
+   publishing contract; strict schema, unknown fields rejected) and
+   `StaticAuthority` (the pre-authority fallback for `--local-domains`:
+   every local-part accepts, routes to itself). Refusals are logged as
+   structured events (peer, mail-from, rcpt, mode, reason) with one
+   uniform SMTP reply for every reason (no address enumeration).
+   *Still open:* the real console-backed authority (HTTP/gRPC) behind
+   the same trait; a shared TTL cache beyond the per-connection one;
+   refusal-event aggregation in the console.
 
    **Per-domain recipient policy** (decided): the authority answers per
    domain with one of three modes —

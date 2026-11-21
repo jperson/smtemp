@@ -102,7 +102,8 @@ file — there is no default, and its absence is a hard error at startup.
 | `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. |
 | `--spool-dir <DIR>` | `spool-dir` | `spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. Messages past the delivery retry budget land in `spool/dead-letter/`. |
 | `--maildir-dir <DIR>` | `maildir-dir` | `maildir` | Local delivery root: one maildir per recipient address (`{root}/{domain}/{local}/new`), written via the `DeliverySink` trait. Delivery happens immediately after acceptance and is retried from the queue until it succeeds; each delivered copy carries `Return-Path:` and a per-recipient `Received:` trace header. |
-| `--local-domains <SPEC>` | `local-domains` | *(the `--domain` value)* | Comma-separated list of recipient domains we accept mail for. The value of `--domain` is always added implicitly. Relay access is closed regardless of authentication — mail for any other recipient domain is refused with `550 5.7.1`. |
+| `--local-domains <SPEC>` | `local-domains` | *(the `--domain` value)* | Comma-separated list of recipient domains we accept mail for. The value of `--domain` is always added implicitly. Relay access is closed regardless of authentication — mail for any other recipient domain is refused with `550 5.7.1`. Superseded by `--authority` when given. |
+| `--authority <FILE>` | `authority` | *(none)* | Recipient authority file (JSON): the hosted-domain list, per-domain policy modes, and the address→mailbox mapping. Hot-reloaded on change; supersedes `--local-domains`. See [the authority schema](#authority-file-schema). Without it, the pre-authority fallback applies: every local-part at a `--local-domains` domain is accepted and delivered to its own maildir. |
 | `--config <FILE>` | — | *(none)* | Path to a TOML config file (see below). |
 
 ### Config file example
@@ -131,6 +132,7 @@ resolver = "1.1.1.1"
 spool-dir = "spool"
 maildir-dir = "maildir"
 local-domains = "example.org,example.net"
+authority = "/etc/mailserv/authority.json"
 ```
 
 ### Environment variables
@@ -141,8 +143,14 @@ local-domains = "example.org,example.net"
 
 ## Behavior summary
 
-- **Closed relay.** Only recipients in `--local-domains` (plus
-  `--domain`) are accepted, authenticated or not.
+- **Closed relay, authority-owned policy.** Only recipients on hosted
+  domains are accepted, authenticated or not. With `--authority`, the
+  authority decides per domain (`reject` / `catch-all` / `grace`) and
+  per address; without it, every local-part at a `--local-domains`
+  domain is accepted. An authority that cannot be consulted fails
+  closed: `451`, the client retries — mail is never accepted without a
+  resolvable destination.
+
 - **SPF** (RFC 7208) is evaluated for the MAIL FROM identity at MAIL time
   (HELO identity for the null sender): `Fail`/`PermError` → `550`,
   `TempError` → `451`. DNS lookups go over DNS-over-TLS to the configured
@@ -174,6 +182,45 @@ local-domains = "example.org,example.net"
   immediately (fast path) and is retried by the queue drain until it
   succeeds; exhausted messages are dead-lettered for inspection.
   Rejected mail (e.g. DMARC `p=reject`) is not spooled or delivered.
+
+## Authority file schema
+
+`--authority` points at a JSON document (hot-reloaded on change) that
+the management console publishes:
+
+```json
+{
+  "version": 1,
+  "domains": {
+    "example.org": { "mode": "reject" },
+    "lists.example.org": { "mode": "catch-all", "catch-all-mailbox": "admin@example.org" },
+    "legacy.example.net": { "mode": "grace", "grace-days": 7 }
+  },
+  "mailboxes": {
+    "alice@example.org": {
+      "user": "alice",
+      "expires": null,
+      "public-key": "...",
+      "key-generation": 2
+    }
+  }
+}
+```
+
+- **`domains[].mode`** — `reject`: only listed, unexpired mailboxes
+  accept; `catch-all`: unknown addresses route to
+  `catch-all-mailbox` (expired addresses still refuse); `grace`:
+  expired addresses keep accepting for `grace-days` days, then refuse.
+- **`mailboxes[].expires`** — RFC 3339 timestamp or `null`
+  (permanent). **`public-key`/`key-generation`** — reserved for the
+  user-held payload encryption (PLAN.md, Phase 12); carried through to
+  the spool metadata already.
+- Refused mail gets one uniform SMTP reply (`550 5.1.1`) regardless of
+  reason, so senders cannot probe which addresses exist; the refusal
+  *reason* (with peer, sender, mode) is written to the structured log
+  for the domain admin's event stream.
+- The schema is strict: unknown fields are rejected at load (extend by
+  bumping `version`).
 
 ## Logging
 

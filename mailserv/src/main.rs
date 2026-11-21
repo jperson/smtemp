@@ -18,9 +18,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Registry};
 use uuid::Uuid;
 
+use authority::{RecipientResolver as _, Resolution};
 use smtp::SmtpSession;
 use spf::SpfResult;
 
+mod authority;
 mod delivery;
 mod limit;
 mod spool;
@@ -106,17 +108,25 @@ struct Args {
     maildir_dir: Option<String>,
 
     /// Domains whose recipients we accept mail for (comma-separated;
-    /// defaults to --domain only). Relay access is closed regardless of
-    /// authentication.
+    /// defaults to --domain only; superseded by --authority when given).
+    /// Relay access is closed regardless of authentication.
     #[arg(long)]
     local_domains: Option<String>,
+
+    /// Recipient authority file (JSON): the hosted-domain list, per-
+    /// domain policy modes, and the address-to-mailbox mapping. The
+    /// authoritative source for recipient policy; hot-reloaded on
+    /// change. Supersedes --local-domains when given. See the module
+    /// docs in authority.rs for the schema.
+    #[arg(long, value_name = "FILE")]
+    authority: Option<String>,
 
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users, resolver, spool-dir, maildir-dir,
     /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
-    /// local-domains); every key
+    /// local-domains, authority); every key
     /// optional.
     #[arg(long, value_name = "FILE")]
     config: Option<String>,
@@ -142,6 +152,7 @@ struct FileConfig {
     spool_dir: Option<String>,
     maildir_dir: Option<String>,
     local_domains: Option<String>,
+    authority: Option<String>,
 }
 
 /// Fully resolved server configuration (CLI > file > built-in defaults).
@@ -166,6 +177,28 @@ struct Config {
     /// Local delivery root (default "maildir").
     maildir_dir: String,
     local_domains: Option<String>,
+    /// Recipient authority file; None uses the static fallback built
+    /// from local-domains (pre-authority behavior).
+    authority: Option<String>,
+}
+
+/// How long a single authority lookup may take before the RCPT is
+/// refused with a temporary failure (fail-closed).
+const AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The RCPT-time authority outcome after cache/timeout handling.
+enum AuthorityAnswer {
+    /// Accept: mail routes to the resolved recipient.
+    Accept(authority::Recipient),
+    /// The domain is not hosted here: relay access denied.
+    NotHosted,
+    /// The domain is hosted but the address cannot receive mail.
+    Refuse {
+        mode: authority::PolicyMode,
+        reason: authority::RefusalReason,
+    },
+    /// The authority could not be consulted: fail closed with 451.
+    Unavailable(String),
 }
 
 /// The default DNS-over-TLS resolver.
@@ -218,6 +251,7 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .or(file.maildir_dir)
             .unwrap_or_else(|| "maildir".to_string()),
         local_domains: cli.local_domains.or(file.local_domains),
+        authority: cli.authority.or(file.authority),
     })
 }
 
@@ -297,7 +331,8 @@ struct UserSession<'session> {
 
     helo: Option<String>,
     mail_from: Option<String>,
-    rcpt_to: Vec<String>,
+    /// Accepted recipients with their authority-resolved routing.
+    rcpt_to: Vec<spool::SpoolRcpt>,
     /// Partial message body, raw bytes exactly as received.
     #[serde(skip_serializing)]
     data: Vec<u8>,
@@ -321,9 +356,15 @@ struct UserSession<'session> {
     auth_login_user: Option<String>,
     /// The mechanism of the in-progress AUTH continuation.
     auth_pending: Option<&'static str>,
-    /// Local domains we accept recipients for.
+    /// The recipient authority (Phase 12 gap 1): owns the hosted-domain
+    /// list, per-domain policy, and the address-to-mailbox mapping.
     #[serde(skip_serializing)]
-    local_domains: Arc<HashSet<String>>,
+    authority: Arc<dyn authority::RecipientResolver>,
+    /// Per-connection cache of *accepted* resolutions, keyed by
+    /// lowercased address. Refusals are never cached — every refusal
+    /// must reach the authority (the "exactly once" invariant).
+    #[serde(skip_serializing)]
+    rcpt_cache: HashMap<String, authority::Recipient>,
     /// Spool backend for accepted messages; None drops them (tests).
     #[serde(skip_serializing)]
     spool: Option<Arc<dyn spool::SpoolWriter>>,
@@ -359,7 +400,8 @@ impl<'session> UserSession<'session> {
             authenticated: None,
             auth_login_user: None,
             auth_pending: None,
-            local_domains: cfg.local_domains.clone(),
+            authority: cfg.authority.clone(),
+            rcpt_cache: HashMap::new(),
             spool: cfg.spool.clone(),
             sink: cfg.sink.clone(),
             dmarc: None,
@@ -658,16 +700,84 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::reject(BAD_ADDRESS);
         };
 
-        // Relay access is closed: recipients must be in a configured local
-        // domain, authenticated or not (there is no outbound relay yet;
-        // this stays fail-closed).
-        if !self.local_domains.contains(&domain) {
-            info!(rcpt = %addr, domain = %domain, "relay access denied");
-            return smtp::Control::reject(b"550 5.7.1 Relay access denied\r\n");
-        }
+        // Relay access is closed and policy-owned by the authority: it
+        // decides whether the domain is hosted, whether this address can
+        // receive mail under the domain's policy mode, and where the
+        // mail routes. Fail-closed: an authority that cannot be consulted
+        // means a temporary refusal, never accept-then-fail.
+        let cache_key = addr.to_ascii_lowercase();
+        let answer = if let Some(hit) = self.rcpt_cache.get(&cache_key) {
+            AuthorityAnswer::Accept(hit.clone())
+        } else {
+            let authority = self.authority.clone();
+            let lookup = addr.clone();
+            let attempt = tokio::time::timeout(
+                AUTHORITY_TIMEOUT,
+                tokio::task::spawn_blocking(move || authority.resolve(&lookup)),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(Ok(Resolution::Accept(recipient)))) => {
+                    // Successes-only cache: refusals always re-consult
+                    // the authority, so every refusal is observed by it
+                    // exactly once.
+                    self.rcpt_cache.insert(cache_key, recipient.clone());
+                    AuthorityAnswer::Accept(recipient)
+                }
+                Ok(Ok(Ok(Resolution::NotHosted))) => AuthorityAnswer::NotHosted,
+                Ok(Ok(Ok(Resolution::Refuse { mode, reason }))) => {
+                    AuthorityAnswer::Refuse { mode, reason }
+                }
+                Ok(Ok(Err(e))) => AuthorityAnswer::Unavailable(e.to_string()),
+                Ok(Err(e)) => AuthorityAnswer::Unavailable(format!("authority task failed: {e}")),
+                Err(_) => AuthorityAnswer::Unavailable("authority timed out".into()),
+            }
+        };
 
-        self.rcpt_to.push(addr);
-        smtp::Control::accept(UserSession::OK)
+        match answer {
+            AuthorityAnswer::Accept(recipient) => {
+                self.rcpt_to.push(spool::SpoolRcpt {
+                    address: addr,
+                    mailbox: recipient.mailbox,
+                    user: recipient.user,
+                    public_key: recipient.public_key,
+                    key_generation: recipient.key_generation,
+                });
+                smtp::Control::accept(UserSession::OK)
+            }
+            AuthorityAnswer::NotHosted => {
+                info!(rcpt = %addr, domain = %domain, "relay access denied");
+                smtp::Control::reject(b"550 5.7.1 Relay access denied\r\n")
+            }
+            AuthorityAnswer::Refuse { mode, reason } => {
+                // Structured refusal event (the ops-side mirror of the
+                // authority's event stream). One SMTP reply for every
+                // reason: distinguishing "expired" from "nonexistent"
+                // to the *sender* would leak which addresses once
+                // existed; the reason lives here and in the authority.
+                info!(
+                    peer = %self.peer,
+                    mail_from = ?self.mail_from,
+                    rcpt = %addr,
+                    domain = %domain,
+                    mode = ?mode,
+                    reason = ?reason,
+                    "recipient refused"
+                );
+                smtp::Control::reject(b"550 5.1.1 No such mailbox\r\n")
+            }
+            AuthorityAnswer::Unavailable(message) => {
+                warn!(
+                    peer = %self.peer,
+                    rcpt = %addr,
+                    error = %message,
+                    "authority unavailable; refusing temporarily"
+                );
+                smtp::Control::tempfail(
+                    b"451 4.3.0 Recipient resolution unavailable, try again later\r\n",
+                )
+            }
+        }
     }
 
     #[instrument(skip(self), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
@@ -867,25 +977,28 @@ impl smtp::SmtpSession for UserSession<'_> {
             // next drain pass.
             if let Some(sink) = self.sink.clone() {
                 let mut delivered_count = 0usize;
-                for recipient in self.rcpt_to.clone() {
-                    let message = delivery::prepare_for_delivery(&meta, &recipient, &raw);
+                for rcpt in self.rcpt_to.clone() {
+                    // Trace headers name the envelope address; the copy
+                    // goes to the authority-resolved routing mailbox.
+                    let message = delivery::prepare_for_delivery(&meta, &rcpt.address, &raw);
+                    let logged_address = rcpt.address.clone();
+                    let logged_mailbox = rcpt.mailbox.clone();
                     let attempt = tokio::task::spawn_blocking({
                         let sink = sink.clone();
                         let queue_id = meta.queue_id.clone();
-                        let recipient = recipient.clone();
-                        move || sink.deliver(&recipient, &queue_id, &message)
+                        move || sink.deliver(&rcpt.mailbox, &queue_id, &message)
                     })
                     .await;
                     match attempt {
                         Ok(Ok(())) => {
                             delivered_count += 1;
-                            info!(queue_id = %meta.queue_id, recipient = %recipient, "message delivered");
+                            info!(queue_id = %meta.queue_id, recipient = %logged_address, mailbox = %logged_mailbox, "message delivered");
                         }
                         Ok(Err(e)) => {
-                            warn!(queue_id = %meta.queue_id, recipient = %recipient, error = %e, "fast-path delivery failed; queued for retry");
+                            warn!(queue_id = %meta.queue_id, recipient = %logged_address, error = %e, "fast-path delivery failed; queued for retry");
                         }
                         Err(e) => {
-                            warn!(queue_id = %meta.queue_id, recipient = %recipient, error = %e, "delivery task panicked; queued for retry");
+                            warn!(queue_id = %meta.queue_id, recipient = %logged_address, error = %e, "delivery task panicked; queued for retry");
                         }
                     }
                 }
@@ -980,7 +1093,31 @@ async fn main() -> Result<()> {
         _ => HashSet::new(),
     };
     local_domains.insert(config.domain.to_ascii_lowercase());
-    let local_domains = Arc::new(local_domains);
+
+    // The recipient authority (Phase 12 gap 1): a JSON file when
+    // configured — the console's publishing format, hot-reloaded —
+    // otherwise the static fallback that preserves the pre-authority
+    // behavior for --local-domains (every local-part accepts).
+    if config.authority.is_some() && config.local_domains.is_some() {
+        warn!("--local-domains is ignored: the authority file owns the hosted-domain list");
+    }
+    let authority: Arc<dyn authority::RecipientResolver> = match &config.authority {
+        Some(path) => {
+            let a = authority::FileAuthority::open(path)?;
+            info!(backend = a.name(), file = %path, "recipient authority ready");
+            Arc::new(a)
+        }
+        None => {
+            let a =
+                authority::StaticAuthority::new(local_domains.iter().cloned().collect::<Vec<_>>());
+            info!(
+                backend = a.name(),
+                domains = local_domains.len(),
+                "no authority file; static per-address fallback (any local-part accepts)"
+            );
+            Arc::new(a)
+        }
+    };
 
     // V1: local disk spool, no payload encryption. Real providers
     // (user-held keys via the console) land with Phase 12; the backend
@@ -1098,7 +1235,7 @@ async fn main() -> Result<()> {
             domain: config.domain.clone(),
             max_data: config.max_data_bytes,
             auth_users: auth_users.clone(),
-            local_domains: local_domains.clone(),
+            authority: authority.clone(),
             resolver: config.resolver,
             spool: Some(spool.clone()),
             sink: Some(sink.clone()),
@@ -1160,7 +1297,9 @@ struct SessionConfig {
     domain: String,
     max_data: usize,
     auth_users: Option<Arc<HashMap<String, String>>>,
-    local_domains: Arc<HashSet<String>>,
+    /// Recipient authority: hosted domains, policy modes, and the
+    /// address-to-mailbox mapping (Phase 12 gap 1).
+    authority: Arc<dyn authority::RecipientResolver>,
     /// DNS-over-TLS resolver used for SPF, DKIM key, and DMARC lookups.
     resolver: Ipv4Addr,
     /// Spool backend for accepted messages; None drops them (tests).
@@ -1397,22 +1536,30 @@ mod tests {
         assert_eq!(resolved.resolver, "8.8.8.8".parse::<Ipv4Addr>().unwrap());
     }
 
-    /// Spawn handle_connection on an ephemeral port. Returns the address.
+    /// Spawn handle_connection on an ephemeral port, handling exactly
+    /// one connection. When `authority` is None, the static fallback is
+    /// built from `local_domains` (the pre-authority behavior: every
+    /// local-part at a hosted domain accepts).
     async fn spawn_server(
         acceptor: Option<Arc<TlsAcceptor>>,
         auth_users: Option<Arc<HashMap<String, String>>>,
         local_domains: Option<Vec<String>>,
         spool: Option<Arc<dyn spool::SpoolWriter>>,
+        sink: Option<Arc<dyn delivery::DeliverySink>>,
+        authority: Option<Arc<dyn authority::RecipientResolver>>,
     ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let local: Arc<HashSet<String>> = Arc::new(
-            local_domains
-                .unwrap_or_else(|| vec!["example.org".to_string()])
-                .into_iter()
-                .map(|d| d.to_ascii_lowercase())
-                .collect(),
-        );
+        let authority: Arc<dyn authority::RecipientResolver> = match authority {
+            Some(a) => a,
+            None => Arc::new(authority::StaticAuthority::new(
+                local_domains
+                    .unwrap_or_else(|| vec!["example.org".to_string()])
+                    .into_iter()
+                    .map(|d| d.to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
+            )),
+        };
         tokio::spawn(async move {
             if let Ok((stream, _peer)) = listener.accept().await {
                 let _ = handle_connection(
@@ -1423,14 +1570,14 @@ mod tests {
                         domain: "mail.example.org".to_string(),
                         max_data: 1024 * 1024,
                         auth_users,
-                        local_domains: local,
+                        authority,
                         // The integration tests exercise the real resolver
                         // path: the sender domains used below
                         // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
                         // evaluates to None and DMARC has no policy.
                         resolver: "1.1.1.1".parse().unwrap(),
                         spool,
-                        sink: None,
+                        sink,
                     },
                 )
                 .await;
@@ -1468,7 +1615,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let addr = spawn_server(Some(acceptor), None, None, None).await;
+        let addr = spawn_server(Some(acceptor), None, None, None, None, None).await;
 
         // --- Plaintext phase.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1549,7 +1696,7 @@ mod tests {
     /// session continues in the clear.
     #[tokio::test]
     async fn starttls_unavailable_is_refused() {
-        let addr = spawn_server(None, None, None, None).await;
+        let addr = spawn_server(None, None, None, None, None, None).await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
         let mut client = BufReader::new(tcp);
         read_reply(&mut client).await;
@@ -1585,7 +1732,15 @@ mod tests {
         );
         let mut users = HashMap::new();
         users.insert("alice".to_string(), "secret".to_string());
-        let addr = spawn_server(Some(acceptor), Some(Arc::new(users)), None, None).await;
+        let addr = spawn_server(
+            Some(acceptor),
+            Some(Arc::new(users)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
 
         // --- Plaintext: AUTH is neither advertised nor accepted.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1711,6 +1866,8 @@ mod tests {
             None,
             Some(vec!["example.org".to_string(), "example.net".to_string()]),
             None,
+            None,
+            None,
         )
         .await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -1760,7 +1917,7 @@ mod tests {
     /// The recipient cap (RFC 5321 Section 4.5.3.1.8: at least 100).
     #[tokio::test]
     async fn recipient_cap() {
-        let addr = spawn_server(None, None, None, None).await;
+        let addr = spawn_server(None, None, None, None, None, None).await;
         let tcp = TestTcpStream::connect(addr).await.unwrap();
         let mut client = BufReader::new(tcp);
         read_reply(&mut client).await;
@@ -1798,7 +1955,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool: Arc<dyn spool::SpoolWriter> =
             Arc::new(spool::DiskSpool::open(dir.path(), None).unwrap());
-        let addr = spawn_server(None, None, None, Some(spool)).await;
+        let addr = spawn_server(None, None, None, Some(spool), None, None).await;
 
         let tcp = TestTcpStream::connect(addr).await.unwrap();
         let mut client = BufReader::new(tcp);
@@ -1852,9 +2009,272 @@ mod tests {
         assert_eq!(meta["queue_id"], id);
         assert_eq!(meta["helo"], "client.test");
         assert_eq!(meta["mail_from"], "sender@spfless-domain-xyz.test");
-        assert_eq!(meta["rcpt_to"][0], "user@example.org");
+        assert_eq!(meta["rcpt_to"][0]["address"], "user@example.org");
+        assert_eq!(meta["rcpt_to"][0]["mailbox"], "user@example.org");
         assert_eq!(meta["message_size"], payload.len());
         assert!(meta["received_at"].is_string());
         assert!(meta["peer"].is_string());
+    }
+
+    // -- Recipient authority (Phase 12 gap 1) ---------------------------
+
+    /// The authority owns recipient policy: known addresses accept and
+    /// route to their mailbox, unknown addresses on reject-mode domains
+    /// are refused with one uniform reply, unhosted domains get the
+    /// relay-denied reply, and accepted mail spools with the resolved
+    /// routing identity.
+    #[tokio::test]
+    async fn authority_governs_recipients() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority_path = dir.path().join("authority.json");
+        std::fs::write(
+            &authority_path,
+            r#"{
+                "version": 1,
+                "domains": { "example.org": { "mode": "reject" } },
+                "mailboxes": {
+                    "alice@example.org": { "user": "alice", "public-key": "pk-alice", "key-generation": 3 }
+                }
+            }"#,
+        )
+        .unwrap();
+        let spool: Arc<dyn spool::SpoolWriter> =
+            Arc::new(spool::DiskSpool::open(dir.path().join("spool"), None).unwrap());
+        let authority = Arc::new(authority::FileAuthority::open(&authority_path).unwrap());
+        let addr = spawn_server(None, None, None, Some(spool), None, Some(authority)).await;
+
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<sender@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+
+        // Known mailbox: accepted, and resolution cached on the session.
+        client
+            .write_all(b"RCPT TO:<alice@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        // Case-variant of the cached address: served from the cache.
+        client
+            .write_all(b"RCPT TO:<ALICE@Example.ORG>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+
+        // Unknown mailbox on a reject-mode domain: refused. The reply is
+        // identical for every refusal reason (no address enumeration).
+        client
+            .write_all(b"RCPT TO:<nobody@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "550 5.1.1 No such mailbox\r\n"
+        );
+
+        // Unhosted domain: relay-denied (distinct policy reply).
+        client
+            .write_all(b"RCPT TO:<x@foreign.example>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "550 5.7.1 Relay access denied\r\n"
+        );
+
+        // Deliver to the accepted recipient: the spool record carries the
+        // resolved routing identity (user + key) from RCPT time.
+        client.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"Subject: to alice\r\n\r\nhi\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+
+        // Two recipients were accepted (the cache hit included).
+        let json = std::fs::read_dir(dir.path().join("spool/new"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json.path()).unwrap()).unwrap();
+        assert_eq!(meta["rcpt_to"].as_array().unwrap().len(), 2);
+        assert_eq!(meta["rcpt_to"][0]["mailbox"], "alice@example.org");
+        assert_eq!(meta["rcpt_to"][0]["user"], "alice");
+        assert_eq!(meta["rcpt_to"][0]["public_key"], "pk-alice");
+        assert_eq!(meta["rcpt_to"][0]["key_generation"], 3);
+    }
+
+    /// An authority that cannot be consulted fails closed: the RCPT is
+    /// refused with a temporary error, inviting the client to retry —
+    /// never accepted-and-later-failed.
+    #[tokio::test]
+    async fn authority_outage_fails_closed() {
+        struct DownAuthority;
+
+        impl authority::RecipientResolver for DownAuthority {
+            fn name(&self) -> &str {
+                "down"
+            }
+
+            fn resolve(
+                &self,
+                _address: &str,
+            ) -> Result<authority::Resolution, authority::AuthorityUnavailable> {
+                Err(authority::AuthorityUnavailable(
+                    "console unreachable".into(),
+                ))
+            }
+        }
+
+        let addr = spawn_server(None, None, None, None, None, Some(Arc::new(DownAuthority))).await;
+
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<sender@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"RCPT TO:<anyone@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "451 4.3.0 Recipient resolution unavailable, try again later\r\n"
+        );
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }
+
+    /// Catch-all domains route unknown addresses to the designated
+    /// inbox: the delivered copy lands under the *mailbox*, while the
+    /// trace headers still name the envelope address.
+    #[tokio::test]
+    async fn catch_all_routes_to_designated_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority_path = dir.path().join("authority.json");
+        std::fs::write(
+            &authority_path,
+            r#"{
+                "version": 1,
+                "domains": { "example.org": { "mode": "catch-all", "catch-all-mailbox": "admin@example.org" } },
+                "mailboxes": {
+                    "admin@example.org": { "user": "admin" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let spool: Arc<dyn spool::SpoolWriter> =
+            Arc::new(spool::DiskSpool::open(dir.path().join("spool"), None).unwrap());
+        let sink: Arc<dyn delivery::DeliverySink> =
+            Arc::new(delivery::MaildirSink::open(dir.path().join("maildir")).unwrap());
+        let authority = Arc::new(authority::FileAuthority::open(&authority_path).unwrap());
+        let addr = spawn_server(None, None, None, Some(spool), Some(sink), Some(authority)).await;
+
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<sender@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+
+        // An unknown local-part is accepted (catch-all)...
+        client
+            .write_all(b"RCPT TO:<whatever-alias@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"Subject: caught\r\n\r\nhi\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+
+        // ...and the mail lands in the admin's maildir, addressed to the
+        // envelope recipient in the trace headers.
+        let inbox = dir.path().join("maildir/example.org/admin/new");
+        let mut rd = tokio::fs::read_dir(&inbox).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names.len(), 1, "admin inbox: {names:?}");
+        let copy = std::fs::read(inbox.join(&names[0])).unwrap();
+        let text = String::from_utf8(copy).unwrap();
+        assert!(text.contains("for <whatever-alias@example.org>"));
+    }
+
+    /// Grace mode: an address expired within the grace window still
+    /// accepts; one expired beyond it is refused with the uniform reply.
+    #[tokio::test]
+    async fn grace_accepts_recently_expired_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        let authority_path = dir.path().join("authority.json");
+        std::fs::write(
+            &authority_path,
+            format!(
+                r#"{{
+                    "version": 1,
+                    "domains": {{ "example.org": {{ "mode": "grace", "grace-days": 7 }} }},
+                    "mailboxes": {{
+                        "recent@example.org": {{ "user": "u", "expires": "{}" }},
+                        "stale@example.org": {{ "user": "u", "expires": "{}" }}
+                    }}
+                }}"#,
+                jiff::Timestamp::from_second(now - 86_400).unwrap(),
+                jiff::Timestamp::from_second(now - 30 * 86_400).unwrap(),
+            ),
+        )
+        .unwrap();
+        let authority = Arc::new(authority::FileAuthority::open(&authority_path).unwrap());
+        let addr = spawn_server(None, None, None, None, None, Some(authority)).await;
+
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<sender@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+
+        client
+            .write_all(b"RCPT TO:<recent@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+
+        client
+            .write_all(b"RCPT TO:<stale@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "550 5.1.1 No such mailbox\r\n"
+        );
+        client.write_all(b"QUIT\r\n").await.unwrap();
     }
 }

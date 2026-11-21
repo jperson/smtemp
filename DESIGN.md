@@ -190,9 +190,16 @@ enforces MAIL-before-RCPT again next time).
   file) — an interim design, to be replaced by hashed storage or an
   external auth backend before production submission use (PLAN.md,
   Phase 8).
-- **Recipient policy**: `--local-domains` (closed relay regardless of
-  auth — no outbound relay exists to relay to), 100-recipient cap,
-  MAIL-before-RCPT sequence enforcement.
+- **Recipient policy**: owned by the **recipient authority** (Phase 12
+  gap 1, now a seam): at RCPT time a `RecipientResolver` decides
+  hosted-domain membership, per-domain policy (`reject` / `catch-all` /
+  `grace`), and the address→mailbox routing — with user and public key
+  attached for later encryption. V1 ships a JSON `FileAuthority`
+  (hot-reloaded; the console's publishing contract) and a
+  `StaticAuthority` fallback for `--local-domains`. Failure is
+  fail-closed (`451`); refusals are logged as structured events with
+  one uniform SMTP reply (no address enumeration). Plus the
+  100-recipient cap and MAIL-before-RCPT sequence enforcement.
 - **Framing DoS**: line caps, per-message size accounting, accept-loop
   backoff.
 
@@ -262,7 +269,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-164 tests, four layers:
+174 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).

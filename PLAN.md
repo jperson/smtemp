@@ -11,7 +11,7 @@
 > file, default 1.1.1.1). Phase 7 has begun: accepted messages are
 > **durably spooled to disk** (the `250` is only sent after the write)
 > with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **149 tests, 0 failures,
+> Workspace state: **151 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -297,6 +297,12 @@ lookups with dynamic ones.
    every time), a timeout, and a **fail-closed** outage policy (`451`,
    never accept-then-fail). Failure semantics matter: accepting mail the
    platform cannot route produces backscatter once delivery exists.
+   *Implementation note (encryption, gap 3):* design the resolver's
+   result to include — or be joinable with — the **user's public key**
+   (and key-rotation generation), not just mailbox routing info. The
+   multi-recipient container encryption needs the recipient key set at
+   end-of-data; retrofitting the key into the lookup result later would
+   be a second schema/API migration.
 
    **Per-domain recipient policy** (decided): the authority answers per
    domain with one of three modes —
@@ -366,18 +372,43 @@ lookups with dynamic ones.
    server: the future front-end decrypts inbox contents client-side.
    Design points:
 
-   - **Mechanism**: envelope encryption — per-message symmetric key
-     (AEAD), wrapped with the user's public key. Format TBD (age/
-     X25519, OpenPGP, or a WebCrypto-friendly scheme for the browser
-     front-end; decide at implementation time). Support **key rotation**
+   - **Mechanism — multi-recipient container (decided direction):**
+     hybrid encryption, PGP/age-style — a random content key encrypts
+     the payload once, and the content key is wrapped once per
+     recipient user's public key; any recipient whose key was used can
+     decrypt. One stored blob per message (no per-recipient copies).
+     Chosen over fan-out (N full ciphertext copies) because storage,
+     write cost, and queue consistency all favor a single object, and
+     per-recipient lifecycle is handled by an access list in metadata
+     ("readable by key ids") rather than duplicated objects — physical
+     deletion when no active reader remains. Resolved earlier concern:
+     under the per-domain policy model, every accepted message has
+     resolvable owner keys at write time (`reject` recipients resolve
+     to users; `catch-all` resolves to the designated inbox owner;
+     expired `grace` addresses are refused, never stored), so key
+     discovery rides the already-planned fail-closed RCPT authority
+     lookups. Format candidate: age-style X25519 recipients with
+     platform-issued keys (simple, native multi-recipient,
+     WASM-decryptable); OpenPGP only if external-tool interop is ever
+     required. Trait evolution when the console authority lands:
+     `PayloadEncryptor::encrypt` gains the recipient key set; session
+     supplies keys from the RCPT-time lookups. Support **key rotation**
      by wrapping with the current key and any still-active previous
      keys.
-   - **Integration point**: the `DeliverySink`/spool boundary (Phase 7).
-     Encryption happens *after* SMTP processing (SPF/DKIM/DMARC,
-     `Received:` prepending are already done) and *before* the bytes
-     hit storage. Queue/routing metadata (recipient identity, verdicts,
-     timestamps) stays plaintext — the server must still be able to
-     route and expire the message it cannot read.
+   - **Integration point — now implemented as the `PayloadEncryptor`
+     hook on the spool backend (Phase 7 work):** encryption happens
+     *after* SMTP processing (SPF/DKIM/DMARC, `Received:` prepending
+     are already done) and *before* the bytes hit storage; the backend
+     stores only ciphertext and records the provider id in metadata.
+     Queue/routing metadata (recipient identity, verdicts, timestamps)
+     stays plaintext — the server must still be able to route and
+     expire the message it cannot read. Remaining: real providers
+     (user-held keys from the console) and the multi-recipient fan-out
+     limitation (one provider seal per message; per-recipient copies
+     are future work). The multi-recipient container design above
+     supersedes the one-seal-per-message limitation described in
+     `spool.rs`; the trait widens to take the recipient key set when
+     the authority lands.
    - **Honest guarantee — encrypted at rest, not end-to-end.** The
      server necessarily sees the plaintext during SMTP reception and
      policy evaluation; what this removes is the *server-side ability
@@ -419,11 +450,15 @@ lookups with dynamic ones.
    reject). Policy profiles should be a parameter, not hard-coded
    behavior.
 
-9. **Spool backend abstraction (object-storage queue).** Planned
-   evolution: the queue behind `SpoolWriter` is pluggable — local disk
-   first, an S3-compatible store as a hosted-service backend. The chosen
-   pattern is **staged sync, not direct-to-S3** in the SMTP path: accept
-   to the durable local spool exactly as today (fast, no object-storage
+9. **Spool backend abstraction (object-storage queue).** The trait is
+   now in place (Phase 7 work): `SpoolWriter` (blocking
+   `write`/`name`, run on the blocking pool) with `DiskSpool` as the
+   first implementation, and a `PayloadEncryptor` hook — the backend
+   seals the payload *before* its first write and records the provider
+   id in the metadata (`encryption`), so no plaintext ever reaches
+   storage when a provider is configured. Remaining: an S3-compatible
+   backend following the **staged sync** pattern — accept to the
+   durable local spool exactly as today (fast, no object-storage
    dependency in the `250` contract), then a backend process uploads
    each message (S3 key = queue ID, so retries are idempotent) and
    deletes the local copy on confirmed upload. Consequences to design
@@ -431,11 +466,9 @@ lookups with dynamic ones.
    space monitoring and a backlog metric in the admin event stream); the
    read path (drain/retry/dead-letter/admin inspection) must fetch from
    the backend on local miss; an upload manifest/marker makes the
-   uploaded-but-not-deleted state recoverable; and Phase 12's user-held
-   encryption composes naturally — the object store only ever holds
-   ciphertext. Never stage in `/tmp` (often tmpfs: lost on reboot,
-   defeating durability); the configured `--spool-dir` is the staging
-   area.
+   uploaded-but-not-deleted state recoverable. Never stage in `/tmp`
+   (often tmpfs: lost on reboot, defeating durability); the configured
+   `--spool-dir` is the staging area.
 
 Sequencing note: Phases 7 (delivery + spool identity), 8 (credential
 storage), 10 (DNS caching, rate limiting), and 11 (multi-domain

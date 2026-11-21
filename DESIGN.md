@@ -256,7 +256,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-149 tests, four layers:
+151 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).

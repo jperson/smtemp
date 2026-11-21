@@ -241,7 +241,7 @@ struct DmarcSummary {
     action: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct UserSession<'session> {
     #[serde(skip_serializing)]
     pub max_data: usize,
@@ -283,9 +283,9 @@ struct UserSession<'session> {
     /// Local domains we accept recipients for.
     #[serde(skip_serializing)]
     local_domains: Arc<HashSet<String>>,
-    /// Disk spool for accepted messages; None drops them (tests).
+    /// Spool backend for accepted messages; None drops them (tests).
     #[serde(skip_serializing)]
-    spool: Option<Arc<spool::Spool>>,
+    spool: Option<Arc<dyn spool::SpoolWriter>>,
     /// DMARC verdict of the last completed message, for the session log.
     dmarc: Option<DmarcSummary>,
 }
@@ -759,11 +759,13 @@ impl smtp::SmtpSession for UserSession<'_> {
         }
 
         // Spool before accepting: the 250 is only sent after a durable
-        // write (Phase 7). A failed spool is a temporary failure — the
-        // client is invited to retry, nothing is lost.
+        // write (Phase 7). The backend is blocking (fsync, and object
+        // storage later), so it runs on the blocking pool. A failed
+        // spool is a temporary failure — the client is invited to
+        // retry, nothing is lost.
         if let Some(spool) = self.spool.clone() {
             let meta = spool::SpoolMeta {
-                queue_id: String::new(), // assigned by the spool
+                queue_id: String::new(), // assigned by the backend
                 session_id: self.session_id.to_string(),
                 received_at: jiff::Timestamp::now().to_string(),
                 peer: self.peer.to_string(),
@@ -777,13 +779,23 @@ impl smtp::SmtpSession for UserSession<'_> {
                 authenticated: self.authenticated.clone(),
                 tls_active: self.tls_active,
                 message_size: raw.len(),
+                encryption: None, // set by the backend's encryptor, if any
             };
-            match spool.write(meta, &raw).await {
-                Ok(queue_id) => {
+            let write = tokio::task::spawn_blocking(move || spool.write(meta, &raw));
+            match write.await {
+                Ok(Ok(queue_id)) => {
                     info!(queue_id = %queue_id, recipients = self.rcpt_to.len(), "message spooled");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(error = %e, "spool write failed; refusing with a temporary error");
+                    self.clear_envelope();
+                    self.message_count += 1;
+                    return smtp::Control::tempfail(
+                        b"451 4.3.0 Error: queueing failed, try again later\r\n",
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "spool task panicked; refusing with a temporary error");
                     self.clear_envelope();
                     self.message_count += 1;
                     return smtp::Control::tempfail(
@@ -874,7 +886,12 @@ async fn main() -> Result<()> {
     local_domains.insert(config.domain.to_ascii_lowercase());
     let local_domains = Arc::new(local_domains);
 
-    let spool = Arc::new(spool::Spool::open(&config.spool_dir).await?);
+    // V1: local disk spool, no payload encryption. Real providers
+    // (user-held keys via the console) land with Phase 12; the backend
+    // trait is already in place.
+    let spool: Arc<dyn spool::SpoolWriter> =
+        Arc::new(spool::DiskSpool::open(&config.spool_dir, None)?);
+    info!(backend = spool.name(), spool_dir = %config.spool_dir, "spool ready");
 
     let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
 
@@ -936,8 +953,8 @@ struct SessionConfig {
     local_domains: Arc<HashSet<String>>,
     /// DNS-over-TLS resolver used for SPF, DKIM key, and DMARC lookups.
     resolver: Ipv4Addr,
-    /// Disk spool for accepted messages; None drops them (tests).
-    spool: Option<Arc<spool::Spool>>,
+    /// Spool backend for accepted messages; None drops them (tests).
+    spool: Option<Arc<dyn spool::SpoolWriter>>,
 }
 
 /// Serve one connection, including a possible STARTTLS upgrade: the
@@ -1173,7 +1190,7 @@ mod tests {
         acceptor: Option<Arc<TlsAcceptor>>,
         auth_users: Option<Arc<HashMap<String, String>>>,
         local_domains: Option<Vec<String>>,
-        spool: Option<Arc<spool::Spool>>,
+        spool: Option<Arc<dyn spool::SpoolWriter>>,
     ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1566,7 +1583,8 @@ mod tests {
     #[tokio::test]
     async fn accepted_message_is_spooled() {
         let dir = tempfile::tempdir().unwrap();
-        let spool = Arc::new(spool::Spool::open(dir.path()).await.unwrap());
+        let spool: Arc<dyn spool::SpoolWriter> =
+            Arc::new(spool::DiskSpool::open(dir.path(), None).unwrap());
         let addr = spawn_server(None, None, None, Some(spool)).await;
 
         let tcp = TestTcpStream::connect(addr).await.unwrap();

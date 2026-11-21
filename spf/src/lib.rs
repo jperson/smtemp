@@ -12,11 +12,12 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Serialize;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
 use dns::proto::{DnsMessage, QType};
-use dns::query_tls;
+use dns::DnsClient;
 
 /// The public module for the lexer and AST parser.
 pub mod parser;
@@ -122,13 +123,18 @@ impl Budget {
 /// Implementations return an empty vector for a name that does not exist
 /// (NXDOMAIN) and an `Err` for transient lookup failures.
 pub trait SpfResolver {
-    /// TXT records for a domain.
+    /// TXT lookup (qtype 16): all strings concatenated by the codec,
+    /// which is what SPF records need (they live in one TXT record but
+    /// DKIM keys span multiple strings). NXDOMAIN is an empty result.
     fn txt(&self, domain: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
-    /// A records for a domain.
+    /// A lookup (qtype 1): the IPv4 addresses of the domain.
+    /// NXDOMAIN is an empty result.
     fn a(&self, domain: &str) -> impl Future<Output = Result<Vec<Ipv4Addr>>> + Send;
-    /// MX records for a domain, as (preference, exchange domain) pairs.
+    /// MX lookup (qtype 15): (preference, exchange) pairs in record
+    /// order. NXDOMAIN is an empty result.
     fn mx(&self, domain: &str) -> impl Future<Output = Result<Vec<(u16, String)>>> + Send;
-    /// PTR record names for a reverse-lookup name.
+    /// PTR lookup (qtype 12): the reverse-lookup names. NXDOMAIN is an
+    /// empty result.
     fn ptr(&self, domain: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
 }
 
@@ -136,33 +142,47 @@ pub trait SpfResolver {
 /// a resolver that stalls (or a black-holed route) produces a transient
 /// error instead of hanging the SMTP session.
 pub struct DotResolver {
-    /// The resolver's IP address (DNS-over-TLS on port 853).
-    pub server: Ipv4Addr,
-    /// Per-query timeout.
-    pub timeout: Duration,
+    /// The shared DNS client: pooled DNS-over-TLS connection and a
+    /// TTL-based result cache, shared across every consumer in the
+    /// process.
+    client: Arc<DnsClient>,
 }
 
 impl DotResolver {
-    /// A resolver with the default 5-second per-query timeout.
+    /// A resolver with its own client and the default 5-second
+    /// per-query timeout. Prefer [`DotResolver::shared`] in a server:
+    /// one client per process means one pooled connection and one warm
+    /// cache instead of a fresh handshake per evaluation.
     pub fn new(server: Ipv4Addr) -> Self {
-        DotResolver {
-            server,
-            timeout: Duration::from_secs(5),
-        }
+        DotResolver::with_timeout(server, Duration::from_secs(5))
     }
 
-    /// A resolver with an explicit per-query timeout.
+    /// A resolver with its own client and an explicit per-query timeout.
     pub fn with_timeout(server: Ipv4Addr, timeout: Duration) -> Self {
-        DotResolver { server, timeout }
+        DotResolver {
+            client: Arc::new(DnsClient::with_timeout(server, timeout)),
+        }
     }
 
+    /// Wrap an already-shared client. This is how a server should build
+    /// its resolver: the client pools the TLS connection and caches
+    /// results across every SPF, DKIM, and DMARC lookup in the process.
+    pub fn shared(client: Arc<DnsClient>) -> Self {
+        DotResolver { client }
+    }
+
+    /// The underlying shared client, for consumers outside SPF (the
+    /// DKIM key lookup uses the same pooled connection and cache).
+    pub fn client(&self) -> Arc<DnsClient> {
+        Arc::clone(&self.client)
+    }
+
+    /// One DNS query through the shared client (pooled connection,
+    /// TTL cache). Errors are already mapped: the client's timeout and
+    /// connection failures surface as `Err`, which `check_host` maps to
+    /// the transient/perm results per RFC 7208 Section 4.6.
     async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
-        match tokio::time::timeout(self.timeout, query_tls(&self.server, domain, qtype, 0x01)).await
-        {
-            Ok(resp) => resp,
-            // Elapsed is not an anyhow error; wrap it.
-            Err(_) => Err(anyhow::anyhow!("DNS query timed out")),
-        }
+        self.client.query(domain, qtype).await
     }
 }
 
@@ -244,6 +264,12 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
 
 /// Evaluate `check_host()` for an identity (RFC 7208 Section 4). Each call
 /// gets a fresh lookup budget.
+///
+/// Returns `Ok(SpfResult)` for every well-formed evaluation — including
+/// `None` (no record published), `SoftFail`, `TempError`, and
+/// `PermError`, which are *results*, not errors — so `Err` never escapes
+/// for record-level problems. The caller (SMTP policy) maps the result
+/// to a reply code.
 pub async fn check_host<R>(
     resolver: &R,
     peer: IpAddr,
@@ -258,6 +284,11 @@ where
     check_host_limited(resolver, peer, sender, domain, helo, &mut budget).await
 }
 
+/// The recursive `check_host()` core, carrying the RFC 7208
+/// Section 4.6.4 budget across includes and redirects. Returns the
+/// first matching mechanism's qualified result, or the redirect
+/// target's evaluation, or `None` when everything falls through to
+/// no mechanism (the caller then applies the default result).
 #[async_recursion]
 async fn check_host_limited<R>(
     resolver: &R,
@@ -334,6 +365,9 @@ fn qualify(q: &SpfQualifier) -> SpfResult {
     }
 }
 
+/// RFC 7208 Section 5.6: `ip4:` matches only against an IPv4 peer
+/// address inside the CIDR. Returns `Some(result)` on match, `None`
+/// otherwise (and always `None` for an IPv6 peer).
 fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
         IpAddr::V4(ip4) if ip.contains(&ip4) => Some(result.clone()),
@@ -341,6 +375,9 @@ fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResul
     }
 }
 
+/// RFC 7208 Section 5.6: `ip6:` matches only against an IPv6 peer
+/// address inside the CIDR. Returns `Some(result)` on match, `None`
+/// otherwise (and always `None` for an IPv4 peer).
 fn check_ipv6(peer: IpAddr, ip: &Ipv6Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
         IpAddr::V6(ip6) if ip.contains(&ip6) => Some(result.clone()),
@@ -467,6 +504,10 @@ async fn check_exists<R: SpfResolver + Sync>(
     Ok(Some(SpfResult::Pass))
 }
 
+/// Evaluate one directive (mechanism + qualifier) against the peer.
+/// Returns `Some(result)` when the mechanism matches (the verdict),
+/// `None` when it does not (evaluation continues to the next
+/// directive). DNS-dependent mechanisms consume the shared budget.
 async fn check_directive<R: SpfResolver + Sync>(
     resolver: &R,
     domain: &str,
@@ -603,6 +644,9 @@ mod tests {
         m
     }
 
+    /// Evaluate `check_host()` for a test sender: lowercases the
+    /// domain, builds the identity, and unwraps the result for direct
+    /// assertions.
     async fn check<R: SpfResolver + Sync>(
         resolver: &R,
         peer: &str,
@@ -619,6 +663,8 @@ mod tests {
         .await
     }
 
+    /// Reddit's real recorded SPF record: the listed IP passes through
+    /// the include chain.
     #[tokio::test]
     async fn test_check_host_reddit() {
         let result = check(
@@ -632,6 +678,8 @@ mod tests {
         assert_eq!(SpfResult::Pass, result);
     }
 
+    /// An unlisted IP falls through every include to the final `~all`
+    /// (SoftFail).
     #[tokio::test]
     async fn test_check_host_reddit_unlisted_ip() {
         let result = check(&reddit_resolver(), "10.0.0.1", "foo@test.com", "reddit.com")
@@ -641,6 +689,7 @@ mod tests {
         assert_eq!(SpfResult::SoftFail, result);
     }
 
+    /// Google's include chain: an authorized include IP passes.
     #[tokio::test]
     async fn test_check_host_google() {
         let mut resolver = MockResolver::default();
@@ -670,6 +719,7 @@ mod tests {
         assert_eq!(SpfResult::SoftFail, result);
     }
 
+    /// A CIDR `ip4:` mechanism matches by network, not exact address.
     #[tokio::test]
     async fn test_check_host_bing() {
         let mut resolver = MockResolver::default();
@@ -686,6 +736,8 @@ mod tests {
         assert_eq!(SpfResult::Fail, result);
     }
 
+    /// RFC 7208 Section 5.4: `mx` resolves each MX exchange to its A
+    /// records and matches against them.
     #[tokio::test]
     async fn test_mx_mechanism_resolves_exchange_names() {
         let mut resolver = MockResolver::default();
@@ -713,6 +765,8 @@ mod tests {
         assert_eq!(SpfResult::Fail, fail);
     }
 
+    /// RFC 7208 Section 5.5: `ptr` requires a forward-confirmed reverse
+    /// lookup whose hostname resolves back to the peer.
     #[tokio::test]
     async fn test_ptr_mechanism_forward_confirms() {
         let mut resolver = MockResolver::default();
@@ -747,6 +801,8 @@ mod tests {
         assert_eq!(SpfResult::Fail, fail);
     }
 
+    /// A domain with no SPF record evaluates to `None` (no policy
+    /// published).
     #[tokio::test]
     async fn test_no_record_is_none() {
         let resolver = MockResolver::default();
@@ -763,6 +819,8 @@ mod tests {
         assert_eq!(SpfResult::None, result);
     }
 
+    /// RFC 7208 Section 5.2: an `include:` to a domain with no SPF
+    /// record is a PermError, not a no-match.
     #[tokio::test]
     async fn test_include_without_record_is_permerror() {
         let mut resolver = MockResolver::default();
@@ -779,6 +837,8 @@ mod tests {
         assert_eq!(SpfResult::PermError, result);
     }
 
+    /// RFC 7208 Section 3.2: more than one `v=spf1` record on a domain
+    /// is a PermError.
     #[tokio::test]
     async fn test_multiple_spf_records_are_permerror() {
         let mut resolver = MockResolver::default();
@@ -797,6 +857,7 @@ mod tests {
 
     // -- Lookup budget (RFC 7208 Section 4.6.4) ---------------------------
 
+    /// Circular includes terminate with PermError via the lookup budget.
     #[tokio::test]
     async fn circular_include_terminates_with_permerror() {
         let mut resolver = MockResolver::default();
@@ -816,6 +877,7 @@ mod tests {
         assert_eq!(SpfResult::PermError, result);
     }
 
+    /// A `redirect` loop terminates with PermError via the same budget.
     #[tokio::test]
     async fn redirect_loop_terminates_with_permerror() {
         let mut resolver = MockResolver::default();
@@ -832,6 +894,8 @@ mod tests {
         assert_eq!(SpfResult::PermError, result.unwrap_err().to_result());
     }
 
+    /// The 10-lookup budget: an eleventh DNS-consuming mechanism is a
+    /// PermError.
     #[tokio::test]
     async fn too_many_mechanism_lookups_is_permerror() {
         let mut resolver = MockResolver::default();
@@ -862,6 +926,7 @@ mod tests {
         assert_eq!(SpfResult::PermError, result);
     }
 
+    /// The budget boundary: exactly 10 lookups evaluate normally.
     #[tokio::test]
     async fn exactly_ten_lookups_still_pass() {
         let mut resolver = MockResolver::default();
@@ -888,6 +953,8 @@ mod tests {
         assert_eq!(SpfResult::Pass, result);
     }
 
+    /// RFC 7208 Section 4.6.4: the third void lookup (empty answer set)
+    /// is a PermError.
     #[tokio::test]
     async fn void_lookups_are_limited_to_two() {
         let mut resolver = MockResolver::default();
@@ -913,6 +980,7 @@ mod tests {
         assert_eq!(SpfResult::Pass, result);
     }
 
+    /// MX exchange A-lookups consume the budget like any other lookup.
     #[tokio::test]
     async fn mx_exchange_lookups_count_toward_the_budget() {
         let mut resolver = MockResolver::default();

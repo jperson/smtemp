@@ -11,7 +11,7 @@
 > file, default 1.1.1.1). Phase 7 has begun: accepted messages are
 > **durably spooled to disk** (the `250` is only sent after the write)
 > with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **174 tests, 0 failures,
+> Workspace state: **181 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -225,9 +225,20 @@ future signer). Do not invest here until after V1 ships.
 - [x] Accept-loop resilience + task result logging. (Graceful shutdown
       (SIGTERM → stop accepting, drain in-flight) **still open**.)
 - [x] Config file (`--config`, TOML, CLI-over-file precedence).
-- [ ] DNS result caching + connection reuse in `DotResolver` (currently a
-      fresh TLS connection and rustls config **per query** — a per-message
-      DoS amplifier).
+- [x] DNS result caching + connection reuse: `dns::DnsClient` — one
+      shared client per process holds a pooled DNS-over-TLS connection
+      (mutex-serialized exchanges; any failed or timed-out exchange
+      poisons the connection so a half-completed read can never be
+      mispaired with the next query, and connection-level failures
+      retry once on a fresh connection) and a TTL-based result cache
+      (positive: minimum answer TTL; NXDOMAIN/NODATA: SOA-derived
+      negative TTL per RFC 2308; clamped to 1 h; bounded to 4096
+      entries). SPF, DKIM, and DMARC all share it — one session went
+      from ~4 full TLS handshakes to one connection. Verified against a
+      real 1.1.1.1 endpoint and a mock DoT server (reuse, cache-hit,
+      transparent reconnect). *Still open: connection *pooling* beyond
+      one serialized connection (contention at very high query rates);
+      EDNS0 option negotiation is minimal.*
 - [x] Configurable resolver: `--resolver <IP>` / `resolver` config-file
       key (CLI > file > default); default 1.1.1.1; resolved once in
       `resolve_config`, threaded through `SessionConfig` into

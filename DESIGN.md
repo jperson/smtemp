@@ -223,9 +223,10 @@ tested systematically (every truncation length + ~5,800 bit-flips of a
 real response must parse to Ok/Err, never panic).
 
 SPF evaluation goes through the `SpfResolver` **trait** (`txt`, `a`, `mx`,
-`ptr`): production uses `DotResolver` (DoT, per-query timeout) against the
-resolver address chosen at startup (`--resolver` / config-file `resolver`
-key, default 1.1.1.1, threaded through `SessionConfig` into
+`ptr`): production uses `DotResolver` around one process-wide `DnsClient`
+(pooled DoT connection, TTL cache) built from the resolver address chosen
+at startup (`--resolver` / config-file `resolver` key, default 1.1.1.1,
+threaded through `SessionConfig` into
 `UserSession`); tests use fixture mocks — the same property that makes
 DKIM's fixture corpus openssl-anchored makes the SPF suite deterministic. The RFC 7208 §4.6.4
 budget (10 lookups / 2 void, shared across include/redirect/a/mx/ptr/
@@ -269,7 +270,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-174 tests, four layers:
+181 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -301,8 +302,9 @@ Honest, tracked list (details in PLAN):
 - DKIM signing does not exist (Phase 8); the crate verifies only.
 - SPF macro expansion is incomplete (transformers, `%{p}`); `exp=`
   explanations are not fetched.
-- DNS: no caching/connection reuse (a fresh DoT connection per query);
-  the resolver address
+- DNS: a single pooled DoT connection per process (serialized — no
+  pipelining/multiplexing, so contention is possible at very high query
+  rates); the resolver address
   is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only.
 - Per-IP limits are per-address, not per-subnet (IPv6 prefix aggregation
   is future hardening); no RCPT-command rate limiting inside a session.

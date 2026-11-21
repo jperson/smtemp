@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.86"
 clap = { version = "4.5.15", features = ["derive"] }
 tokio = { version = "1.39.2", features = ["full"] }
+dns = { path = "../dns" }
 smtp = { path = "../smtp" }
 spf = { path = "../spf" }
 dkim = { path = "../dkim" }

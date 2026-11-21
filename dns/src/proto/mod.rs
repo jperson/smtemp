@@ -230,9 +230,20 @@ impl DnsMessage {
     }
 
     /// Serialize the full message (header, questions, records).
+    /// Serialize to wire format. The header counts are synchronized
+    /// with the actual section lengths here — a message that carries
+    /// records but advertises fewer of them in its header is malformed
+    /// on the wire, and forgetting to bump the counts by hand is an
+    /// easy way to produce exactly that.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
+        let mut header = self.header.clone();
+        header.question_count = self.questions.len() as u16;
+        header.answer_count = self.answers.len() as u16;
+        header.authority_resource_records = self.authorities.len() as u16;
+        header.additional_resource_records_count = self.additionals.len() as u16;
+
         let mut data = Vec::new();
-        let _ = data.write_all(self.header.to_bytes()?.as_slice());
+        let _ = data.write_all(header.to_bytes()?.as_slice());
 
         for q in &self.questions {
             let _ = data.write_all(q.to_bytes()?.as_slice());

@@ -30,9 +30,10 @@ use rsa::pkcs8::DecodePublicKey as _;
 use rsa::signature::Verifier;
 use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
-use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+use dns::DnsClient;
 
 use mailparse::{parse_message, ParsedMessage, RawHeader};
 
@@ -284,6 +285,8 @@ pub fn find_signatures<'a, 'm>(msg: &'a ParsedMessage<'m>) -> Vec<ParsedSignatur
 // Canonicalization (RFC 6376 Section 3.4)
 // ---------------------------------------------------------------------------
 
+/// Is this byte a WSP (space or tab)? RFC 6376 Section 3.4 folds
+/// CRLF + WSP; WSP here is the character class test.
 fn is_wsp(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
@@ -464,6 +467,9 @@ fn dkim_sig_without_b(raw_value: &[u8]) -> Vec<u8> {
 /// Compute the base64 body hash (`bh=`) for a signature over the message's
 /// raw body: canonicalize per the signature's body algorithm, truncate to
 /// `l=` bytes if present, then hash with the algorithm named by `a=`.
+///
+/// Returns `Ok(base64 digest)` or `Err` for an unsupported hash
+/// algorithm.
 pub fn body_hash(msg: &ParsedMessage, sig: &DkimSignature) -> Result<String, DkimError> {
     let mut canon = canonicalize_body(sig.body_canon, msg.body);
     if let Some(l) = sig.body_length {
@@ -477,6 +483,10 @@ pub fn body_hash(msg: &ParsedMessage, sig: &DkimSignature) -> Result<String, Dki
 }
 
 /// Check the computed body hash against the signature's `bh=` tag.
+///
+/// Returns `Ok(true)` on an exact match, `Ok(false)` on a mismatch
+/// (the classic DKIM `permfail` body condition), or `Err` if the body
+/// hash itself could not be computed.
 pub fn body_hash_matches(msg: &ParsedMessage, sig: &DkimSignature) -> Result<bool, DkimError> {
     Ok(body_hash(msg, sig)? == strip_fws(sig.body_hash))
 }
@@ -590,10 +600,14 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 --b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4--
 "#;
 
+    /// The test message with CRLF line endings, as DKIM canonicalization
+    /// would see it on the wire.
     fn message_bytes() -> Vec<u8> {
         TEST_MESSAGE.replace('\n', "\r\n").into_bytes()
     }
 
+    /// The parsed test message, borrowed for 'static (the backing bytes
+    /// are intentionally leaked; fine for tests).
     fn parsed() -> mailparse::ParsedMessage<'static> {
         // Leaks the message bytes so the ParsedMessage can borrow them with
         // 'static; fine for tests.
@@ -601,6 +615,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         parse_message(bytes).unwrap()
     }
 
+    /// RFC 6376 Section 3.4.5's own relaxed header example, plus the
+    /// collapse rules the RFC pins down.
     #[test]
     fn test_relaxed_headers_canonicalization() {
         // RFC 6376 Section 3.4.5 example: "A: X\r\nB : Y\t\r\n\t Z  \r\n"
@@ -609,11 +625,14 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(relaxed_header(b"B ", b"Y \t\r\n\t Z  "), b"b:Y Z");
     }
 
+    /// Simple header canonicalization keeps the header byte-exact.
     #[test]
     fn test_simple_header_canonicalization() {
         assert_eq!(simple_header(b"A", b" X\r\n"), b"A: X\r\n");
     }
 
+    /// Relaxed body canonicalization: strip trailing WSP per line,
+    /// collapse interior WSP runs, remove trailing empty lines.
     #[test]
     fn test_relaxed_body_canonicalization() {
         // RFC 6376 Section 3.4.5 example.
@@ -621,6 +640,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(relaxed_body(body), b" C\r\nD E\r\n");
     }
 
+    /// The RFC 6376 Section 3.4.3/3.4.4 edge cases: empty bodies,
+    /// missing final CRLF, and empty-line handling for both algorithms.
     #[test]
     fn test_body_canonicalization_edges() {
         // Trailing empty lines collapse to a single CRLF.
@@ -637,6 +658,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(simple_body(b""), b"\r\n");
     }
 
+    /// Every DKIM-Signature tag parses into the right field, including
+    /// folded `b=` values.
     #[test]
     fn test_parse_signature_tags() {
         let raw = "v=1; a=rsa-sha256; c=relaxed/relaxed; d=protonmail.com; \
@@ -670,6 +693,9 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         );
     }
 
+    /// Malformed signature tag lists are rejected: wrong version,
+    /// missing required tags, empty `h=`; `c=` with only the header
+    /// algorithm defaults the body algorithm to simple.
     #[test]
     fn test_parse_rejects_missing_and_invalid_tags() {
         assert!(DkimSignature::parse("v=2; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From").is_err());
@@ -681,6 +707,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!((sig.header_canon, sig.body_canon), ("relaxed", "simple"));
     }
 
+    /// Removing the `b=` value for signing produces the signed form:
+    /// the tag name and separators survive, the value is gone.
     #[test]
     fn test_dkim_sig_without_b() {
         let raw = b"v=1; a=rsa-sha256; d=x.com; s=s; bh=abc=; h=From; b=OcGM\r\n\t bHQ7==";
@@ -690,6 +718,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         );
     }
 
+    /// The computed body hash of the test message matches the fixture's
+    /// `bh=` value, and the comparison helpers agree.
     #[test]
     fn body_hash_of_signed_message() {
         let msg = parsed();
@@ -710,6 +740,9 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(verify_body_hashes(&msg), vec![(sig.clone(), true)]);
     }
 
+    /// The signed header data of a real-world-shaped message is
+    /// assembled in `h=` order with canonicalization and CRLF folding
+    /// exactly as RFC 6376 Section 3.7 prescribes.
     #[test]
     fn signed_header_data_of_real_message() {
         let msg = parsed();
@@ -741,6 +774,9 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         }
     }
 
+    /// RFC 6376 Section 5.4.2: `h=` selects headers bottom-up, and each
+    /// header instance is used at most once - over-subscription stops
+    /// at the instances that exist.
     #[test]
     fn header_selection_is_bottom_up_and_single_use() {
         let raw = b"X-Test: one\r\nSubject: s\r\nX-Test: two\r\n\r\nbody\r\n";
@@ -760,6 +796,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(data.ends_with(b"subject:s"));
     }
 
+    /// DKIM key record tags parse: key type, public key, service type,
+    /// flags, and the hash restriction list.
     #[test]
     fn test_parse_key_record() {
         let key = DkimKeyRecord::parse("v=DKIM1; k=rsa; p=MIIBIjAN; s=email; t=s:y; h=sha256:sha1")
@@ -794,6 +832,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(!bad_version.version_ok());
     }
 
+    /// RFC 6376 Section 3.6.1 AUID alignment: `i=` equal to or a
+    /// subdomain of `d=` aligns, unless the key record sets `t=s`.
     #[test]
     fn test_auid_matching() {
         let key = DkimKeyRecord::parse("v=DKIM1; p=abc").unwrap();
@@ -827,6 +867,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(auid_matches(&no_i, &key));
     }
 
+    /// The `x=` expiry comparison: exactly at the timestamp is not yet
+    /// expired, one second later is.
     #[test]
     fn test_expiry() {
         let sig =
@@ -839,9 +881,9 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(!is_expired(&no_x, u64::MAX));
     }
 
-    /// Sign a message with a locally generated RSA key and verify it with
-    /// the full DNS-free verification path — the complete positive and
-    /// negative test of the verifier.
+    /// RSA end-to-end: sign the test message's DKIM-Signature with a
+    /// generated RSA key, publish the matching key record, and verify -
+    /// the full RFC 6376 verification path.
     #[test]
     fn rsa_sign_and_verify_end_to_end() {
         use rsa::pkcs1v15::SigningKey;
@@ -907,8 +949,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(r3.signature_ok);
     }
 
-    /// Sign a message with a locally generated Ed25519 key (RFC 8463) and
-    /// verify it, including tamper and key-type-mismatch negatives.
+    /// Ed25519 end-to-end (RFC 8463): sign with a generated Ed25519
+    /// key and verify through the same path.
     #[test]
     fn ed25519_sign_and_verify_end_to_end() {
         use ed25519_dalek::{Signer as _, SigningKey};
@@ -968,6 +1010,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(matches!(r3.error, Some(DkimError::InvalidKey(_))));
     }
 
+    /// A signature made by a different key must not verify: the body
+    /// hash may match, the signature must not.
     #[test]
     fn verify_rejects_mismatched_key() {
         use rsa::pkcs8::EncodePublicKey as _;
@@ -989,9 +1033,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(!result.signature_ok);
     }
 
-    /// Live DNS fetch of a real published DKIM key. Ignored by default to
-    /// keep the suite offline-deterministic; run with `cargo test -p dkim
-    /// -- --ignored`.
+    /// Live: fetch protonmail's real DKIM key over DNS-over-TLS.
+    /// Opt-in because it touches the network.
     #[tokio::test]
     #[ignore = "hits live DNS (DoT to 1.1.1.1)"]
     async fn live_fetch_public_key() {
@@ -999,7 +1042,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
             "v=1; a=rsa-sha256; b=x; bh=x; d=protonmail.com; s=protonmail3; h=From",
         )
         .unwrap();
-        let resolver: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let resolver = DnsClient::new("1.1.1.1".parse().unwrap());
         let key = fetch_public_key(&resolver, &sig).await.unwrap();
         assert_eq!(key.key_type, "rsa");
         assert!(key.public_key.len() > 100, "key material looks truncated");
@@ -1105,13 +1148,15 @@ impl DkimKeyRecord {
 }
 
 /// Fetch the DKIM public key record for a signature:
-/// TXT at `{selector}._domainkey.{domain}`, over DNS-over-TLS.
+/// TXT at `{selector}._domainkey.{domain}`, over the shared DNS-over-TLS
+/// client (pooled connection, TTL cache).
 pub async fn fetch_public_key(
-    resolver: &Ipv4Addr,
+    resolver: &DnsClient,
     sig: &DkimSignature<'_>,
 ) -> Result<DkimKeyRecord, DkimError> {
     let name = sig.key_query_name();
-    let resp = dns::query_tls(resolver, &name, 0x10, 0x01)
+    let resp = resolver
+        .query(&name, 0x10)
         .await
         .map_err(|e| DkimError::KeyLookupFailed(e.to_string()))?;
 
@@ -1309,7 +1354,7 @@ pub fn verify_with_key<'m>(
 /// fetch each signer's public key over DNS-over-TLS, and cryptographically
 /// verify the signed header data. Returns one result per signature; an
 /// empty result means the message had no parseable DKIM signature.
-pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &Ipv4Addr) -> Vec<DkimResult<'m>> {
+pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimResult<'m>> {
     let Ok(msg) = parse_message(raw) else {
         return Vec::new();
     };

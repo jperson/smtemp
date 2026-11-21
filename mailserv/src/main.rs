@@ -326,7 +326,10 @@ struct UserSession<'session> {
 
     pub session_id: Uuid,
     domain: &'session str,
-    dns: Ipv4Addr,
+    /// Shared DNS client (pooled DoT connection + TTL cache) for SPF,
+    /// DKIM key, and DMARC lookups.
+    #[serde(skip_serializing)]
+    dns: Arc<dns::DnsClient>,
     peer: SocketAddr,
 
     helo: Option<String>,
@@ -383,7 +386,7 @@ impl<'session> UserSession<'session> {
             session_id: Uuid::new_v4(),
 
             domain: &cfg.domain,
-            dns: cfg.resolver,
+            dns: cfg.dns.clone(),
             peer,
 
             helo: None,
@@ -460,7 +463,7 @@ impl smtp::SmtpSession for UserSession<'_> {
             None
         } else {
             match spf::check_host(
-                &spf::DotResolver::new(self.dns),
+                &spf::DotResolver::shared(self.dns.clone()),
                 self.peer.ip(),
                 &format!("postmaster@{h}"),
                 h.to_string(),
@@ -652,7 +655,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         let result = match identity {
             Some((sender, domain)) => {
                 match spf::check_host(
-                    &spf::DotResolver::new(self.dns),
+                    &spf::DotResolver::shared(self.dns.clone()),
                     self.peer.ip(),
                     &sender,
                     domain.clone(),
@@ -852,7 +855,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         let mut dmarc_summary: Option<DmarcSummary> = None;
 
         if let Some(from_domain) = from_domain {
-            let resolver = spf::DotResolver::new(self.dns);
+            let resolver = spf::DotResolver::shared(self.dns.clone());
             let record = match dmarc::fetch_policy(&resolver, &from_domain).await {
                 Ok(Some(record)) => Some(record),
                 Ok(None) => None,
@@ -1169,6 +1172,15 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
 
+    // One shared DNS client for the whole process (Phase 10): the pooled
+    // DNS-over-TLS connection and the TTL result cache serve SPF, DKIM,
+    // and DMARC alike — previously every query paid a full TLS handshake.
+    let dns_client = Arc::new(dns::DnsClient::new(config.resolver));
+    info!(
+        resolver = %config.resolver,
+        "DNS-over-TLS client ready (pooled connection, TTL cache)"
+    );
+
     // Connection caps (Phase 10): a server-wide semaphore plus per-IP
     // concurrency and connection-rate budgets, enforced in the accept
     // loop before any session work.
@@ -1236,7 +1248,7 @@ async fn main() -> Result<()> {
             max_data: config.max_data_bytes,
             auth_users: auth_users.clone(),
             authority: authority.clone(),
-            resolver: config.resolver,
+            dns: dns_client.clone(),
             spool: Some(spool.clone()),
             sink: Some(sink.clone()),
         };
@@ -1300,8 +1312,8 @@ struct SessionConfig {
     /// Recipient authority: hosted domains, policy modes, and the
     /// address-to-mailbox mapping (Phase 12 gap 1).
     authority: Arc<dyn authority::RecipientResolver>,
-    /// DNS-over-TLS resolver used for SPF, DKIM key, and DMARC lookups.
-    resolver: Ipv4Addr,
+    /// Shared DNS client used for SPF, DKIM key, and DMARC lookups.
+    dns: Arc<dns::DnsClient>,
     /// Spool backend for accepted messages; None drops them (tests).
     spool: Option<Arc<dyn spool::SpoolWriter>>,
     /// Local delivery sink; None leaves messages queued (tests).
@@ -1575,7 +1587,11 @@ mod tests {
                         // path: the sender domains used below
                         // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
                         // evaluates to None and DMARC has no policy.
-                        resolver: "1.1.1.1".parse().unwrap(),
+                        // The integration tests exercise the real resolver
+                        // path: the sender domains used below
+                        // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
+                        // evaluates to None and DMARC has no policy.
+                        dns: Arc::new(dns::DnsClient::new("1.1.1.1".parse().unwrap())),
                         spool,
                         sink,
                     },

@@ -21,6 +21,23 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::io::Write as _;
+
+/// Shared removal body for [`DiskSpool::remove`] and
+/// [`DiskSpool::remove_committed`]: metadata first, then payload and
+/// sidecar; missing files are tolerated (a concurrent drain pass may
+/// have removed the message already).
+fn remove_committed_at(meta_path: &Path, payload_path: &Path, attempts_path: &Path) -> Result<()> {
+    match std::fs::remove_file(meta_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("cannot remove {}", meta_path.display()));
+        }
+    }
+    let _ = std::fs::remove_file(payload_path);
+    let _ = std::fs::remove_file(attempts_path);
+    Ok(())
+}
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -47,6 +64,15 @@ pub trait SpoolWriter: Send + Sync {
     /// message is not). Callers treat `Err` as a temporary failure and
     /// refuse the message with `451`.
     fn write(&self, meta: SpoolMeta, payload: &[u8]) -> Result<String>;
+
+    /// Remove a fully handled message from the backend (all recipients
+    /// delivered, or dead-lettered by the drain).
+    ///
+    /// Removing a queue ID that no longer exists is **not** an error —
+    /// the inline delivery fast path and the drain loop race, and either
+    /// may remove first. Returns `Err` only if removal genuinely fails
+    /// (I/O error); the message then stays queued and is retried later.
+    fn remove(&self, queue_id: &str) -> Result<()>;
 }
 
 /// Encrypts a message payload before it reaches the spool backend.
@@ -74,13 +100,16 @@ pub trait PayloadEncryptor: Send + Sync {
 }
 
 /// Envelope and verdict metadata for one accepted message.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SpoolMeta {
     /// Set by the backend during [`SpoolWriter::write`]; the queue
     /// identity of this message.
     pub queue_id: String,
     /// The SMTP session that accepted the message.
     pub session_id: String,
+    /// The server's own domain for this connection (the `by` clause of
+    /// the `Received:` header generated at delivery).
+    pub server_domain: String,
     /// RFC 3339 reception timestamp.
     pub received_at: String,
     /// The connected peer (`ip:port`).
@@ -186,6 +215,138 @@ impl DiskSpool {
         let _ = std::fs::remove_file(self.new_dir.join(format!("{queue_id}.eml")));
         let _ = std::fs::remove_file(self.tmp.join(format!("{queue_id}.json")));
     }
+
+    /// List all committed messages, oldest queue ID first. Messages are
+    /// returned with their parsed metadata and payload bytes.
+    ///
+    /// Returns `Err` only if the queue directory is unreadable; a single
+    /// malformed or uncommitted entry (a `.eml` without `.json`) is
+    /// skipped — that is crash debris for a drain pass, not a message.
+    pub fn list(&self) -> Result<Vec<QueuedMessage>> {
+        let mut queued = Vec::new();
+        for entry in std::fs::read_dir(&self.new_dir)
+            .with_context(|| format!("cannot read spool dir {}", self.new_dir.display()))?
+        {
+            let path = entry.with_context(|| "cannot list spool dir")?.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Some(queue_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let payload_path = self.new_dir.join(format!("{queue_id}.eml"));
+            let Ok(meta_bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<SpoolMeta>(&meta_bytes) else {
+                continue;
+            };
+            let Ok(payload) = std::fs::read(&payload_path) else {
+                continue;
+            };
+            let attempts_path = self.new_dir.join(format!("{queue_id}.attempts"));
+            let attempts = std::fs::read_to_string(&attempts_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            queued.push(QueuedMessage {
+                queue_id: queue_id.to_string(),
+                meta,
+                payload,
+                payload_path,
+                meta_path: path,
+                attempts_path,
+                attempts,
+            });
+        }
+        queued.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
+        Ok(queued)
+    }
+
+    /// Record one failed delivery attempt for a queued message.
+    ///
+    /// Returns the new attempt count (1 on the first call). The count is
+    /// persisted in an `{id}.attempts` sidecar so it survives restarts;
+    /// a missing or unreadable sidecar counts as zero prior attempts.
+    pub fn record_attempt(&self, queued: &QueuedMessage) -> Result<u32> {
+        let attempts = queued.attempts + 1;
+        write_durable(&queued.attempts_path, attempts.to_string().as_bytes())?;
+        Ok(attempts)
+    }
+
+    /// Remove a fully handled message (payload, metadata, attempt
+    /// sidecar) from the queue. Metadata is removed first: a half-removed
+    /// message is crash debris, never a committed message. Missing files
+    /// are tolerated — a concurrent drain pass may have removed the
+    /// message already.
+    pub fn remove(&self, queued: &QueuedMessage) -> Result<()> {
+        remove_committed_at(
+            &queued.meta_path,
+            &queued.payload_path,
+            &queued.attempts_path,
+        )
+    }
+
+    /// Remove a queued message by queue ID alone (used by the session's
+    /// inline delivery fast path, which has no `QueuedMessage` handle).
+    /// Same semantics as [`DiskSpool::remove`], tolerating a concurrent
+    /// drain pass having removed it first.
+    pub fn remove_committed(&self, queue_id: &str) -> Result<()> {
+        remove_committed_at(
+            &self.new_dir.join(format!("{queue_id}.json")),
+            &self.new_dir.join(format!("{queue_id}.eml")),
+            &self.new_dir.join(format!("{queue_id}.attempts")),
+        )
+    }
+
+    /// Move a message that exhausted its delivery budget to the
+    /// `dead-letter/` directory under the spool root, preserving all
+    /// three files for operator inspection.
+    pub fn dead_letter(&self, queued: &QueuedMessage) -> Result<()> {
+        let dead = self
+            .new_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("dead-letter");
+        std::fs::create_dir_all(&dead)
+            .with_context(|| format!("cannot create dead-letter dir {}", dead.display()))?;
+        // Metadata first again: a dead-lettered message is "complete"
+        // only with its metadata present.
+        std::fs::rename(
+            &queued.meta_path,
+            dead.join(queued.meta_path.file_name().context("missing file name")?),
+        )?;
+        for path in [&queued.payload_path, &queued.attempts_path] {
+            if path.exists() {
+                std::fs::rename(
+                    path,
+                    dead.join(path.file_name().context("missing file name")?),
+                )
+                .with_context(|| format!("cannot move {} to dead-letter", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One committed message in the queue, as returned by [`DiskSpool::list`].
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    /// Queue identity (also the file stem of the pair).
+    pub queue_id: String,
+    /// Parsed acceptance metadata.
+    pub meta: SpoolMeta,
+    /// Payload bytes (as stored — possibly ciphertext if an encryptor
+    /// was configured at write time).
+    pub payload: Vec<u8>,
+    /// Path of the payload file.
+    pub payload_path: PathBuf,
+    /// Path of the metadata file.
+    pub meta_path: PathBuf,
+    /// Path of the delivery-attempt sidecar (may not exist yet).
+    pub attempts_path: PathBuf,
+    /// Recorded failed delivery attempts (0 if none).
+    pub attempts: u32,
 }
 
 impl SpoolWriter for DiskSpool {
@@ -271,6 +432,10 @@ impl SpoolWriter for DiskSpool {
 
         Ok(queue_id)
     }
+
+    fn remove(&self, queue_id: &str) -> Result<()> {
+        self.remove_committed(queue_id)
+    }
 }
 
 /// Write bytes to `path`, fsync the file, and only then return: callers
@@ -300,6 +465,7 @@ mod tests {
         SpoolMeta {
             queue_id: String::new(),
             session_id: "session-1".into(),
+            server_domain: "mail.test".into(),
             received_at: jiff::Timestamp::now().to_string(),
             peer: "127.0.0.1:40000".into(),
             helo: Some("client.test".into()),
@@ -492,5 +658,24 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert!(names.is_empty(), "orphan payload left behind: {names:?}");
+    }
+
+    /// `remove` (the [`SpoolWriter`] contract) tolerates unknown and
+    /// already-removed queue IDs: the inline fast path and the drain
+    /// race, and either may remove first.
+    #[tokio::test]
+    async fn remove_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = DiskSpool::open(dir.path(), None).unwrap();
+
+        // Unknown queue ID: fine.
+        SpoolWriter::remove(&spool, "no-such-message").unwrap();
+
+        // Removing twice: the second call finds nothing and still succeeds.
+        let raw = b"payload".to_vec();
+        let id = spool.write(sample_meta(), &raw).unwrap();
+        SpoolWriter::remove(&spool, &id).unwrap();
+        assert!(spool.list().unwrap().is_empty());
+        SpoolWriter::remove(&spool, &id).unwrap();
     }
 }

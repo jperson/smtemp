@@ -21,10 +21,11 @@ use uuid::Uuid;
 use smtp::SmtpSession;
 use spf::SpfResult;
 
+mod delivery;
 mod spool;
 
 /// One DKIM verification outcome, summarized for structured logging.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct DkimSummary {
     domain: String,
     selector: String,
@@ -84,6 +85,12 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     spool_dir: Option<String>,
 
+    /// Local delivery root: one maildir per recipient address
+    /// ({root}/{domain}/{local}/). Accepted messages are delivered here
+    /// and retried from the spool until they succeed.
+    #[arg(long, value_name = "DIR")]
+    maildir_dir: Option<String>,
+
     /// Domains whose recipients we accept mail for (comma-separated;
     /// defaults to --domain only). Relay access is closed regardless of
     /// authentication.
@@ -93,7 +100,7 @@ struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, resolver, spool-dir,
+    /// tls-cert, tls-key, auth-users, resolver, spool-dir, maildir-dir,
     /// local-domains); every key
     /// optional.
     #[arg(long, value_name = "FILE")]
@@ -115,6 +122,7 @@ struct FileConfig {
     auth_users: Option<String>,
     resolver: Option<Ipv4Addr>,
     spool_dir: Option<String>,
+    maildir_dir: Option<String>,
     local_domains: Option<String>,
 }
 
@@ -134,6 +142,8 @@ struct Config {
     resolver: Ipv4Addr,
     /// Queue directory for accepted messages (default "spool").
     spool_dir: String,
+    /// Local delivery root (default "maildir").
+    maildir_dir: String,
     local_domains: Option<String>,
 }
 
@@ -176,6 +186,10 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .spool_dir
             .or(file.spool_dir)
             .unwrap_or_else(|| "spool".to_string()),
+        maildir_dir: cli
+            .maildir_dir
+            .or(file.maildir_dir)
+            .unwrap_or_else(|| "maildir".to_string()),
         local_domains: cli.local_domains.or(file.local_domains),
     })
 }
@@ -229,7 +243,7 @@ fn mail_from_reply(result: &SpfResult) -> smtp::Control {
 }
 
 /// One DMARC verification outcome, summarized for structured logging.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct DmarcSummary {
     from_domain: String,
     /// The applied policy (p= or sp=).
@@ -286,6 +300,9 @@ struct UserSession<'session> {
     /// Spool backend for accepted messages; None drops them (tests).
     #[serde(skip_serializing)]
     spool: Option<Arc<dyn spool::SpoolWriter>>,
+    /// Local delivery sink; None leaves messages queued (tests).
+    #[serde(skip_serializing)]
+    sink: Option<Arc<dyn delivery::DeliverySink>>,
     /// DMARC verdict of the last completed message, for the session log.
     dmarc: Option<DmarcSummary>,
 }
@@ -317,6 +334,7 @@ impl<'session> UserSession<'session> {
             auth_pending: None,
             local_domains: cfg.local_domains.clone(),
             spool: cfg.spool.clone(),
+            sink: cfg.sink.clone(),
             dmarc: None,
         }
     }
@@ -764,9 +782,10 @@ impl smtp::SmtpSession for UserSession<'_> {
         // spool is a temporary failure — the client is invited to
         // retry, nothing is lost.
         if let Some(spool) = self.spool.clone() {
-            let meta = spool::SpoolMeta {
+            let mut meta = spool::SpoolMeta {
                 queue_id: String::new(), // assigned by the backend
                 session_id: self.session_id.to_string(),
+                server_domain: self.domain.to_string(),
                 received_at: jiff::Timestamp::now().to_string(),
                 peer: self.peer.to_string(),
                 helo: self.helo.clone(),
@@ -781,10 +800,18 @@ impl smtp::SmtpSession for UserSession<'_> {
                 message_size: raw.len(),
                 encryption: None, // set by the backend's encryptor, if any
             };
-            let write = tokio::task::spawn_blocking(move || spool.write(meta, &raw));
+            // The backend runs on the blocking pool and takes owned
+            // data; the session keeps its copies for the delivery fast
+            // path below.
+            let write_meta = meta.clone();
+            let write_raw = raw.clone();
+            let write_spool = spool.clone();
+            let write =
+                tokio::task::spawn_blocking(move || write_spool.write(write_meta, &write_raw));
             match write.await {
                 Ok(Ok(queue_id)) => {
                     info!(queue_id = %queue_id, recipients = self.rcpt_to.len(), "message spooled");
+                    meta.queue_id = queue_id;
                 }
                 Ok(Err(e)) => {
                     error!(error = %e, "spool write failed; refusing with a temporary error");
@@ -801,6 +828,48 @@ impl smtp::SmtpSession for UserSession<'_> {
                     return smtp::Control::tempfail(
                         b"451 4.3.0 Error: queueing failed, try again later\r\n",
                     );
+                }
+            }
+
+            // Delivery fast path: attempt each recipient copy immediately
+            // for low latency. Failures are not fatal — the message is
+            // durably queued and the drain loop retries (delivery is
+            // idempotent per (recipient, queue_id), so overlapping
+            // attempts never duplicate mail). If every recipient copy is
+            // delivered, dequeue immediately instead of waiting for the
+            // next drain pass.
+            if let Some(sink) = self.sink.clone() {
+                let mut delivered_count = 0usize;
+                for recipient in self.rcpt_to.clone() {
+                    let message = delivery::prepare_for_delivery(&meta, &recipient, &raw);
+                    let attempt = tokio::task::spawn_blocking({
+                        let sink = sink.clone();
+                        let queue_id = meta.queue_id.clone();
+                        let recipient = recipient.clone();
+                        move || sink.deliver(&recipient, &queue_id, &message)
+                    })
+                    .await;
+                    match attempt {
+                        Ok(Ok(())) => {
+                            delivered_count += 1;
+                            info!(queue_id = %meta.queue_id, recipient = %recipient, "message delivered");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(queue_id = %meta.queue_id, recipient = %recipient, error = %e, "fast-path delivery failed; queued for retry");
+                        }
+                        Err(e) => {
+                            warn!(queue_id = %meta.queue_id, recipient = %recipient, error = %e, "delivery task panicked; queued for retry");
+                        }
+                    }
+                }
+                if delivered_count == self.rcpt_to.len() {
+                    let _ = tokio::task::spawn_blocking({
+                        let spool = spool.clone();
+                        let queue_id = meta.queue_id.clone();
+                        move || spool.remove(&queue_id)
+                    })
+                    .await;
+                    info!(queue_id = %meta.queue_id, "all recipients delivered; dequeued");
                 }
             }
         }
@@ -889,9 +958,50 @@ async fn main() -> Result<()> {
     // V1: local disk spool, no payload encryption. Real providers
     // (user-held keys via the console) land with Phase 12; the backend
     // trait is already in place.
-    let spool: Arc<dyn spool::SpoolWriter> =
-        Arc::new(spool::DiskSpool::open(&config.spool_dir, None)?);
+    let disk_spool = Arc::new(spool::DiskSpool::open(&config.spool_dir, None)?);
+    let spool: Arc<dyn spool::SpoolWriter> = disk_spool.clone();
     info!(backend = spool.name(), spool_dir = %config.spool_dir, "spool ready");
+
+    let sink: Arc<dyn delivery::DeliverySink> =
+        Arc::new(delivery::MaildirSink::open(&config.maildir_dir)?);
+    info!(backend = sink.name(), maildir_dir = %config.maildir_dir, "delivery ready");
+
+    // The drain is the retry engine: it delivers whatever the fast path
+    // could not (crashes, sink failures), removes fully delivered
+    // messages, and dead-letters messages past the attempt budget. The
+    // first pass runs immediately at startup (recovering anything queued
+    // before a restart); later passes run on a fixed interval. Per-message
+    // failures inside a pass are logged and counted, never fatal.
+    {
+        let spool = disk_spool.clone();
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let pass = tokio::task::spawn_blocking({
+                    let spool = spool.clone();
+                    let sink = sink.clone();
+                    move || delivery::drain_once(&spool, &*sink)
+                })
+                .await;
+                match pass {
+                    Ok(Ok(stats)) if stats.delivered + stats.dead_lettered > 0 => {
+                        info!(
+                            delivered = stats.delivered,
+                            retrying = stats.retrying,
+                            dead_lettered = stats.dead_lettered,
+                            "drain pass"
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => warn!(error = %e, "drain pass failed"),
+                    Err(e) => warn!(error = %e, "drain task panicked"),
+                }
+            }
+        });
+    }
 
     let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
 
@@ -924,6 +1034,7 @@ async fn main() -> Result<()> {
             local_domains: local_domains.clone(),
             resolver: config.resolver,
             spool: Some(spool.clone()),
+            sink: Some(sink.clone()),
         };
 
         tokio::spawn(async move {
@@ -955,6 +1066,8 @@ struct SessionConfig {
     resolver: Ipv4Addr,
     /// Spool backend for accepted messages; None drops them (tests).
     spool: Option<Arc<dyn spool::SpoolWriter>>,
+    /// Local delivery sink; None leaves messages queued (tests).
+    sink: Option<Arc<dyn delivery::DeliverySink>>,
 }
 
 /// Serve one connection, including a possible STARTTLS upgrade: the
@@ -1218,6 +1331,7 @@ mod tests {
                         // evaluates to None and DMARC has no policy.
                         resolver: "1.1.1.1".parse().unwrap(),
                         spool,
+                        sink: None,
                     },
                 )
                 .await;

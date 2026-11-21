@@ -97,7 +97,8 @@ file — there is no default, and its absence is a hard error at startup.
 | `--tls-key <FILE>` | `tls-key` | *(none)* | PEM private key for STARTTLS. |
 | `--auth-users <SPEC>` | `auth-users` | *(none)* | SASL credentials for AUTH PLAIN/LOGIN, as comma-separated `user:password` pairs (e.g. `alice:secret,bob:hunter2`). When set, `AUTH PLAIN LOGIN` is advertised **only over TLS** (RFC 8310); AUTH on a plaintext session is refused with `538`. ⚠️ Credentials are stored **in plaintext** in the process arguments/config file (shell history, `ps` output) — acceptable for testing only, not for production (see PLAN.md, Phase 8). |
 | `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. |
-| `--spool-dir <DIR>` | `spool-dir` | `spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. |
+| `--spool-dir <DIR>` | `spool-dir` | `spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. Messages past the delivery retry budget land in `spool/dead-letter/`. |
+| `--maildir-dir <DIR>` | `maildir-dir` | `maildir` | Local delivery root: one maildir per recipient address (`{root}/{domain}/{local}/new`), written via the `DeliverySink` trait. Delivery happens immediately after acceptance and is retried from the queue until it succeeds; each delivered copy carries `Return-Path:` and a per-recipient `Received:` trace header. |
 | `--local-domains <SPEC>` | `local-domains` | *(the `--domain` value)* | Comma-separated list of recipient domains we accept mail for. The value of `--domain` is always added implicitly. Relay access is closed regardless of authentication — mail for any other recipient domain is refused with `550 5.7.1`. |
 | `--config <FILE>` | — | *(none)* | Path to a TOML config file (see below). |
 
@@ -122,6 +123,7 @@ auth-users = "alice:secret,bob:hunter2"
 
 resolver = "1.1.1.1"
 spool-dir = "spool"
+maildir-dir = "maildir"
 local-domains = "example.org,example.net"
 ```
 
@@ -154,10 +156,12 @@ local-domains = "example.org,example.net"
 - **Framing limits:** commands capped at 512 octets, data lines at 64 KiB,
   dot-unstuffing per RFC 5321 §4.5.2, up to 100 recipients (RFC 5321
   §4.5.3.1.8).
-- **Durable spool:** accepted messages are written to the spool directory
-  before the `250` is sent — accepted mail is never silently dropped.
-  Rejected mail (e.g. DMARC `p=reject`) is not spooled. Local delivery
-  from the queue is the next open item (PLAN.md, Phase 7).
+- **Durable spool + local delivery:** accepted messages are written to
+  the spool directory before the `250` is sent — accepted mail is never
+  silently dropped. Delivery to per-recipient maildirs happens
+  immediately (fast path) and is retried by the queue drain until it
+  succeeds; exhausted messages are dead-lettered for inspection.
+  Rejected mail (e.g. DMARC `p=reject`) is not spooled or delivered.
 
 ## Logging
 

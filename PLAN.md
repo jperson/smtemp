@@ -11,7 +11,7 @@
 > file, default 1.1.1.1). Phase 7 has begun: accepted messages are
 > **durably spooled to disk** (the `250` is only sent after the write)
 > with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **151 tests, 0 failures,
+> Workspace state: **156 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -158,21 +158,27 @@ The server verifies mail and drops it. This phase makes it an MTA.
 - [x] **Queue identity**: maildir-style queue ID (`<hex-millis>.<uuid>`,
       sortable, unique); logged on spool and stored in the metadata
       (Phase 8 will put it in the `Received:` header).
-- [ ] **Local delivery**: maildir-style delivery for local domains (one
-      directory per recipient), with a clear failure→`451` path.
-      *Design note (Phase 12):* keep the delivery step behind a
-      `DeliverySink`-style trait (maildir being the first implementation)
-      so a hosted backend (API/queue/DB/LMTP to an external mailbox
-      system) can replace it without touching the protocol or policy
-      layers.
-- [ ] **Message fixing on delivery**: prepend `Received:` (from, by, with,
-      id, date) and `Return-Path:`.
-- [ ] **Queue drain/retry**: minimal retry loop with backoff for spool
-      items that failed delivery; dead-letter directory after N attempts.
-      *Design note (Phase 12, gap 9):* express the queue as a
-      `SpoolWriter`-style backend trait (write/read/delete/list) — the
-      local-disk spool is the first implementation, an object-storage
-      backend a planned evolution.
+- [x] **Local delivery**: accepted messages are delivered through a
+      `DeliverySink` trait — the first implementation is a maildir sink
+      (`--maildir-dir`, default `maildir`), one maildir per recipient
+      address (`{root}/{domain}/{local}/new`). The session attempts
+      delivery immediately after spooling (fast path); failure leaves the
+      message queued with a logged warning — never a bounce, never lost.
+      Delivery is **idempotent per (recipient, queue_id)**, so the fast
+      path and the drain can race safely. When every recipient copy is
+      delivered, the message is dequeued immediately.
+- [x] **Message fixing on delivery**: each per-recipient copy gets
+      `Return-Path:` (envelope sender, `<>` for null sender) and a
+      `Received:` header (from HELO/peer, by server domain, with
+      ESMTP/ESMTPS, queue ID, `for <this recipient>` only — other
+      envelope recipients are never disclosed, RFC 5321 §4.4) prepended;
+      raw bytes follow verbatim.
+- [x] **Queue drain/retry**: a drain pass runs at startup and every
+      60 s (blocking pool): delivers queued messages, removes fully
+      delivered ones, counts failed attempts in an `{id}.attempts`
+      sidecar, and dead-letters messages to `spool/dead-letter/` after 5
+      failed passes (all files preserved for operator inspection). A
+      future `SpoolWriter` S3 backend plugs into the same drain.
 
 ### Phase 8 — Submission semantics (MSA) — **post-V1, low priority**
 

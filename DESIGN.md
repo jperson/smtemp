@@ -258,7 +258,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-151 tests, four layers:
+156 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -282,10 +282,11 @@ One opt-in live test (`#[ignore]`) fetches protonmail's real DKIM key.
 
 Honest, tracked list (details in PLAN):
 
-- **No local delivery** — accepted mail is verified and durably spooled
-  to disk (`--spool-dir`, maildir-style `tmp/`+`new/`), but not yet
-  delivered to mailboxes (Phase 7); no `Received:`/`Return-Path`
-  generation yet.
+- **No hosted delivery backend** — mail is delivered to local maildirs
+  (`--maildir-dir`, one per recipient address, with `Return-Path:`/
+  `Received:` trace headers); the platform backend (API/queue/LMTP to
+  the console's mailboxes) replaces the maildir sink via the
+  `DeliverySink` trait (Phase 12).
 - DKIM signing does not exist (Phase 8); the crate verifies only.
 - SPF macro expansion is incomplete (transformers, `%{p}`); `exp=`
   explanations are not fetched.

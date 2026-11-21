@@ -1,40 +1,54 @@
+//! SPF record lexing (logos-based).
+
 use logos::Logos;
 
+/// The SPF record lexer: one token per version, qualifier, mechanism, or
+/// modifier; token payloads are the trimmed source slices.
 #[derive(Logos, Debug, PartialEq)]
 pub enum Token<'source> {
+    /// `v=spf1` — the version token.
     #[regex(r"v=spf1\s*", |lex| lex.slice().trim())]
     Version(&'source str),
 
+    /// An optional mechanism qualifier (`+`, `-`, `?`, `~`).
     #[regex(r"[\+\-\?~]?", |lex| lex.slice().trim())]
     Qualifier(&'source str),
 
+    /// `all`.
     #[regex(r"all\s*", |lex| lex.slice().trim())]
     All(&'source str),
 
+    /// `include:<domain>`.
     #[regex(r"include:[\x21-\x24\x26-\x7E]*\s*", |lex| lex.slice().trim())]
     Include(&'source str),
 
+    /// `a[:domain-spec]`.
     #[regex(r"a(:|\/)?[^\s]*\s*", |lex| lex.slice().trim())]
     A(&'source str),
 
-    // "mx" or "mx:<domain-spec>". (TODO: dual-cidr forms like mx/24 or
-    // mx:domain/24 are not yet split into domain + prefix; the trailing
-    // cidr must not reach the resolver.)
+    /// `mx[:domain-spec]` (dual-CIDR forms like `mx/24` not yet split
+    /// into domain + prefix; the trailing cidr must not reach the
+    /// resolver).
     #[regex(r"mx(:[^\s]*)?\s*", |lex| lex.slice().trim())]
     Mx(&'source str),
 
+    /// `ptr[:domain-spec]`.
     #[regex(r"ptr(:?|/?)[^\s]*\s*", |lex| lex.slice().trim())]
     Ptr(&'source str),
 
+    /// `ip4:network[/prefix]`.
     #[regex(r"ip4:[^\s]*\s*", |lex| lex.slice().trim())]
     Ip4(&'source str),
 
+    /// `ip6:network[/prefix]`.
     #[regex(r"ip6:[^\s]*\s*", |lex| lex.slice().trim())]
     Ip6(&'source str),
 
+    /// `exists:domain`.
     #[regex(r"exists:[^\s]*\s*", |lex| lex.slice().trim())]
     Exists(&'source str),
 
+    /// Any name=value modifier (`redirect=`, `exp=`, unknown).
     #[regex(r"[a-zA-Z][a-zA-Z0-9\-_\.]*=[^\s]*\s*", |lex| lex.slice().trim())]
     Modifier(&'source str),
 }

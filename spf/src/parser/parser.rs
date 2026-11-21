@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use chrono;
 use logos::{Lexer, Logos};
 use memchr;
 
@@ -12,27 +11,44 @@ use crate::parser::lexer::Token;
 
 type SpfLexer<'source> = Peekable<Lexer<'source, Token<'source>>>;
 
+/// A mechanism qualifier: the `+`/`-`/`?`/`~` prefix.
 #[derive(Debug, Eq, PartialEq)]
 pub enum SpfQualifier {
+    /// `+` — Pass.
     Plus,
+    /// `-` — Fail.
     Dash,
+    /// `?` — Neutral.
     Question,
+    /// `~` — SoftFail.
     Tilde,
 }
 
+/// A parsed SPF mechanism. String-valued mechanisms keep the (macro-
+/// expanded) domain-spec; an empty string means "the current domain".
 #[derive(Debug, Eq, PartialEq)]
 pub enum SpfMechanism {
+    /// `all`.
     All,
+    /// `include:<domain>`.
     Include(String),
+    /// `a[:domain]`.
     A(String),
+    /// `mx[:domain]`.
     Mx(String),
+    /// `ptr[:domain]`.
     Ptr(String),
+    /// `ip4:network`.
     Ip4(Ipv4Net),
+    /// `ip6:network`.
     Ip6(Ipv6Net),
+    /// `exists:<domain>`.
     Exists(String),
 }
 
 impl SpfMechanism {
+    /// The mechanism's domain-spec, if it carries one (empty string means
+    /// "the current domain").
     pub fn domain_spec(&self) -> Option<String> {
         match &self {
             SpfMechanism::All => None,
@@ -47,52 +63,80 @@ impl SpfMechanism {
     }
 }
 
+/// A parsed SPF record: the version and its terms in record order.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Spf {
+    /// The `v=spf1` version token.
     pub version: SpfVersion,
+    /// The mechanisms and modifiers, in record order.
     pub terms: Vec<SpfTerm>,
 }
 
+/// The record's version token (`"v=spf1"`).
 #[derive(Debug, Eq, PartialEq)]
-pub struct SpfVersion(String);
+pub struct SpfVersion(pub String);
 
+/// One term of an SPF record: either a mechanism or a modifier.
 #[derive(Debug, Eq, PartialEq)]
 pub enum SpfTerm {
+    /// A mechanism directive (`+mx`, `-all`, ...).
     Directive(SpfDirective),
+    /// A modifier (`redirect=`, `exp=`, or unknown name=value).
     Modifier(SpfModifier),
 }
 
+/// A mechanism directive: qualifier plus mechanism.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SpfDirective {
+    /// The qualifier (`+`/`-`/`?`/`~`).
     pub qualifier: SpfQualifier,
+    /// The mechanism.
     pub mechanism: SpfMechanism,
 }
 
+/// A name=value modifier (`redirect=`, `exp=`, or unknown).
 #[derive(Debug, Eq, PartialEq)]
 pub struct SpfModifier {
+    /// The modifier name.
     pub name: String,
+    /// The (macro-expanded) value.
     pub value: String,
 }
 
+/// The macro-expansion substitutions (RFC 7208 Section 7) available while
+/// evaluating one record.
 #[derive(Debug, Eq, PartialEq, Default)]
 pub struct SpfMacroSubs {
-    pub s: Option<String>, //sender
-    pub l: Option<String>, //local part
-    pub o: Option<String>, //domain of sender
-    pub d: Option<String>, //domain
-    pub i: Option<String>, //ip addr
-    pub p: Option<String>, //validated domain of ip
-    pub h: Option<String>, //helo/ehlo
-    pub c: Option<String>, //SMTP client ip
-    pub r: Option<String>, //domain of host performing the check
-    pub t: Option<String>, //current timestamp
-    pub v: Option<String>, //the string "in-addr" if <ip> is ipv4, or "ip6" if <ip> is ipv6
+    /// `%{s}` — the sender identity (MAIL FROM or postmaster@HELO).
+    pub s: Option<String>,
+    /// `%{l}` — the local part of the sender.
+    pub l: Option<String>,
+    /// `%{o}` — the sender's domain.
+    pub o: Option<String>,
+    /// `%{d}` — the domain being evaluated.
+    pub d: Option<String>,
+    /// `%{i}` — the connecting IP.
+    pub i: Option<String>,
+    /// `%{p}` — the validated domain of the IP (reverse DNS; currently
+    /// never populated).
+    pub p: Option<String>,
+    /// `%{h}` — the HELO/EHLO name.
+    pub h: Option<String>,
+    /// `%{c}` — the SMTP client IP (readable form).
+    pub c: Option<String>,
+    /// `%{r}` — the domain of the host performing the check.
+    pub r: Option<String>,
+    /// `%{t}` — the current timestamp.
+    pub t: Option<String>,
+    /// `%{v}` — `"in-addr"` for IPv4, `"ip6"` for IPv6.
+    pub v: Option<String>,
 }
 
 impl SpfMacroSubs {
+    /// Build the substitution set for one evaluation.
     pub fn new(peer: IpAddr, sender: &String, domain: &String, helo: &Option<String>) -> Self {
         let (local_part, sender_domain) = sender.split_once('@').unzip();
-        let timestamp = chrono::Utc::now().to_rfc3339();
+        let timestamp = jiff::Timestamp::now().to_string();
         let ip_type: &'static str = if peer.is_ipv4() { "in-addr" } else { "ip6" };
 
         SpfMacroSubs {
@@ -111,6 +155,9 @@ impl SpfMacroSubs {
     }
 }
 
+/// Parse a full SPF record (`v=spf1` plus terms) into its AST, expanding
+/// macros with `subs`. Unknown syntax is an `Err` (which evaluation maps
+/// to PermError).
 pub fn parse(subs: &SpfMacroSubs, s: &str) -> Result<Spf> {
     let mut lex = Token::lexer(s).peekable();
 
@@ -327,8 +374,8 @@ fn expand_macro_string(subs: &SpfMacroSubs, s: &String) -> Result<String> {
     }
 
     if let Some(p) = memchr::memchr(b'%', s.as_bytes()) {
-        r.extend_from_slice(s[..p].as_bytes());
-        for &c in s[p + 1..].as_bytes() {
+        r.extend_from_slice(&s.as_bytes()[..p]);
+        for &c in &s.as_bytes()[p + 1..] {
             if c == b's' && subs.s.is_some() {
                 macro_sub!(subs.s);
             } else if c == b'l' && subs.l.is_some() {
@@ -372,8 +419,10 @@ mod tests {
     fn test_parse() {
         let spf: &'static str =
             "v=spf1 a:127.0.0.1 a include:_foo.test.com redirect=_foo.bar.com +all";
-        let mut subs: SpfMacroSubs = Default::default();
-        subs.i = Some("test".to_string());
+        let subs: SpfMacroSubs = SpfMacroSubs {
+            i: Some("test".to_string()),
+            ..Default::default()
+        };
 
         let result = parse(&subs, spf).unwrap();
 
@@ -454,8 +503,10 @@ mod tests {
     #[test]
     fn test_expand_macro_str() {
         let s = "foo.%{i}.com".to_string();
-        let mut subs: SpfMacroSubs = Default::default();
-        subs.i = Some("test".to_string());
+        let subs: SpfMacroSubs = SpfMacroSubs {
+            i: Some("test".to_string()),
+            ..Default::default()
+        };
 
         let expected = "foo.test.com".to_string();
         let result = expand_macro_string(&subs, &s).unwrap();

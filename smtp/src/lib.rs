@@ -1,10 +1,17 @@
+//! SMTP wire protocol: state machine, framing, and DATA transparency.
+//!
+//! This crate owns *what SMTP is* (verbs, states, sequencing, line caps,
+//! dot-unstuffing); the [`SmtpSession`] implementor owns *what this server
+//! is* (policy: every reply and every accept/reject decision, expressed as
+//! [`Control`] verdicts that bind the state machine).
+#![warn(missing_docs)]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use anyhow::Result;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 
 /// What the session policy decided about a command: the reply to send to
@@ -25,35 +32,67 @@ pub enum Control {
     /// Temporarily failed (a 4xx reply). The state does not advance; the
     /// client may retry.
     Tempfail(Vec<u8>),
+    /// Pause the session for a transport upgrade (STARTTLS, RFC 3207): the
+    /// reply is written, the read loop returns
+    /// [`EndReason::TlsHandshake`], and the caller performs the TLS
+    /// handshake before resuming with a fresh `run` call.
+    Upgrade(Vec<u8>),
+    /// Continue an interactive exchange (the AUTH PLAIN/LOGIN continuation
+    /// dance, RFC 4954): the reply (a `334` challenge) is sent, the machine
+    /// enters [`SmtpState::Auth`], and further lines go to
+    /// [`SmtpSession::auth_line`] until it returns a final verdict.
+    Challenge(Vec<u8>),
 }
 
 impl Control {
+    /// Build an [`Control::Accept`].
     pub fn accept(reply: impl Into<Vec<u8>>) -> Self {
         Control::Accept(reply.into())
     }
 
+    /// Build a [`Control::Reject`].
     pub fn reject(reply: impl Into<Vec<u8>>) -> Self {
         Control::Reject(reply.into())
     }
 
+    /// Build a [`Control::Tempfail`].
     pub fn tempfail(reply: impl Into<Vec<u8>>) -> Self {
         Control::Tempfail(reply.into())
+    }
+
+    /// Build a [`Control::Upgrade`] (STARTTLS pause).
+    pub fn upgrade(reply: impl Into<Vec<u8>>) -> Self {
+        Control::Upgrade(reply.into())
+    }
+
+    /// Build a [`Control::Challenge`] (AUTH continuation).
+    pub fn challenge(reply: impl Into<Vec<u8>>) -> Self {
+        Control::Challenge(reply.into())
     }
 
     /// The reply bytes to send to the client.
     pub fn reply(&self) -> &[u8] {
         match self {
-            Control::Accept(r) | Control::Reject(r) | Control::Tempfail(r) => r,
+            Control::Accept(r)
+            | Control::Reject(r)
+            | Control::Tempfail(r)
+            | Control::Upgrade(r)
+            | Control::Challenge(r) => r,
         }
     }
 
     /// The reply bytes, consuming the control.
     pub fn into_reply(self) -> Vec<u8> {
         match self {
-            Control::Accept(r) | Control::Reject(r) | Control::Tempfail(r) => r,
+            Control::Accept(r)
+            | Control::Reject(r)
+            | Control::Tempfail(r)
+            | Control::Upgrade(r)
+            | Control::Challenge(r) => r,
         }
     }
 
+    /// Whether this control lets the command through.
     pub fn is_accept(&self) -> bool {
         matches!(self, Control::Accept(_))
     }
@@ -69,6 +108,7 @@ pub enum DataControl {
     Abort(Vec<u8>),
 }
 
+/// The protocol state machine's states.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SmtpState {
     /// Waiting for HELO/EHLO.
@@ -79,29 +119,229 @@ pub enum SmtpState {
     Data,
     /// A data transfer was aborted; discarding lines until the ".".
     Discard,
+    /// The policy accepted STARTTLS: the `220` reply was written and the
+    /// read loop is paused for the caller to perform the TLS handshake.
+    /// Never visible to policy; the driver resets to Idle after the
+    /// handshake (RFC 3207 Section 4.2: the protocol restarts).
+    TlsHandshake,
+    /// Mid-authentication (RFC 4954): lines go to
+    /// [`SmtpSession::auth_line`] until it returns a final verdict, which
+    /// returns the session to the carried state. A client `*` aborts
+    /// (RFC 4954 Section 4).
+    Auth(Box<SmtpState>),
     /// The client asked to end the session.
     Quit,
 }
 
+/// Where the protocol loop stands, owned by the connection driver so the
+/// state survives a STARTTLS pause: the driver performs the TLS handshake
+/// and calls [`SmtpSession::run`] again with the same session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionState {
+    /// The state-machine state.
+    pub state: SmtpState,
+    /// The banner has been sent on this connection — exactly once, not
+    /// once per `run` call.
+    pub greeted: bool,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        SessionState {
+            state: SmtpState::Idle,
+            greeted: false,
+        }
+    }
+}
+
+/// Why the protocol loop returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndReason {
+    /// QUIT, EOF, read timeout, or I/O error: the session is over.
+    Closed,
+    /// The policy accepted STARTTLS and the `220` reply was written: the
+    /// caller must perform the TLS handshake on the raw stream, mark the
+    /// session with [`SmtpSession::tls_established`], reset the protocol
+    /// state to Idle, and call `run` again over the TLS stream.
+    TlsHandshake,
+}
+
+/// One read line from the wire.
+enum Line {
+    /// A full line up to and including its '\n' (or the final unterminated
+    /// bytes at EOF).
+    Complete(Vec<u8>),
+    /// More than the configured cap was read. `terminated` says whether
+    /// the newline was reached (and consumed) before the cap was
+    /// exceeded — when false, the remainder of the line is still on the
+    /// wire and must be drained before any further line is read.
+    Overflow { terminated: bool },
+}
+
+/// Read one line (up to and including '\n'), never buffering more than
+/// `cap` octets before reporting overflow.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Line> {
+    let mut line = Vec::new();
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            // EOF: whatever was accumulated (possibly nothing) is the
+            // final unterminated line.
+            return Ok(Line::Complete(line));
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let overflows = line.len() + pos + 1 > cap;
+                line.extend_from_slice(&buf[..=pos]);
+                reader.consume(pos + 1);
+                return Ok(if overflows {
+                    let _ = line;
+                    Line::Overflow { terminated: true }
+                } else {
+                    Line::Complete(line)
+                });
+            }
+            None => {
+                let n = buf.len();
+                line.extend_from_slice(buf);
+                reader.consume(n);
+                if line.len() > cap {
+                    return Ok(Line::Overflow { terminated: false });
+                }
+            }
+        }
+    }
+}
+
+/// Consume bytes up to and including the next '\n' (or EOF), discarding
+/// them. Used to drain the remainder of an over-long line.
+async fn drain_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                reader.consume(pos + 1);
+                return Ok(());
+            }
+            None => {
+                let n = buf.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
+
+/// ASCII case-insensitive equality.
+fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+/// Decode a base64 AUTH token. The special initial response `=` means an
+/// empty response (RFC 4954 Section 4).
+pub fn decode_b64(input: &[u8]) -> Option<Vec<u8>> {
+    if input == b"=" {
+        return Some(Vec::new());
+    }
+    let text = std::str::from_utf8(input).ok()?;
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .ok()
+}
+
+/// Decode an RFC 4616 PLAIN message: `authzid NUL authcid NUL passwd`.
+/// Returns `(authcid, passwd)`; the authorization identity must be empty
+/// or equal to the authentication identity (the only form this server
+/// supports).
+pub fn decode_plain(input: &[u8]) -> Option<(String, String)> {
+    let parts: Vec<&[u8]> = input.split(|&b| b == 0).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let authzid = std::str::from_utf8(parts[0]).ok()?;
+    let authcid = std::str::from_utf8(parts[1]).ok()?;
+    let passwd = std::str::from_utf8(parts[2]).ok()?;
+    if !authzid.is_empty() && authzid != authcid {
+        return None;
+    }
+    Some((authcid.to_string(), passwd.to_string()))
+}
+
+/// Split the command content into its verb and the rest of the line.
+fn split_verb(content: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match content.iter().position(|&b| b == b' ') {
+        Some(i) => (&content[..i], Some(&content[i + 1..])),
+        None => (content, None),
+    }
+}
+
+/// Trim trailing ASCII whitespace (SP, HTAB, CR, LF) from a byte slice.
+fn trim_ascii_end(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
 /// The protocol side of an SMTP session: the state machine, command
-/// syntax, and reply framing. The implementor is the policy: it decides
-/// every reply and whether a command advances the session.
+/// syntax, reply framing, and DATA transparency (dot-unstuffing, bounded
+/// line reads). The implementor is the policy: it decides every reply and
+/// whether a command advances the session.
 pub trait SmtpSession {
+    /// `250 Ok` generic positive reply.
     const OK: &'static [u8] = b"250 Ok\r\n";
+    /// `354` reply that starts message-data mode.
     const SEND_DATA: &'static [u8] = b"354 End data with <CR>.<CR><LF>\r\n";
-    const DATA_END: &'static str = ".\r\n";
+    /// `221` reply that closes the session.
     const QUIT: &'static [u8] = b"221 Bye\r\n";
+    /// `500` reply for unrecognized commands.
     const UNKNOWN: &'static [u8] = b"500 Unknown\r\n";
+    /// `501` reply for malformed arguments.
     const SYNTAX_ERR: &'static [u8] = b"501 5.5.4 Syntax error\r\n";
+    /// `503` reply for commands out of sequence (kept for policy use).
     const INVALID_SEQ: &'static [u8] = b"503 5.5.1 Invalid sequence.\r\n";
+    /// `503` reply for a repeated MAIL FROM.
     const MULTI_MAIL: &'static [u8] = b"503 5.5.1 Multiple MAIL FROM commands not allowed.\r\n";
+    /// Reply when a command line exceeds `MAX_CMD_LINE`.
+    const LINE_TOO_LONG: &'static [u8] = b"500 5.5.2 Line too long\r\n";
+    /// Reply when a message-data line exceeds `MAX_DATA_LINE`; the rest
+    /// of the transfer is discarded.
+    const DATA_LINE_TOO_LONG: &'static [u8] =
+        b"552 5.3.4 Line exceeds fixed maximum message line size\r\n";
+
+    /// Command lines are capped at 512 octets including CRLF (RFC 5321
+    /// Section 4.5.3.1.4). An over-long command is answered with
+    /// `LINE_TOO_LONG` and the session continues.
+    const MAX_CMD_LINE: usize = 512;
+    /// Message-data lines are capped at this many octets including the
+    /// line ending, so a single line can never exhaust memory regardless
+    /// of the message-size policy. RFC 5321 sets 1000 for
+    /// interoperability, but real mail regularly carries longer lines, so
+    /// the default is generous. An over-long data line aborts the transfer
+    /// (`DATA_LINE_TOO_LONG`, then discard-until-dot).
+    const MAX_DATA_LINE: usize = 64 * 1024;
 
     /// The banner to send when the connection opens.
     fn server_greet(&self) -> impl Future<Output = Vec<u8>> + Send;
 
-    /// HELO/EHLO. `Accept` advances the session to [`SmtpState::Ready`];
-    /// anything else leaves it in [`SmtpState::Idle`].
-    fn helo(&mut self, arg: &str) -> impl Future<Output = Control> + Send;
+    /// HELO/EHLO. `ehlo` distinguishes the verbs so the reply can carry
+    /// the multiline capability list (RFC 5321 Section 3.2). `Accept`
+    /// advances the session to [`SmtpState::Ready`]; anything else leaves
+    /// it in [`SmtpState::Idle`].
+    fn helo(&mut self, ehlo: bool, arg: &str) -> impl Future<Output = Control> + Send;
 
     /// MAIL FROM. `Accept` records the envelope sender.
     fn mail_from(&mut self, path: &str) -> impl Future<Output = Control> + Send;
@@ -113,8 +353,11 @@ pub trait SmtpSession {
     /// recipients) leaves the session in [`SmtpState::Ready`].
     fn start_data(&mut self) -> impl Future<Output = Control> + Send;
 
-    /// One line of message data (line ending included, as received).
-    fn recv_data(&mut self, line: &str) -> impl Future<Output = DataControl> + Send;
+    /// One line of message data: the (dot-unstuffed) content followed by
+    /// the line ending exactly as the client sent it (CRLF, bare LF, or
+    /// nothing for an unterminated final line). Raw bytes — the body may
+    /// contain any 8-bit content and must be preserved verbatim.
+    fn recv_data(&mut self, line: &[u8]) -> impl Future<Output = DataControl> + Send;
 
     /// The message is complete. The session always returns to
     /// [`SmtpState::Ready`]; the control only carries the reply.
@@ -124,163 +367,364 @@ pub trait SmtpSession {
     /// envelope (sender, recipients, data).
     fn reset(&mut self) -> impl Future<Output = Control> + Send;
 
-    /// Serve one connection: read commands, run them through
-    /// [`handler`], write replies, until QUIT, an error, or a read
-    /// timeout.
-    fn run(
+    /// STARTTLS (RFC 3207). `Upgrade` pauses the session for the TLS
+    /// handshake ([`EndReason::TlsHandshake`]); `Reject` keeps the session
+    /// in its current state. The policy is responsible for refusing when
+    /// TLS is unavailable (454) or already active (503).
+    fn starttls(&mut self) -> impl Future<Output = Control> + Send;
+
+    /// Called by the connection driver after the TLS handshake completes.
+    /// The policy should discard pre-TLS knowledge (HELO name, SPF
+    /// results, envelope): the protocol restarts, and the client must
+    /// re-issue EHLO (RFC 3207 Section 4.2).
+    fn tls_established(&mut self) -> impl Future<Output = ()> + Send;
+
+    /// AUTH (RFC 4954). `mechanism` is the SASL name (PLAIN, LOGIN, ...);
+    /// `initial` is the optional base64 initial response — the special
+    /// value `=` means an empty response, per the RFC. A
+    /// [`Control::Challenge`] result begins the continuation dance in
+    /// [`SmtpState::Auth`].
+    fn auth(
         &mut self,
-        stream: &mut BufReader<TcpStream>,
+        mechanism: &str,
+        initial: Option<&[u8]>,
+    ) -> impl Future<Output = Control> + Send;
+
+    /// One continuation line of an in-progress AUTH exchange, either the
+    /// base64 response to the previous challenge or a client abort (`*`,
+    /// which the protocol layer intercepts). Only called in
+    /// [`SmtpState::Auth`].
+    fn auth_line(&mut self, line: &[u8]) -> impl Future<Output = Control> + Send;
+
+    /// Serve one connection: read bounded lines, run them through
+    /// `handler`, write replies, until QUIT, EOF, an error, a read
+    /// timeout, or a STARTTLS pause.
+    ///
+    /// Generic over the stream so sessions can be tested in-process
+    /// against an in-memory duplex — and so the driver can hand a
+    /// plaintext stream first and a TLS stream after a STARTTLS upgrade.
+    fn run<R>(
+        &mut self,
+        stream: &mut BufReader<R>,
         _peer: &SocketAddr,
         _domain: &str,
         max_read_duration_ms: &u64,
-    ) -> impl Future<Output = Result<()>> + Send
+        session_state: &mut SessionState,
+    ) -> impl Future<Output = Result<EndReason>> + Send
     where
+        R: AsyncRead + AsyncWrite + Unpin + Send,
         Self: Send,
     {
-        async {
-            let mut state = SmtpState::Idle;
-
-            let _ = stream.write_all(&self.server_greet().await).await;
+        async move {
+            // The banner is sent once per connection, not once per run()
+            // call: a STARTTLS resume must not re-greet.
+            if !session_state.greeted {
+                let _ = stream.write_all(&self.server_greet().await).await;
+                session_state.greeted = true;
+            }
 
             loop {
-                let line = match timeout(Duration::from_millis(*max_read_duration_ms), async {
-                    let mut line = String::new();
-                    if stream.read_line(&mut line).await? == 0 {
-                        return Err(anyhow!("Stream closed"));
-                    }
-                    Ok(line)
-                })
-                .await
-                {
-                    Ok(Ok(line)) => line,
-                    // Read error or timeout: the session ends silently.
-                    _ => return Ok(()),
+                let cap = match session_state.state {
+                    SmtpState::Data | SmtpState::Discard => Self::MAX_DATA_LINE,
+                    _ => Self::MAX_CMD_LINE,
                 };
 
-                let (reply, next) = self.handler(&state, line.as_str()).await;
-                state = next;
-                if !reply.is_empty() {
-                    let _ = stream.write_all(&reply).await;
-                }
+                let line = match timeout(
+                    Duration::from_millis(*max_read_duration_ms),
+                    read_line_capped(stream, cap),
+                )
+                .await
+                {
+                    // EOF (empty line) ends the session; a final
+                    // unterminated line is still delivered.
+                    Ok(Ok(line)) if line.is_complete_and_empty() => return Ok(EndReason::Closed),
+                    Ok(Ok(line)) => line,
+                    // Read error or timeout: the session ends silently.
+                    _ => return Ok(EndReason::Closed),
+                };
 
-                if state == SmtpState::Quit {
-                    break;
+                match line {
+                    Line::Complete(line) => {
+                        let (reply, next) = self.handler(&session_state.state, &line).await;
+                        session_state.state = next;
+                        if !reply.is_empty() {
+                            let _ = stream.write_all(&reply).await;
+                        }
+                        match session_state.state {
+                            SmtpState::Quit => break,
+                            // The policy accepted STARTTLS; the `220` is
+                            // on the wire and the caller takes over for
+                            // the handshake.
+                            SmtpState::TlsHandshake => return Ok(EndReason::TlsHandshake),
+                            _ => {}
+                        }
+                    }
+                    Line::Overflow { terminated, .. } => {
+                        // Only drain when the line's newline is still on
+                        // the wire; a line that arrived fully within one
+                        // buffered chunk was already consumed to its end.
+                        // The drain is a read and gets the same read
+                        // timeout as every other read: a client that goes
+                        // silent mid-line must not block the session
+                        // forever.
+                        let drained = if terminated {
+                            Ok(Ok(()))
+                        } else {
+                            timeout(
+                                Duration::from_millis(*max_read_duration_ms),
+                                drain_line(stream),
+                            )
+                            .await
+                        };
+                        if !matches!(drained, Ok(Ok(()))) {
+                            return Ok(EndReason::Closed);
+                        }
+                        match session_state.state {
+                            SmtpState::Data => {
+                                // The line never reached the policy; abort
+                                // the transfer the same way a policy size
+                                // abort would.
+                                let _ = stream.write_all(Self::DATA_LINE_TOO_LONG).await;
+                                session_state.state = SmtpState::Discard;
+                            }
+                            // Already discarding: keep draining silently.
+                            SmtpState::Discard => {}
+                            _ => {
+                                let _ = stream.write_all(Self::LINE_TOO_LONG).await;
+                            }
+                        }
+                    }
                 }
             }
-            Ok(())
+            Ok(EndReason::Closed)
         }
     }
 
     /// Apply one command line in the given state, returning the reply and
     /// the next state. Every command produces a reply — there is no silent
-    /// error path.
+    /// error path. `msg` includes the line ending as received.
+    ///
+    /// DATA transparency handled here (RFC 5321 Section 4.5.2): a data
+    /// line whose content is exactly "." terminates the transfer (CRLF or
+    /// bare-LF ending), and any other line beginning with "." has that
+    /// first dot removed before the line is handed to `recv_data`.
     fn handler(
         &mut self,
         state: &SmtpState,
-        msg: &str,
+        msg: &[u8],
     ) -> impl Future<Output = (Vec<u8>, SmtpState)> + Send
     where
         Self: Send,
     {
         async move {
-            let cmd: Vec<&str> = msg.splitn(2, ' ').collect();
-            let verb = cmd[0].trim_end().to_lowercase();
+            // Split the line into its content and the original line
+            // ending, so data lines preserve the ending as received.
+            let (content, ending): (&[u8], &[u8]) = match msg.strip_suffix(b"\n") {
+                Some(s) => match s.strip_suffix(b"\r") {
+                    Some(s2) => (s2, &b"\r\n"[..]),
+                    None => (s, &b"\n"[..]),
+                },
+                None => (msg, &b""[..]),
+            };
 
-            match (state, verb.as_str()) {
+            let (verb, arg) = split_verb(content);
+
+            match (state, verb) {
                 // RSET and QUIT are honored in any state. Mid-DATA they are
                 // technically client protocol violations, but honoring
                 // them is safer than treating them as message lines.
-                (_, "rset") => (self.reset().await.into_reply(), SmtpState::Idle),
-                (_, "quit") => (Self::QUIT.to_vec(), SmtpState::Quit),
-
-                (SmtpState::Idle, "helo") | (SmtpState::Idle, "ehlo") => {
-                    match cmd.get(1).map(|arg| arg.trim_end()) {
-                        Some(arg) if !arg.is_empty() => match self.helo(arg).await {
-                            Control::Accept(reply) => (reply, SmtpState::Ready),
-                            refused => (refused.into_reply(), SmtpState::Idle),
-                        },
-                        // RFC 5321 Section 4.1.1.1: a domain argument is
-                        // required.
-                        _ => (Self::SYNTAX_ERR.to_vec(), SmtpState::Idle),
-                    }
+                (_, v) if eq_ignore_ascii_case(v, b"rset") => {
+                    (self.reset().await.into_reply(), SmtpState::Idle)
+                }
+                (_, v) if eq_ignore_ascii_case(v, b"quit") => {
+                    (Self::QUIT.to_vec(), SmtpState::Quit)
                 }
 
-                (SmtpState::Ready, "mail") => {
-                    let Some(&arg) = cmd.get(1) else {
-                        return (Self::SYNTAX_ERR.to_vec(), state.clone());
-                    };
-                    if !arg.to_lowercase().starts_with("from:") {
-                        return (Self::UNKNOWN.to_vec(), state.clone());
-                    }
-                    let path = arg[5..].trim_end();
-                    if path.is_empty() {
-                        return (Self::SYNTAX_ERR.to_vec(), state.clone());
-                    }
-                    (self.mail_from(path).await.into_reply(), state.clone())
-                }
-
-                (SmtpState::Ready, "rcpt") => {
-                    let Some(&arg) = cmd.get(1) else {
-                        return (Self::SYNTAX_ERR.to_vec(), state.clone());
-                    };
-                    if !arg.to_lowercase().starts_with("to:") {
-                        return (Self::UNKNOWN.to_vec(), state.clone());
-                    }
-                    let path = arg[3..].trim_end();
-                    if path.is_empty() {
-                        return (Self::SYNTAX_ERR.to_vec(), state.clone());
-                    }
-                    (self.rcpt_to(path).await.into_reply(), state.clone())
-                }
-
-                (SmtpState::Ready, "data") => match self.start_data().await {
-                    Control::Accept(reply) => (reply, SmtpState::Data),
-                    refused => (refused.into_reply(), SmtpState::Ready),
-                },
-
-                (SmtpState::Data, _) => {
-                    if msg == Self::DATA_END {
-                        // The transaction ends either way; the control
-                        // only carries the reply.
+                (&SmtpState::Data, _) => {
+                    if content == b"." {
                         (self.end_data().await.into_reply(), SmtpState::Ready)
                     } else {
-                        match self.recv_data(msg).await {
+                        // Dot-unstuffing: a data line starting with '.' has
+                        // that first dot removed.
+                        let unstuffed = content.strip_prefix(b".").unwrap_or(content);
+                        let mut line = Vec::with_capacity(unstuffed.len() + ending.len());
+                        line.extend_from_slice(unstuffed);
+                        line.extend_from_slice(ending);
+                        match self.recv_data(&line).await {
                             DataControl::Continue => (Vec::new(), SmtpState::Data),
                             DataControl::Abort(reply) => (reply, SmtpState::Discard),
                         }
                     }
                 }
 
-                (SmtpState::Discard, _) => {
-                    // The abort reply was already sent; swallow lines
-                    // until the terminator.
-                    let done = msg == Self::DATA_END;
-                    (Vec::new(), if done { SmtpState::Ready } else { SmtpState::Discard })
+                (&SmtpState::Discard, _) => (
+                    Vec::new(),
+                    if content == b"." {
+                        SmtpState::Ready
+                    } else {
+                        SmtpState::Discard
+                    },
+                ),
+
+                (&SmtpState::Idle | &SmtpState::Ready, v)
+                    if eq_ignore_ascii_case(v, b"helo") || eq_ignore_ascii_case(v, b"ehlo") =>
+                {
+                    match arg
+                        .map(trim_ascii_end)
+                        .and_then(|a| std::str::from_utf8(a).ok())
+                    {
+                        // RFC 5321 Section 4.1.1.1: a domain argument is
+                        // required. Commands must be ASCII.
+                        Some(arg) if !arg.is_empty() => {
+                            match self.helo(eq_ignore_ascii_case(v, b"ehlo"), arg).await {
+                                Control::Accept(reply) => (reply, SmtpState::Ready),
+                                refused => (refused.into_reply(), SmtpState::Idle),
+                            }
+                        }
+                        _ => (Self::SYNTAX_ERR.to_vec(), SmtpState::Idle),
+                    }
                 }
 
-                (SmtpState::Ready, "vrfy" | "noop" | "help" | "expn") => {
-                    (Self::OK.to_vec(), state.clone())
+                // STARTTLS (RFC 3207): only before a transaction — in Data
+                // or Discard state the verb is message data, which is the
+                // RFC-correct response to a mid-transfer upgrade attempt.
+                (&SmtpState::Idle | &SmtpState::Ready, v)
+                    if eq_ignore_ascii_case(v, b"starttls") =>
+                {
+                    match self.starttls().await {
+                        Control::Upgrade(reply) => (reply, SmtpState::TlsHandshake),
+                        refused => (refused.into_reply(), state.clone()),
+                    }
+                }
+
+                // AUTH (RFC 4954): the verb carries the SASL mechanism and
+                // the optional base64 initial response.
+                (&SmtpState::Idle | &SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"auth") => {
+                    let (mechanism, initial) = match arg.map(trim_ascii_end) {
+                        Some(arg) => match arg.iter().position(|&b| b == b' ') {
+                            Some(i) => (
+                                &arg[..i],
+                                Some(
+                                    std::str::from_utf8(trim_ascii_end(&arg[i + 1..]))
+                                        .unwrap_or("")
+                                        .as_bytes(),
+                                ),
+                            ),
+                            None => (arg, None),
+                        },
+                        None => {
+                            return (Self::SYNTAX_ERR.to_vec(), state.clone());
+                        }
+                    };
+                    let Ok(mechanism) = std::str::from_utf8(mechanism) else {
+                        return (Self::SYNTAX_ERR.to_vec(), state.clone());
+                    };
+                    match self.auth(mechanism, initial).await {
+                        Control::Challenge(reply) => {
+                            (reply, SmtpState::Auth(Box::new(state.clone())))
+                        }
+                        refused => (refused.into_reply(), state.clone()),
+                    }
+                }
+
+                // Mid-authentication lines (RFC 4954 Section 4): the
+                // base64 response, or `*` to abort.
+                (SmtpState::Auth(return_to), _) => {
+                    if content == b"*" {
+                        (
+                            b"501 5.7.0 Authentication aborted\r\n".to_vec(),
+                            (**return_to).clone(),
+                        )
+                    } else {
+                        match self.auth_line(content).await {
+                            Control::Challenge(reply) => {
+                                (reply, SmtpState::Auth(return_to.clone()))
+                            }
+                            done => (done.into_reply(), (**return_to).clone()),
+                        }
+                    }
+                }
+
+                (&SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"mail") => {
+                    match Self::envelope_arg(arg, b"from:") {
+                        Ok(path) => (self.mail_from(path).await.into_reply(), SmtpState::Ready),
+                        Err(reply) => (reply, SmtpState::Ready),
+                    }
+                }
+
+                (&SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"rcpt") => {
+                    match Self::envelope_arg(arg, b"to:") {
+                        Ok(path) => (self.rcpt_to(path).await.into_reply(), SmtpState::Ready),
+                        Err(reply) => (reply, SmtpState::Ready),
+                    }
+                }
+
+                (&SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"data") => {
+                    match self.start_data().await {
+                        Control::Accept(reply) => (reply, SmtpState::Data),
+                        refused => (refused.into_reply(), SmtpState::Ready),
+                    }
+                }
+
+                (&SmtpState::Ready, v)
+                    if eq_ignore_ascii_case(v, b"vrfy")
+                        || eq_ignore_ascii_case(v, b"noop")
+                        || eq_ignore_ascii_case(v, b"help")
+                        || eq_ignore_ascii_case(v, b"expn") =>
+                {
+                    (Self::OK.to_vec(), SmtpState::Ready)
                 }
 
                 _ => (Self::UNKNOWN.to_vec(), SmtpState::Idle),
             }
         }
     }
+
+    /// Validate the argument of MAIL FROM / RCPT TO: an ASCII
+    /// case-insensitive `from:`/`to:` prefix and a non-empty, UTF-8 path.
+    /// `Err` carries the reply to send (syntax errors keep the session in
+    /// its current Ready state).
+    fn envelope_arg<'a>(
+        arg: Option<&'a [u8]>,
+        prefix: &[u8],
+    ) -> std::result::Result<&'a str, Vec<u8>> {
+        let Some(arg) = arg else {
+            return Err(Self::SYNTAX_ERR.to_vec());
+        };
+        if arg.len() < prefix.len() || !eq_ignore_ascii_case(&arg[..prefix.len()], prefix) {
+            return Err(Self::UNKNOWN.to_vec());
+        }
+        let path = match std::str::from_utf8(trim_ascii_end(&arg[prefix.len()..])) {
+            Ok(path) => path,
+            Err(_) => return Err(Self::SYNTAX_ERR.to_vec()),
+        };
+        if path.is_empty() {
+            return Err(Self::SYNTAX_ERR.to_vec());
+        }
+        Ok(path)
+    }
+}
+
+impl Line {
+    fn is_complete_and_empty(&self) -> bool {
+        matches!(self, Line::Complete(line) if line.is_empty())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
 
     /// A configurable SmtpSession that records what the protocol machine
-    /// hands to the callbacks. Every test drives `handler()` directly —
-    /// the state machine runs entirely in-process.
+    /// hands to the callbacks. Plain `do_*` methods hold the behavior so
+    /// the const overrides ([`SmallSession`]) can reuse it.
     #[derive(Default)]
     struct TestSession {
         helo: Option<String>,
         mail_from: Option<String>,
         rcpt_to: Vec<String>,
-        data_lines: Vec<String>,
+        data_lines: Vec<Vec<u8>>,
         end_data_calls: usize,
         reset_calls: usize,
         reject_helo: bool,
@@ -290,14 +734,24 @@ mod tests {
         /// bytes have been received.
         data_limit: Option<usize>,
         received_bytes: usize,
+        /// STARTTLS policy: None refuses with 454; Some upgrades.
+        offer_tls: Option<Vec<u8>>,
+        tls_active: bool,
+        tls_established_calls: usize,
+        /// AUTH policy: None refuses; Some is the (user, password) pair
+        /// accepted by PLAIN and LOGIN, and the challenge replies to
+        /// expect.
+        auth_users: Option<(String, String)>,
+        authenticated: Option<String>,
+        /// LOGIN continuation state.
+        auth_login_user: Option<String>,
+        /// The mechanism of the in-progress continuation.
+        auth_pending: Option<&'static str>,
     }
 
-    impl SmtpSession for TestSession {
-        async fn server_greet(&self) -> Vec<u8> {
-            b"220 test ready\r\n".to_vec()
-        }
-
-        async fn helo(&mut self, arg: &str) -> Control {
+    impl TestSession {
+        fn do_helo(&mut self, ehlo: bool, arg: &str) -> Control {
+            let _ = ehlo;
             if self.reject_helo {
                 return Control::reject(b"550 nope\r\n");
             }
@@ -305,35 +759,128 @@ mod tests {
             Control::accept(b"250 hello\r\n")
         }
 
-        async fn mail_from(&mut self, path: &str) -> Control {
+        fn do_starttls(&mut self) -> Control {
+            if self.tls_active {
+                return Control::reject(b"503 5.5.1 TLS already active\r\n");
+            }
+            match self.offer_tls.take() {
+                Some(reply) => Control::upgrade(reply),
+                None => Control::reject(b"454 4.7.0 TLS not available\r\n"),
+            }
+        }
+
+        fn do_tls_established(&mut self) {
+            self.tls_active = true;
+            self.tls_established_calls += 1;
+            self.helo = None;
+            self.mail_from = None;
+            self.authenticated = None;
+        }
+
+        fn verify(&mut self, user: &str, pass: &str) -> Control {
+            match &self.auth_users {
+                Some((u, p)) if u == user && p == pass => {
+                    self.authenticated = Some(user.to_string());
+                    Control::accept(b"235 2.7.0 Authentication successful\r\n")
+                }
+                _ => Control::reject(b"535 5.7.8 Authentication credentials invalid\r\n"),
+            }
+        }
+
+        fn do_auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> Control {
+            if !self.tls_active {
+                return Control::reject(b"538 5.7.11 Encryption required for authentication\r\n");
+            }
+            if self.authenticated.is_some() {
+                return Control::reject(b"503 5.5.1 Already authenticated\r\n");
+            }
+            let Some((_, _)) = &self.auth_users else {
+                return Control::reject(b"502 5.5.1 Authentication not supported\r\n");
+            };
+            match mechanism {
+                "PLAIN" => {
+                    let Some(initial) = initial else {
+                        self.auth_pending = Some("PLAIN");
+                        return Control::challenge(b"334 \r\n");
+                    };
+                    match decode_b64(initial).as_deref().and_then(decode_plain) {
+                        Some((user, pass)) => self.verify(&user, &pass),
+                        None => Control::reject(b"501 5.5.2 Invalid base64 data\r\n"),
+                    }
+                }
+                "LOGIN" => {
+                    if let Some(initial) = initial {
+                        match decode_b64(initial) {
+                            Some(user) => {
+                                self.auth_login_user =
+                                    Some(String::from_utf8_lossy(&user).into_owned());
+                                self.auth_pending = Some("LOGIN");
+                                Control::challenge(b"334 UGFzc3dvcmQ6\r\n")
+                            }
+                            None => Control::reject(b"501 5.5.2 Invalid base64 data\r\n"),
+                        }
+                    } else {
+                        self.auth_pending = Some("LOGIN");
+                        Control::challenge(b"334 VXNlcm5hbWU6\r\n")
+                    }
+                }
+                _ => Control::reject(b"504 5.5.4 Unrecognized authentication type\r\n"),
+            }
+        }
+
+        fn do_auth_line(&mut self, line: &[u8]) -> Control {
+            match decode_b64(line) {
+                None => Control::reject(b"501 5.5.2 Invalid base64 data\r\n"),
+                Some(data) => match self.auth_pending.take() {
+                    Some("PLAIN") => match decode_plain(&data) {
+                        Some((user, pass)) => self.verify(&user, &pass),
+                        None => Control::reject(b"501 5.5.2 Invalid PLAIN response\r\n"),
+                    },
+                    Some("LOGIN") => {
+                        if let Some(user) = self.auth_login_user.take() {
+                            let pass = String::from_utf8_lossy(&data).into_owned();
+                            self.verify(&user, &pass)
+                        } else {
+                            self.auth_login_user =
+                                Some(String::from_utf8_lossy(&data).into_owned());
+                            self.auth_pending = Some("LOGIN");
+                            Control::challenge(b"334 UGFzc3dvcmQ6\r\n")
+                        }
+                    }
+                    _ => Control::reject(b"501 5.5.2 No authentication in progress\r\n"),
+                },
+            }
+        }
+
+        fn do_mail_from(&mut self, path: &str) -> Control {
             self.mail_from = Some(path.to_string());
             Control::accept(Self::OK)
         }
 
-        async fn rcpt_to(&mut self, path: &str) -> Control {
+        fn do_rcpt_to(&mut self, path: &str) -> Control {
             self.rcpt_to.push(path.to_string());
             Control::accept(Self::OK)
         }
 
-        async fn start_data(&mut self) -> Control {
+        fn do_start_data(&mut self) -> Control {
             if self.reject_start_data {
                 return Control::reject(b"503 5.5.1 No valid recipients\r\n");
             }
             Control::accept(Self::SEND_DATA)
         }
 
-        async fn recv_data(&mut self, line: &str) -> DataControl {
+        fn do_recv_data(&mut self, line: &[u8]) -> DataControl {
             self.received_bytes += line.len();
             if let Some(limit) = self.data_limit {
                 if self.received_bytes > limit {
                     return DataControl::Abort(b"552 5.3.4 too big\r\n".to_vec());
                 }
             }
-            self.data_lines.push(line.to_string());
+            self.data_lines.push(line.to_vec());
             DataControl::Continue
         }
 
-        async fn end_data(&mut self) -> Control {
+        fn do_end_data(&mut self) -> Control {
             self.end_data_calls += 1;
             if self.reject_end_data {
                 return Control::reject(b"550 nope\r\n");
@@ -341,7 +888,7 @@ mod tests {
             Control::accept(b"250 accepted\r\n")
         }
 
-        async fn reset(&mut self) -> Control {
+        fn do_reset(&mut self) -> Control {
             self.reset_calls += 1;
             self.mail_from = None;
             self.rcpt_to.clear();
@@ -350,12 +897,120 @@ mod tests {
         }
     }
 
+    impl SmtpSession for TestSession {
+        async fn server_greet(&self) -> Vec<u8> {
+            b"220 test ready\r\n".to_vec()
+        }
+
+        async fn helo(&mut self, ehlo: bool, arg: &str) -> Control {
+            self.do_helo(ehlo, arg)
+        }
+
+        async fn starttls(&mut self) -> Control {
+            self.do_starttls()
+        }
+
+        async fn tls_established(&mut self) {
+            self.do_tls_established()
+        }
+
+        async fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> Control {
+            self.do_auth(mechanism, initial)
+        }
+
+        async fn auth_line(&mut self, line: &[u8]) -> Control {
+            self.do_auth_line(line)
+        }
+
+        async fn mail_from(&mut self, path: &str) -> Control {
+            self.do_mail_from(path)
+        }
+
+        async fn rcpt_to(&mut self, path: &str) -> Control {
+            self.do_rcpt_to(path)
+        }
+
+        async fn start_data(&mut self) -> Control {
+            self.do_start_data()
+        }
+
+        async fn recv_data(&mut self, line: &[u8]) -> DataControl {
+            self.do_recv_data(line)
+        }
+
+        async fn end_data(&mut self) -> Control {
+            self.do_end_data()
+        }
+
+        async fn reset(&mut self) -> Control {
+            self.do_reset()
+        }
+    }
+
+    /// Same behavior as [`TestSession`] with tiny line caps, so framing
+    /// overflow can be tested without moving kilobytes through the duplex.
+    #[derive(Default)]
+    struct SmallSession(TestSession);
+
+    impl SmtpSession for SmallSession {
+        const MAX_CMD_LINE: usize = 16;
+        const MAX_DATA_LINE: usize = 32;
+
+        async fn server_greet(&self) -> Vec<u8> {
+            b"220 test ready\r\n".to_vec()
+        }
+
+        async fn helo(&mut self, ehlo: bool, arg: &str) -> Control {
+            self.0.do_helo(ehlo, arg)
+        }
+
+        async fn starttls(&mut self) -> Control {
+            self.0.do_starttls()
+        }
+
+        async fn tls_established(&mut self) {
+            self.0.do_tls_established()
+        }
+
+        async fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> Control {
+            self.0.do_auth(mechanism, initial)
+        }
+
+        async fn auth_line(&mut self, line: &[u8]) -> Control {
+            self.0.do_auth_line(line)
+        }
+
+        async fn mail_from(&mut self, path: &str) -> Control {
+            self.0.do_mail_from(path)
+        }
+
+        async fn rcpt_to(&mut self, path: &str) -> Control {
+            self.0.do_rcpt_to(path)
+        }
+
+        async fn start_data(&mut self) -> Control {
+            self.0.do_start_data()
+        }
+
+        async fn recv_data(&mut self, line: &[u8]) -> DataControl {
+            self.0.do_recv_data(line)
+        }
+
+        async fn end_data(&mut self) -> Control {
+            self.0.do_end_data()
+        }
+
+        async fn reset(&mut self) -> Control {
+            self.0.do_reset()
+        }
+    }
+
     /// Drive one command through the handler and assert the reply and the
     /// resulting state.
     async fn expect(
         session: &mut TestSession,
         state: SmtpState,
-        line: &str,
+        line: &[u8],
         want_reply: &[u8],
         want_next: SmtpState,
     ) {
@@ -367,12 +1022,24 @@ mod tests {
     #[tokio::test]
     async fn helo_and_ehlo_advance_to_ready() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "HELO example.org\r\n", b"250 hello\r\n", SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO example.org\r\n",
+            b"250 hello\r\n",
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.helo.as_deref(), Some("example.org"));
 
-        expect(&mut s, SmtpState::Idle, "EHLO mail.example.net\r\n", b"250 hello\r\n", SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"EHLO mail.example.net\r\n",
+            b"250 hello\r\n",
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.helo.as_deref(), Some("mail.example.net"));
     }
 
@@ -385,88 +1052,225 @@ mod tests {
             reject_helo: true,
             ..Default::default()
         };
-        expect(&mut s, SmtpState::Idle, "HELO example.org\r\n", b"550 nope\r\n", SmtpState::Idle)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO example.org\r\n",
+            b"550 nope\r\n",
+            SmtpState::Idle,
+        )
+        .await;
 
         // The client ignores the 550 and tries to send mail anyway.
-        expect(&mut s, SmtpState::Idle, "MAIL FROM:<a@b>\r\n", TestSession::UNKNOWN, SmtpState::Idle)
-            .await;
-        expect(&mut s, SmtpState::Idle, "RCPT TO:<c@d>\r\n", TestSession::UNKNOWN, SmtpState::Idle)
-            .await;
-        expect(&mut s, SmtpState::Idle, "DATA\r\n", TestSession::UNKNOWN, SmtpState::Idle)
-            .await;
-        assert_eq!(s.mail_from, None, "no envelope may be recorded before an accepted HELO");
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"MAIL FROM:<a@b>\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"RCPT TO:<c@d>\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"DATA\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
+        assert_eq!(
+            s.mail_from, None,
+            "no envelope may be recorded before an accepted HELO"
+        );
     }
 
     #[tokio::test]
     async fn helo_without_argument_is_a_syntax_error() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "HELO\r\n", TestSession::SYNTAX_ERR, SmtpState::Idle)
-            .await;
-        expect(&mut s, SmtpState::Idle, "EHLO\r\n", TestSession::SYNTAX_ERR, SmtpState::Idle)
-            .await;
-        expect(&mut s, SmtpState::Idle, "HELO \r\n", TestSession::SYNTAX_ERR, SmtpState::Idle)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Idle,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"EHLO\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Idle,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO \r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Idle,
+        )
+        .await;
         assert_eq!(s.helo, None, "callback must not run on a syntax error");
+    }
+
+    /// A command argument that is not valid UTF-8 is a syntax error, not
+    /// a panic or a mojibake path.
+    #[tokio::test]
+    async fn command_with_invalid_utf8_arg_is_a_syntax_error() {
+        let mut s = TestSession::default();
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO \xff\xfe\xfd\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Idle,
+        )
+        .await;
+        assert_eq!(s.helo, None);
+
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<a@b>\xff\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
+        assert_eq!(s.mail_from, None);
     }
 
     #[tokio::test]
     async fn mail_from_requires_helo_first() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "MAIL FROM:<a@b>\r\n", TestSession::UNKNOWN, SmtpState::Idle)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"MAIL FROM:<a@b>\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
         assert_eq!(s.mail_from, None);
     }
 
     #[tokio::test]
     async fn mail_from_passes_the_path_to_the_callback() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:<alice@example.org>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<alice@example.org>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.mail_from.as_deref(), Some("<alice@example.org>"));
 
         // The null sender is a valid non-empty path.
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:<>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.mail_from.as_deref(), Some("<>"));
     }
 
     #[tokio::test]
     async fn mail_argument_errors_keep_the_session_in_ready() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "MAIL\r\n", TestSession::SYNTAX_ERR, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:\r\n", TestSession::SYNTAX_ERR, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
         // A malformed keyword no longer resets the state to Idle.
-        expect(&mut s, SmtpState::Ready, "MAIL X:<a@b>\r\n", TestSession::UNKNOWN, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL X:<a@b>\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Ready,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn rcpt_argument_errors_keep_the_session_in_ready() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "RCPT\r\n", TestSession::SYNTAX_ERR, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "RCPT TO:\r\n", TestSession::SYNTAX_ERR, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "RCPT FROM:<a@b>\r\n", TestSession::UNKNOWN, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT TO:\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT FROM:<a@b>\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Ready,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn rcpt_to_passes_the_path_to_the_callback() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "RCPT TO:<bob@example.net>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT TO:<bob@example.net>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.rcpt_to, vec!["<bob@example.net>".to_string()]);
     }
 
     #[tokio::test]
     async fn data_requires_ready_state() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "DATA\r\n", TestSession::UNKNOWN, SmtpState::Idle)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"DATA\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
     }
 
     /// A rejected DATA (e.g. no valid recipients) leaves the session in
@@ -477,38 +1281,140 @@ mod tests {
             reject_start_data: true,
             ..Default::default()
         };
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", b"503 5.5.1 No valid recipients\r\n", SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            b"503 5.5.1 No valid recipients\r\n",
+            SmtpState::Ready,
+        )
+        .await;
 
         // The client adds a recipient and retries DATA successfully.
         s.reject_start_data = false;
-        expect(&mut s, SmtpState::Ready, "RCPT TO:<bob@example.net>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT TO:<bob@example.net>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn data_mode_records_lines_until_crlf_dot() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
 
         // Message lines yield no reply and stay in Data mode.
-        expect(&mut s, SmtpState::Data, "line one\r\n", b"", SmtpState::Data).await;
-        expect(&mut s, SmtpState::Data, "line two\r\n", b"", SmtpState::Data).await;
-        assert_eq!(s.data_lines, vec!["line one\r\n".to_string(), "line two\r\n".to_string()]);
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"line one\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"line two\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        assert_eq!(
+            s.data_lines,
+            vec![b"line one\r\n".to_vec(), b"line two\r\n".to_vec()]
+        );
         assert_eq!(s.end_data_calls, 0);
 
-        expect(&mut s, SmtpState::Data, ".\r\n", b"250 accepted\r\n", SmtpState::Ready).await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".\r\n",
+            b"250 accepted\r\n",
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.end_data_calls, 1);
     }
 
+    /// Dot-unstuffing (RFC 5321 Section 4.5.2): a data line beginning with
+    /// '.' loses that dot before reaching the policy; ".." becomes ".".
     #[tokio::test]
-    async fn lf_only_dot_does_not_terminate_data() {
+    async fn dot_unstuffing() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Data, ".\n", b"", SmtpState::Data).await;
-        assert_eq!(s.data_lines, vec![".\n".to_string()], "documents known LF-terminator wart");
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".hidden\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"..two dots\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        expect(&mut s, SmtpState::Data, b"plain\r\n", b"", SmtpState::Data).await;
+        // A bare-LF line is unstuffed and keeps its ending.
+        expect(&mut s, SmtpState::Data, b".lf line\n", b"", SmtpState::Data).await;
+
+        assert_eq!(
+            s.data_lines,
+            vec![
+                b"hidden\r\n".to_vec(),
+                b".two dots\r\n".to_vec(),
+                b"plain\r\n".to_vec(),
+                b"lf line\n".to_vec(),
+            ]
+        );
+    }
+
+    /// The terminator is "." with either CRLF or a bare LF.
+    #[tokio::test]
+    async fn lf_dot_terminates_data() {
+        let mut s = TestSession::default();
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".\n",
+            b"250 accepted\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        assert_eq!(s.end_data_calls, 1);
+    }
+
+    /// Message data is bytes, not text: 8-bit and invalid-UTF-8 content
+    /// reaches the policy verbatim.
+    #[tokio::test]
+    async fn data_lines_are_raw_bytes() {
+        let mut s = TestSession::default();
+        let raw = b"binary \xFF\xFE\x00 bytes\r\n";
+        expect(&mut s, SmtpState::Data, raw, b"", SmtpState::Data).await;
+        assert_eq!(s.data_lines, vec![raw.to_vec()]);
     }
 
     /// A size-abort replies once, discards the rest of the message until
@@ -519,20 +1425,46 @@ mod tests {
             data_limit: Some(10),
             ..Default::default()
         };
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
 
-        expect(&mut s, SmtpState::Data, "short\r\n", b"", SmtpState::Data).await;
+        expect(&mut s, SmtpState::Data, b"short\r\n", b"", SmtpState::Data).await;
         // This line crosses the limit.
-        expect(&mut s, SmtpState::Data, "this line is too long\r\n", b"552 5.3.4 too big\r\n", SmtpState::Discard)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"this line is too long\r\n",
+            b"552 5.3.4 too big\r\n",
+            SmtpState::Discard,
+        )
+        .await;
 
         // Remaining body lines are swallowed without being recorded or
         // mistaken for commands. QUIT still ends the session: it is matched
         // before the discard arm, which is the safe response for a client
         // that aborts and then hangs up.
-        expect(&mut s, SmtpState::Discard, "more body\r\n", b"", SmtpState::Discard).await;
-        expect(&mut s, SmtpState::Discard, "QUIT\r\n", TestSession::QUIT, SmtpState::Quit).await;
+        expect(
+            &mut s,
+            SmtpState::Discard,
+            b"more body\r\n",
+            b"",
+            SmtpState::Discard,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Discard,
+            b"QUIT\r\n",
+            TestSession::QUIT,
+            SmtpState::Quit,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -541,17 +1473,42 @@ mod tests {
             data_limit: Some(10),
             ..Default::default()
         };
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
-        expect(&mut s, SmtpState::Data, "this line is too long\r\n", b"552 5.3.4 too big\r\n", SmtpState::Discard)
-            .await;
-        expect(&mut s, SmtpState::Discard, "more body\r\n", b"", SmtpState::Discard).await;
-        expect(&mut s, SmtpState::Discard, ".\r\n", b"", SmtpState::Ready).await;
-        assert_eq!(s.data_lines, Vec::<String>::new());
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"this line is too long\r\n",
+            b"552 5.3.4 too big\r\n",
+            SmtpState::Discard,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Discard,
+            b"more body\r\n",
+            b"",
+            SmtpState::Discard,
+        )
+        .await;
+        expect(&mut s, SmtpState::Discard, b".\r\n", b"", SmtpState::Ready).await;
+        assert_eq!(s.data_lines, Vec::<Vec<u8>>::new());
 
         // The session is usable again.
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:<a@b>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<a@b>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -560,19 +1517,45 @@ mod tests {
             reject_end_data: true,
             ..Default::default()
         };
-        expect(&mut s, SmtpState::Data, ".\r\n", b"550 nope\r\n", SmtpState::Ready).await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".\r\n",
+            b"550 nope\r\n",
+            SmtpState::Ready,
+        )
+        .await;
         assert_eq!(s.end_data_calls, 1);
     }
 
     #[tokio::test]
     async fn rset_clears_envelope_and_returns_to_idle() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:<a@b>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "RCPT TO:<c@d>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<a@b>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT TO:<c@d>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
 
-        expect(&mut s, SmtpState::Ready, "RSET\r\n", TestSession::OK, SmtpState::Idle).await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RSET\r\n",
+            TestSession::OK,
+            SmtpState::Idle,
+        )
+        .await;
         assert_eq!(s.reset_calls, 1);
         assert_eq!(s.mail_from, None, "RSET must clear the envelope");
         assert!(s.rcpt_to.is_empty());
@@ -581,80 +1564,795 @@ mod tests {
     #[tokio::test]
     async fn rset_and_quit_work_mid_data() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
-        expect(&mut s, SmtpState::Data, "body line\r\n", b"", SmtpState::Data).await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"body line\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
 
         // RSET mid-DATA aborts the transfer and clears the envelope.
-        expect(&mut s, SmtpState::Data, "RSET\r\n", TestSession::OK, SmtpState::Idle).await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"RSET\r\n",
+            TestSession::OK,
+            SmtpState::Idle,
+        )
+        .await;
         assert_eq!(s.reset_calls, 1);
         assert!(s.data_lines.is_empty());
 
         // QUIT mid-DATA ends the session (via a fresh DATA mode).
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
-        expect(&mut s, SmtpState::Data, "QUIT\r\n", TestSession::QUIT, SmtpState::Quit).await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"QUIT\r\n",
+            TestSession::QUIT,
+            SmtpState::Quit,
+        )
+        .await;
+    }
+
+    // -- AUTH (RFC 4954) -------------------------------------------------
+
+    fn b64(s: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(s)
+            .into_bytes()
+    }
+
+    fn tls_session() -> TestSession {
+        TestSession {
+            tls_active: true,
+            auth_users: Some(("alice".to_string(), "secret".to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_plain_with_initial_response() {
+        let mut s = tls_session();
+        // authzid NUL authcid NUL passwd, base64'd.
+        let initial = b64("\0alice\0secret");
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            [b"AUTH PLAIN ".as_slice(), &initial, b"\r\n"]
+                .concat()
+                .as_slice(),
+            b"235 2.7.0 Authentication successful\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        assert_eq!(s.authenticated.as_deref(), Some("alice"));
+
+        // Bad credentials.
+        let mut s = tls_session();
+        let initial = b64("\0alice\0wrong");
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            [b"AUTH PLAIN ".as_slice(), &initial, b"\r\n"]
+                .concat()
+                .as_slice(),
+            b"535 5.7.8 Authentication credentials invalid\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auth_plain_continuation_and_abort() {
+        let mut s = tls_session();
+        // No initial response: the machine enters the continuation state,
+        // remembering where to return (Ready).
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH PLAIN\r\n",
+            b"334 \r\n",
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+        )
+        .await;
+        // The client completes the exchange.
+        expect(
+            &mut s,
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+            &b64("\0alice\0secret"),
+            b"235 2.7.0 Authentication successful\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        assert_eq!(s.authenticated.as_deref(), Some("alice"));
+
+        // A client aborts with `*`: back to the remembered state.
+        let mut s = tls_session();
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH PLAIN\r\n",
+            b"334 \r\n",
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+            b"*\r\n",
+            b"501 5.7.0 Authentication aborted\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auth_login_dance() {
+        let mut s = tls_session();
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH LOGIN\r\n",
+            b"334 VXNlcm5hbWU6\r\n", // base64 "Username:"
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+            &b64("alice"),
+            b"334 UGFzc3dvcmQ6\r\n", // base64 "Password:"
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Auth(Box::new(SmtpState::Ready)),
+            &b64("secret"),
+            b"235 2.7.0 Authentication successful\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        assert_eq!(s.authenticated.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn auth_policy_gates() {
+        // AUTH over a plaintext connection is refused (RFC 8310: the
+        // password must not traverse an unencrypted channel).
+        let mut s = tls_session();
+        s.tls_active = false;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH PLAIN\r\n",
+            b"538 5.7.11 Encryption required for authentication\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+
+        // No configured users: not supported.
+        let mut s = TestSession {
+            tls_active: true,
+            ..Default::default()
+        };
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH PLAIN\r\n",
+            b"502 5.5.1 Authentication not supported\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+
+        // Unsupported mechanism.
+        let mut s = tls_session();
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH CRAM-MD5\r\n",
+            b"504 5.5.4 Unrecognized authentication type\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+
+        // AUTH without an argument is a syntax error.
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH\r\n",
+            TestSession::SYNTAX_ERR,
+            SmtpState::Ready,
+        )
+        .await;
+
+        // Already authenticated.
+        let mut s = tls_session();
+        s.authenticated = Some("alice".to_string());
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"AUTH PLAIN\r\n",
+            b"503 5.5.1 Already authenticated\r\n",
+            SmtpState::Ready,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn quit_terminates_the_session() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Ready, "QUIT\r\n", TestSession::QUIT, SmtpState::Quit).await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"QUIT\r\n",
+            TestSession::QUIT,
+            SmtpState::Quit,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn misc_commands_accepted_in_ready_state() {
         let mut s = TestSession::default();
-        for cmd in ["NOOP\r\n", "VRFY user\r\n", "HELP\r\n", "EXPN list\r\n"] {
-            expect(&mut s, SmtpState::Ready, cmd, TestSession::OK, SmtpState::Ready).await;
+        for cmd in [
+            b"NOOP\r\n".as_slice(),
+            b"VRFY user\r\n",
+            b"HELP\r\n",
+            b"EXPN list\r\n",
+        ] {
+            expect(
+                &mut s,
+                SmtpState::Ready,
+                cmd,
+                TestSession::OK,
+                SmtpState::Ready,
+            )
+            .await;
         }
     }
 
     #[tokio::test]
     async fn unknown_command_is_rejected() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "FROB\r\n", TestSession::UNKNOWN, SmtpState::Idle).await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"FROB\r\n",
+            TestSession::UNKNOWN,
+            SmtpState::Idle,
+        )
+        .await;
+    }
+
+    // -- STARTTLS (RFC 3207) -------------------------------------------
+
+    /// The policy's Upgrade verdict pauses the machine in TlsHandshake; a
+    /// refusal keeps the current state.
+    #[tokio::test]
+    async fn starttls_upgrade_and_refusal() {
+        let mut s = TestSession {
+            offer_tls: Some(b"220 2.0.0 Ready to start TLS\r\n".to_vec()),
+            ..Default::default()
+        };
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"STARTTLS\r\n",
+            b"220 2.0.0 Ready to start TLS\r\n",
+            SmtpState::TlsHandshake,
+        )
+        .await;
+
+        // Refused (no TLS available): the session stays where it was.
+        let mut s = TestSession::default();
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"STARTTLS\r\n",
+            b"454 4.7.0 TLS not available\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        // Also valid from Idle (before HELO).
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"STARTTLS\r\n",
+            b"454 4.7.0 TLS not available\r\n",
+            SmtpState::Idle,
+        )
+        .await;
+    }
+
+    /// STARTTLS mid-transaction is message data, not a command (RFC 3207
+    /// Section 4: the command must not be issued during a transfer).
+    #[tokio::test]
+    async fn starttls_during_data_is_message_data() {
+        let mut s = TestSession {
+            offer_tls: Some(b"220 2.0.0 Ready to start TLS\r\n".to_vec()),
+            ..Default::default()
+        };
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"STARTTLS\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        assert_eq!(s.data_lines, vec![b"STARTTLS\r\n".to_vec()]);
+    }
+
+    /// The driver contract: run writes the 220, returns TlsHandshake; the
+    /// resumed run does not re-greet and continues from the reset state.
+    #[tokio::test]
+    async fn starttls_pause_and_resume_over_duplex() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = TestSession {
+                offer_tls: Some(b"220 2.0.0 Ready to start TLS\r\n".to_vec()),
+                ..Default::default()
+            };
+            let mut stream = BufReader::new(server);
+            let mut state = SessionState::default();
+            let first = session
+                .run(&mut stream, &peer, "example.org", &2000, &mut state)
+                .await;
+
+            // The driver: handshake goes here (abstracted away in this
+            // test); the protocol restarts in Idle with no new greeting.
+            session.do_tls_established();
+            state.state = SmtpState::Idle;
+            state.greeted = true;
+
+            let second = session
+                .run(&mut stream, &peer, "example.org", &2000, &mut state)
+                .await;
+            (session, first, second)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        assert_eq!(greet, "220 test ready\r\n");
+
+        client.write_all(b"EHLO client.test\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 hello\r\n");
+
+        client.write_all(b"STARTTLS\r\n").await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "220 2.0.0 Ready to start TLS\r\n"
+        );
+
+        // (TLS would be negotiated here.)
+
+        // After the handshake the client re-issues EHLO; the server must
+        // not re-send the banner.
+        client.write_all(b"EHLO client.test\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 hello\r\n");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "221 Bye\r\n");
+        drop(client);
+
+        let (session, first, second) = task.await.unwrap();
+        assert_eq!(first.unwrap(), EndReason::TlsHandshake);
+        assert_eq!(second.unwrap(), EndReason::Closed);
+        assert!(session.tls_active);
+        // The pre-TLS HELO knowledge was discarded at the upgrade, then
+        // legitimately re-established by the client's post-TLS EHLO.
+        assert_eq!(session.tls_established_calls, 1);
+        assert_eq!(session.helo.as_deref(), Some("client.test"));
     }
 
     #[tokio::test]
     async fn verbs_are_case_insensitive() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "helo example.org\r\n", b"250 hello\r\n", SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "MaIl FrOm:<a@b>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "rCpT tO:<c@d>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "dAta\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
-        expect(&mut s, SmtpState::Data, ".\r\n", b"250 accepted\r\n", SmtpState::Ready).await;
-        expect(&mut s, SmtpState::Ready, "qUiT\r\n", TestSession::QUIT, SmtpState::Quit).await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"helo example.org\r\n",
+            b"250 hello\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MaIl FrOm:<a@b>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"rCpT tO:<c@d>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"dAta\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".\r\n",
+            b"250 accepted\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"qUiT\r\n",
+            TestSession::QUIT,
+            SmtpState::Quit,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn full_session_happy_path() {
         let mut s = TestSession::default();
-        expect(&mut s, SmtpState::Idle, "HELO client.example\r\n", b"250 hello\r\n", SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "MAIL FROM:<alice@example.org>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "RCPT TO:<bob@example.net>\r\n", TestSession::OK, SmtpState::Ready)
-            .await;
-        expect(&mut s, SmtpState::Ready, "DATA\r\n", TestSession::SEND_DATA, SmtpState::Data)
-            .await;
-        expect(&mut s, SmtpState::Data, "Subject: hi\r\n", b"", SmtpState::Data).await;
-        expect(&mut s, SmtpState::Data, "\r\n", b"", SmtpState::Data).await;
-        expect(&mut s, SmtpState::Data, "body\r\n", b"", SmtpState::Data).await;
-        expect(&mut s, SmtpState::Data, ".\r\n", b"250 accepted\r\n", SmtpState::Ready).await;
-        expect(&mut s, SmtpState::Ready, "QUIT\r\n", TestSession::QUIT, SmtpState::Quit).await;
+        expect(
+            &mut s,
+            SmtpState::Idle,
+            b"HELO client.example\r\n",
+            b"250 hello\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<alice@example.org>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"RCPT TO:<bob@example.net>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"DATA\r\n",
+            TestSession::SEND_DATA,
+            SmtpState::Data,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b"Subject: hi\r\n",
+            b"",
+            SmtpState::Data,
+        )
+        .await;
+        expect(&mut s, SmtpState::Data, b"\r\n", b"", SmtpState::Data).await;
+        expect(&mut s, SmtpState::Data, b"body\r\n", b"", SmtpState::Data).await;
+        expect(
+            &mut s,
+            SmtpState::Data,
+            b".\r\n",
+            b"250 accepted\r\n",
+            SmtpState::Ready,
+        )
+        .await;
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"QUIT\r\n",
+            TestSession::QUIT,
+            SmtpState::Quit,
+        )
+        .await;
 
         assert_eq!(s.helo.as_deref(), Some("client.example"));
         assert_eq!(s.mail_from.as_deref(), Some("<alice@example.org>"));
         assert_eq!(s.rcpt_to, vec!["<bob@example.net>".to_string()]);
         assert_eq!(
             s.data_lines,
-            vec!["Subject: hi\r\n".to_string(), "\r\n".to_string(), "body\r\n".to_string()]
+            vec![
+                b"Subject: hi\r\n".to_vec(),
+                b"\r\n".to_vec(),
+                b"body\r\n".to_vec()
+            ]
         );
         assert_eq!(s.end_data_calls, 1);
+    }
+
+    // -- Framing tests over an in-memory duplex (exercise `run`, the read
+    //    caps, and the greet/reply wire loop) -------------------------------
+
+    /// Read one reply line from the client side of the duplex.
+    async fn read_reply(client: &mut BufReader<tokio::io::DuplexStream>) -> String {
+        let mut buf = String::new();
+        client.read_line(&mut buf).await.unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn full_session_over_duplex() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = TestSession::default();
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &2000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        assert_eq!(greet, "220 test ready\r\n");
+
+        client.write_all(b"HELO client.example\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 hello\r\n");
+
+        client.write_all(b"MAIL FROM:<a@b>\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 Ok\r\n");
+
+        client.write_all(b"RCPT TO:<c@d>\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 Ok\r\n");
+
+        client.write_all(b"DATA\r\n").await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "354 End data with <CR>.<CR><LF>\r\n"
+        );
+
+        // Stuffed lines arrive on the wire and reach the policy unstuffed.
+        client
+            .write_all(b".stuffed\r\n..dots\r\nplain\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 accepted\r\n");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "221 Bye\r\n");
+        drop(client);
+
+        let (session, result) = task.await.unwrap();
+        result.unwrap();
+        assert_eq!(
+            session.data_lines,
+            vec![
+                b"stuffed\r\n".to_vec(),
+                b".dots\r\n".to_vec(),
+                b"plain\r\n".to_vec()
+            ]
+        );
+        assert_eq!(session.end_data_calls, 1);
+        assert_eq!(session.helo.as_deref(), Some("client.example"));
+    }
+
+    /// An over-long command line is answered with 500 and the session
+    /// continues with the next (valid) command.
+    #[tokio::test]
+    async fn oversized_command_line_is_rejected_and_session_continues() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = SmallSession::default();
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &2000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+
+        // MAX_CMD_LINE is 16 for SmallSession; this line is 22 octets.
+        client.write_all(b"AAAAAAAAAAAAAAAAAAAA\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "500 5.5.2 Line too long\r\n");
+
+        // The session is unaffected.
+        client.write_all(b"HELO x\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 hello\r\n");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        drop(client);
+        let (_, result) = task.await.unwrap();
+        result.unwrap();
+    }
+
+    /// An over-long data line aborts the transfer with 552, the rest of
+    /// the message is discarded until the terminator, and the session
+    /// returns to Ready.
+    #[tokio::test]
+    async fn oversized_data_line_aborts_and_discards() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = SmallSession::default();
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &2000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+
+        for cmd in [
+            &b"HELO x\r\n"[..],
+            &b"MAIL FROM:<a@b>\r\n"[..],
+            &b"RCPT TO:<c@d>\r\n"[..],
+            &b"DATA\r\n"[..],
+        ] {
+            client.write_all(cmd).await.unwrap();
+            read_reply(&mut client).await;
+        }
+
+        // MAX_DATA_LINE is 32 for SmallSession; this line is 41 octets.
+        client.write_all(&[b'X'; 40]).await.unwrap();
+        client.write_all(b"\r\n").await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "552 5.3.4 Line exceeds fixed maximum message line size\r\n"
+        );
+
+        // Subsequent body lines are swallowed silently.
+        client.write_all(b"more body\r\n").await.unwrap();
+        // The "." terminator ends the discard — with no reply.
+        client.write_all(b".\r\n").await.unwrap();
+
+        // The session is usable again — but it is in Ready, not Idle, so
+        // HELO would correctly be refused, and SmallSession's 16-octet
+        // command cap limits the command length; MAIL FROM:<a> is 15
+        // octets and valid in Ready.
+        client.write_all(b"MAIL FROM:<a>\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 Ok\r\n");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        drop(client);
+        let (session, result) = task.await.unwrap();
+        result.unwrap();
+        // The oversized line never reached the policy.
+        assert_eq!(session.0.data_lines, Vec::<Vec<u8>>::new());
+    }
+
+    /// A client that sends an over-long line and then goes silent must
+    /// not block the session forever: the drain of the unterminated line
+    /// is subject to the same read timeout as every other read.
+    #[tokio::test]
+    async fn silent_client_mid_overflow_line_ends_the_session() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = SmallSession::default();
+            let mut stream = BufReader::new(server);
+            // Short read timeout: the drain must give up on this clock.
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &100,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+
+        // 40 octets, no newline, then silence. MAX_DATA_LINE is 32 for
+        // SmallSession, but this arrives in command (Idle) state, capped
+        // at MAX_CMD_LINE = 16.
+        client.write_all(&[b'X'; 40]).await.unwrap();
+
+        // The run task must terminate on its own (drain read timeout);
+        // awaiting it here is the regression assertion.
+        let (session, result) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("session must end after the read timeout, not hang")
+            .unwrap();
+        result.unwrap();
+
+        // The session ended before any reply was produced, and nothing
+        // reached the policy.
+        assert_eq!(session.0.data_lines, Vec::<Vec<u8>>::new());
+        assert_eq!(session.0.end_data_calls, 0);
+    }
+
+    /// The client closing the connection ends the session cleanly.
+    #[tokio::test]
+    async fn eof_ends_the_session() {
+        let (client, server) = duplex(1024);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+
+        let task = tokio::spawn(async move {
+            let mut session = TestSession::default();
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &2000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        assert_eq!(greet, "220 test ready\r\n");
+
+        drop(client);
+        let (session, result) = task.await.unwrap();
+        result.unwrap();
+        assert_eq!(session.end_data_calls, 0);
     }
 }

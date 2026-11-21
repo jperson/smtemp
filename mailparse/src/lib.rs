@@ -1,34 +1,63 @@
+//! RFC 5322/2045 mail header parsing with two views over one parse:
+//!
+//! - **raw** ([`RawHeader`]): byte-exact, ordered, duplicates preserved,
+//!   folding whitespace verbatim — what DKIM canonicalization consumes;
+//! - **typed** ([`MailHeaders`]): the best-effort RFC view (addresses,
+//!   dates, MIME) — what application code reads.
+//!
+//! The crate is lenient: unknown or malformed headers degrade to
+//! `optional_field` instead of failing the message.
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 
 use pest::Parser;
 use pest::iterators::{Pair, Pairs};
-use pest_derive::Parser;
 use thiserror::Error;
 
 use jiff::Zoned;
 use jiff::fmt::rfc2822;
 
-#[derive(Parser)]
-#[grammar = "../grammar/mail.pest"]
-struct MailParser;
+// The pest parser and its generated `Rule` enum are machinery; the
+// generated code cannot carry documentation, so the lint is scoped off
+// here and `Rule` is re-exported for the rest of the crate.
+#[allow(missing_docs)]
+mod pest_parser {
 
+    /// RFC 5322/2045/6376 header parser (grammar: `grammar/mail.pest`).
+    #[derive(pest_derive::Parser)]
+    #[grammar = "../grammar/mail.pest"]
+    pub struct MailParser;
+}
+use pest_parser::{MailParser, Rule};
+
+// (the crate-level documentation lives in the inner-attribute block at
+// the top of this file)
+/// Errors from the typed header parse and message splitting.
 #[derive(Error, Debug)]
 pub enum MailHeaderError {
+    /// A header did not match the grammar.
     #[error("Invalid header")]
     InvalidHeader,
 
+    /// A date field could not be parsed as RFC 2822.
     #[error("InvalidDate")]
     InvalidDate,
 
+    /// An address (mailbox) field was incomplete.
     #[error("InvalidMailbox")]
     InvalidMailbox,
 
+    /// Anything else.
     #[error("Unknown")]
     Unknown,
 
+    /// The message had no blank line separating headers from the body.
     #[error("Missing header/body separator")]
     MissingSeparator,
 
+    /// The header block was not valid UTF-8; use the byte-level API
+    /// ([`split_message`] + [`extract_raw_headers`]) instead.
     #[error("Header block is not valid UTF-8")]
     InvalidUtf8,
 }
@@ -96,8 +125,7 @@ pub struct ParsedMessage<'m> {
 pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage<'_>, MailHeaderError> {
     let (header_block, body) = split_message(raw)?;
     let headers = extract_raw_headers(header_block);
-    let header_str =
-        std::str::from_utf8(header_block).map_err(|_| MailHeaderError::InvalidUtf8)?;
+    let header_str = std::str::from_utf8(header_block).map_err(|_| MailHeaderError::InvalidUtf8)?;
     let typed = parse_headers(header_str)?;
     Ok(ParsedMessage {
         headers,
@@ -143,7 +171,7 @@ pub fn split_message(raw: &[u8]) -> Result<(&[u8], &[u8]), MailHeaderError> {
             Some(b'\n') => return Ok((&raw[..i + 1], &raw[i + 2..])),
             // Last header ended with CRLF (or LF); the blank line is CRLF.
             Some(b'\r') if raw.get(i + 2) == Some(&b'\n') => {
-                return Ok((&raw[..i + 1], &raw[i + 3..]))
+                return Ok((&raw[..i + 1], &raw[i + 3..]));
             }
             _ => {}
         }
@@ -218,26 +246,38 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
         .collect()
 }
 
+/// Placeholder for a zoned date (kept for API compatibility).
 #[derive(Debug, Default)]
 pub struct DateZoned;
 
+/// One mailbox from an address field.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Mailbox<'p> {
+    /// The display name, empty when absent ("Jason Person").
     pub display_name: &'p str,
+    /// The part before the @ ("jason.person").
     pub local_part: &'p str,
+    /// The part after the @ ("example.org").
     pub domain: &'p str,
 }
 
+/// One message identifier (<left@right>).
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MsgId<'p> {
+    /// The part before the @.
     pub id_left: &'p str,
+    /// The part after the @.
     pub id_right: &'p str,
 }
 
+/// One trace entry: a Return-Path (if seen) plus one Received line.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Trace<'p> {
+    /// The Return-Path angle-addr, when the block carried one.
     pub return_path: Option<&'p str>,
+    /// The Received line's tokens (from/by/via/with/id/for), in order.
     pub received_tokens: Vec<&'p str>,
+    /// The Received line's date, if parseable.
     pub date_time: Zoned,
 }
 
@@ -250,79 +290,128 @@ pub struct DkimHeader<'p> {
     pub raw: &'p str,
 }
 
+/// The MIME-Version header (major.minor).
 #[derive(Debug, Default)]
 pub struct MimeVersion<'p> {
+    /// The major version digits.
     pub major: &'p str,
+    /// The minor version digits.
     pub minor: &'p str,
 }
 
+/// The Content-Type header with its parameters.
 #[derive(Debug, Default)]
 pub struct ContentType<'p> {
+    /// The discrete/composite type ("text", "multipart").
     pub content_type: &'p str,
+    /// The subtype ("plain", "alternative").
     pub content_subtype: &'p str,
-    /// Last-seen parameter's attribute and value.
+    /// Last-seen parameter's attribute.
     pub attribute: &'p str,
+    /// Last-seen parameter's value.
     pub value: &'p str,
     /// All parameters in order of appearance.
     pub parameters: Vec<(&'p str, &'p str)>,
 }
 
+/// The Content-Transfer-Encoding header.
 #[derive(Debug, Default)]
 pub struct ContentEncoding<'p> {
+    /// The encoding mechanism ("base64", "quoted-printable", ...).
     pub mechanism: &'p str,
 }
 
+/// The Content-Description header.
 #[derive(Debug, Default)]
 pub struct ContentDescription<'p> {
+    /// The description text.
     pub description: &'p str,
 }
 
+/// The Content-Disposition header (parameters are not parsed yet; see
+/// the PLAN).
 #[derive(Debug, Default)]
 pub struct ContentDisposition<'p> {
+    /// The disposition type ("inline", "attachment").
     pub disposition: &'p str,
 }
 
+/// The MIME entity headers of the message.
 #[derive(Debug, Default)]
 pub struct MimeHeader<'p> {
+    /// MIME-Version, if present.
     pub mime_version: Option<MimeVersion<'p>>,
+    /// Content-Type, if present.
     pub content_type: Option<ContentType<'p>>,
+    /// Content-Transfer-Encoding, if present.
     pub content_encoding: Option<ContentEncoding<'p>>,
+    /// Content-ID, if present.
     pub content_id: Option<MsgId<'p>>,
+    /// Content-Description, if present.
     pub content_description: Option<ContentDescription<'p>>,
+    /// Content-Disposition, if present.
     pub content_disposition: Option<ContentDisposition<'p>>,
 }
 
+/// The typed RFC 5322/2045 view of the message headers: fields bucketed
+/// by name, duplicates appended to lists, best-effort. Malformed headers
+/// degrade to `optional_field` rather than failing the parse.
 #[derive(Debug, Default)]
 pub struct MailHeaders<'h> {
-    //pub trace: Vec<Trace<'h>>,
+    /// Trace entries, in message order (one per `Received` line, with
+    /// `Return-Path` attached to its block).
     pub trace: Vec<Trace<'h>>,
 
+    /// `Resent-Date` values.
     pub resent_date: Vec<Zoned>,
+    /// `Resent-From` mailboxes.
     pub resent_from: Vec<Mailbox<'h>>,
+    /// `Resent-Sender` mailboxes.
     pub resent_sender: Vec<Mailbox<'h>>,
+    /// `Resent-To` mailboxes.
     pub resent_to: Vec<Mailbox<'h>>,
+    /// `Resent-Cc` mailboxes.
     pub resent_cc: Vec<Mailbox<'h>>,
+    /// `Resent-Bcc` mailboxes.
     pub resent_bcc: Vec<Mailbox<'h>>,
+    /// `Resent-Message-ID` values.
     pub resent_msg_id: Vec<MsgId<'h>>,
 
+    /// All `DKIM-Signature` headers, in message order.
     pub dkim: Vec<DkimHeader<'h>>,
 
+    /// The `Date` field.
     pub orig_date: Option<Zoned>,
+    /// The `From` mailboxes.
     pub from: Option<Vec<Mailbox<'h>>>,
+    /// The `Sender` mailbox.
     pub sender: Option<Mailbox<'h>>,
+    /// The `Reply-To` mailboxes.
     pub reply_to: Option<Vec<Mailbox<'h>>>,
+    /// The `To` mailboxes.
     pub to: Option<Vec<Mailbox<'h>>>,
+    /// The `Cc` mailboxes.
     pub cc: Option<Vec<Mailbox<'h>>>,
+    /// The `Bcc` mailboxes.
     pub bcc: Option<Vec<Mailbox<'h>>>,
+    /// The `Message-ID`.
     pub message_id: Option<MsgId<'h>>,
+    /// The `In-Reply-To` identifiers.
     pub in_reply_to: Option<Vec<MsgId<'h>>>,
+    /// The `References` identifiers.
     pub references: Option<Vec<MsgId<'h>>>,
+    /// The `Subject` text.
     pub subject: Option<&'h str>,
+    /// `Comments` values.
     pub comments: Vec<&'h str>,
+    /// `Keywords` values.
     pub keywords: Vec<&'h str>,
 
+    /// The MIME entity headers, when any are present.
     pub mime_header: Option<MimeHeader<'h>>,
 
+    /// Every unrecognized (or typed-parse-failed) header as
+    /// name → value; duplicates overwrite.
     pub optional_field: HashMap<&'h str, &'h str>,
 }
 
@@ -532,8 +621,8 @@ fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
         match token.as_rule() {
             Rule::received_token => th.received_tokens.push(token.as_str().trim()),
             Rule::received_date => {
-                th.date_time =
-                    rfc2822::parse(token.as_str().trim()).map_err(|_| MailHeaderError::InvalidDate)?
+                th.date_time = rfc2822::parse(token.as_str().trim())
+                    .map_err(|_| MailHeaderError::InvalidDate)?
             }
             _ => continue,
         }
@@ -594,7 +683,10 @@ fn dkim_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
-fn resent_sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
+fn resent_sender<'p>(
+    mh: &mut MailHeaders<'p>,
+    item: Pair<'p, Rule>,
+) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     let m = mailboxes!(rules)
         .into_iter()
@@ -1446,11 +1538,7 @@ VGVzdA==
         assert!(dkim_val.ends_with("dXMlV6KdvNXpA=="));
         assert!(dkim_val.contains("\r\n 9R51b1")); // fold preserved
 
-        let subject = msg
-            .headers
-            .iter()
-            .find(|h| h.name_eq("subject"))
-            .unwrap();
+        let subject = msg.headers.iter().find(|h| h.name_eq("subject")).unwrap();
         assert_eq!(subject.raw_value, b" Test");
 
         // Typed view: DKIM-Signature retained with its raw tag list.
@@ -1481,27 +1569,24 @@ VGVzdA==
         assert_eq!(ct.parameters[0].0, "boundary");
 
         // Body: raw bytes after the blank line, verbatim.
-        assert!(msg
-            .body
-            .starts_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4\r\n"));
-        assert!(msg
-            .body
-            .ends_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4--\r\n"));
+        assert!(
+            msg.body
+                .starts_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4\r\n")
+        );
+        assert!(
+            msg.body
+                .ends_with(b"--b1=_DAe4ebKwgsZsACinmSR6tfFOA3greGoFYImur3b4--\r\n")
+        );
         assert!(msg.body.windows(7).any(|w| w == b"VGVzdA="));
     }
 
     #[test]
     fn parse_message_lf_only() {
-        let raw =
-            b"From: foo@bar.com\nSubject: Hi\nX-Folded: one\n two\n\nbody line\nstill body\n";
+        let raw = b"From: foo@bar.com\nSubject: Hi\nX-Folded: one\n two\n\nbody line\nstill body\n";
         let msg = parse_message(raw).unwrap();
 
         assert_eq!(msg.headers.len(), 3);
-        let folded = msg
-            .headers
-            .iter()
-            .find(|h| h.name_eq("x-folded"))
-            .unwrap();
+        let folded = msg.headers.iter().find(|h| h.name_eq("x-folded")).unwrap();
         assert_eq!(folded.raw_value, b" one\n two");
 
         assert_eq!(msg.body, b"body line\nstill body\n");
@@ -1543,5 +1628,3 @@ VGVzdA==
         assert!(split_message(b"A: 1\r\nB: 2\r\n").is_err());
     }
 }
-
-

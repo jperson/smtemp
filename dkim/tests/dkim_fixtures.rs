@@ -55,7 +55,10 @@ fn simple_simple_fixture() {
     // simple header canonicalization keeps original bytes: the first h=
     // entry (From) appears verbatim, folded headers keep their folds.
     assert!(data.starts_with(b"From: Alice Example <alice@example.org>\r\n"));
-    assert!(contains(&data, b"Subject: Simple canonicalization test\r\n"));
+    assert!(contains(
+        &data,
+        b"Subject: Simple canonicalization test\r\n"
+    ));
     // The DKIM-Signature (b= emptied) is appended last without a CRLF.
     assert!(data.ends_with(b"b="));
 }
@@ -133,7 +136,14 @@ fn oversigned_headers_selected_bottom_up_once() {
     // Case of h= entries is preserved by parsing.
     assert_eq!(
         sig.signed_headers,
-        vec!["Received", "received", "Subject", "X-Missing", "SUBJECT", "From"]
+        vec![
+            "Received",
+            "received",
+            "Subject",
+            "X-Missing",
+            "SUBJECT",
+            "From"
+        ]
     );
     assert!(body_hash_matches(&msg, sig).unwrap());
 
@@ -147,7 +157,9 @@ fn oversigned_headers_selected_bottom_up_once() {
     // One Subject instance is used once even though h= names it twice
     // (Subject and SUBJECT match case-insensitively).
     assert_eq!(
-        data.windows(b"subject:".len()).filter(|w| w == b"subject:").count(),
+        data.windows(b"subject:".len())
+            .filter(|w| w == b"subject:")
+            .count(),
         1,
         "subject must appear exactly once"
     );
@@ -204,8 +216,5 @@ fn utf8_subject_bytes_preserved() {
     );
     // Non-ASCII bytes must be preserved exactly, not mangled by the
     // lowercase/name handling. Only the name is lowercased.
-    assert!(contains(
-        &data,
-        b"from:Ivan Example <ivan@example.org>"
-    ));
+    assert!(contains(&data, b"from:Ivan Example <ivan@example.org>"));
 }

@@ -1,0 +1,458 @@
+//! DMARC (RFC 7489) evaluation: record parsing, identifier alignment,
+//! and policy application.
+//!
+//! The evaluation is pure and offline-testable; the policy-record fetch
+//! is generic over [`spf::SpfResolver`], reusing the SPF crate's resolver
+//! abstraction (and its fixture mocks).
+#![warn(missing_docs)]
+
+//! DMARC (RFC 7489) record parsing, identifier alignment, and policy
+//! application. The evaluation is pure (fully unit-testable offline);
+//! policy-record fetch is generic over [`spf::SpfResolver`], reusing the
+//! resolver abstraction (and its fixture mocks) from the SPF crate.
+//!
+//! Not implemented: `rua=`/`ruf=` reporting, `pct=` gradual sampling
+//! (treated as 100), and PSL-based organizational-domain discovery (a
+//! simple last-two-labels heuristic is used instead).
+
+use spf::SpfResolver;
+use thiserror::Error;
+
+/// Errors from DMARC record fetching and parsing.
+#[derive(Debug, Error)]
+pub enum DmarcError {
+    /// The record does not parse (bad version, bad `p=`, bad flags).
+    #[error("invalid DMARC record: {0}")]
+    Invalid(&'static str),
+    /// More than one parseable DMARC record at the name.
+    #[error("multiple DMARC records")]
+    MultipleRecords,
+    /// The DNS lookup itself failed.
+    #[error("transient DNS failure")]
+    Temp,
+}
+
+/// The `p=` (and `sp=`) policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmarcPolicy {
+    /// `p=none` — monitor only; mail is not quarantined or rejected.
+    None,
+    /// `p=quarantine` — flag failing mail for the spam pipeline.
+    Quarantine,
+    /// `p=reject` — refuse failing mail.
+    Reject,
+}
+
+/// A parsed `_dmarc.<domain>` TXT record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmarcRecord {
+    /// `p=` — the policy for the domain.
+    pub policy: DmarcPolicy,
+    /// `sp=` — the policy for subdomains (defaults to `p=`).
+    pub subdomain_policy: Option<DmarcPolicy>,
+    /// `adkim=r|s` — DKIM alignment mode (default relaxed).
+    pub adkim_strict: bool,
+    /// `aspf=r|s` — SPF alignment mode (default relaxed).
+    pub aspf_strict: bool,
+    /// `pct=` — percentage of messages the policy applies to (0-100;
+    /// this implementation treats every value as 100).
+    pub pct: u8,
+}
+
+impl DmarcRecord {
+    /// Parse a DMARC record from TXT text. Requires `v=DMARC1` (case
+    /// per RFC 7489 Section 6.3: the tag is case-insensitive but the
+    /// value "DMARC1" is literal) and a valid `p=`.
+    pub fn parse(txt: &str) -> Result<Self, DmarcError> {
+        let mut version = None;
+        let mut policy = None;
+        let mut subdomain_policy = None;
+        let mut adkim_strict = false;
+        let mut aspf_strict = false;
+        let mut pct = 100;
+
+        for segment in txt.split(';') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = segment.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim();
+            match name.to_ascii_lowercase().as_str() {
+                "v" => version = Some(value.to_string()),
+                "p" => policy = Some(parse_policy(value)?),
+                "sp" => subdomain_policy = Some(parse_policy(value)?),
+                "adkim" => match value {
+                    "r" => adkim_strict = false,
+                    "s" => adkim_strict = true,
+                    _ => return Err(DmarcError::Invalid("adkim")),
+                },
+                "aspf" => match value {
+                    "r" => aspf_strict = false,
+                    "s" => aspf_strict = true,
+                    _ => return Err(DmarcError::Invalid("aspf")),
+                },
+                "pct" => {
+                    pct = value.parse().map_err(|_| DmarcError::Invalid("pct"))?;
+                }
+                // rua, ruf, fo, rf, ri: reporting tags, not needed for
+                // policy evaluation.
+                _ => {}
+            }
+        }
+
+        match (version.as_deref(), policy) {
+            (Some("DMARC1"), Some(policy)) => Ok(DmarcRecord {
+                policy,
+                subdomain_policy,
+                adkim_strict,
+                aspf_strict,
+                pct,
+            }),
+            (Some(_), _) => Err(DmarcError::Invalid("v")),
+            (None, _) => Err(DmarcError::Invalid("v missing")),
+        }
+    }
+
+    /// The policy that applies to `domain` given the record's owner:
+    /// `sp=` for subdomains of the record's domain, `p=` otherwise.
+    pub fn policy_for(&self, record_domain: &str, domain: &str) -> DmarcPolicy {
+        let is_subdomain = domain != record_domain
+            && domain
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", record_domain.to_ascii_lowercase()));
+        match (is_subdomain, self.subdomain_policy) {
+            (true, Some(sp)) => sp,
+            _ => self.policy,
+        }
+    }
+}
+
+fn parse_policy(value: &str) -> Result<DmarcPolicy, DmarcError> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(DmarcPolicy::None),
+        "quarantine" => Ok(DmarcPolicy::Quarantine),
+        "reject" => Ok(DmarcPolicy::Reject),
+        _ => Err(DmarcError::Invalid("p")),
+    }
+}
+
+/// Relaxed alignment (RFC 7489 Section 3.1.1): the domains are aligned if
+/// they are equal or one is a subdomain of the other.
+pub fn aligned_relaxed(a: &str, b: &str) -> bool {
+    let a = a.trim().to_ascii_lowercase();
+    let b = b.trim().to_ascii_lowercase();
+    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
+/// Strict alignment: exact match, case-insensitive.
+pub fn aligned_strict(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// The outcome of alignment evaluation for one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evaluation {
+    /// SPF passed **and** its Mail From domain is aligned with the From
+    /// header domain.
+    pub spf_aligned: bool,
+    /// At least one DKIM signature is verified **and** its `d=` domain is
+    /// aligned with the From header domain.
+    pub dkim_aligned: bool,
+    /// At least one of the two.
+    pub pass: bool,
+}
+
+/// Evaluate alignment (RFC 7489 Section 4.2; the DMARC "pass" requires
+/// SPF **or** DKIM alignment). `spf` is the envelope-sender domain and
+/// whether SPF evaluated to Pass; `dkim` is each signature's `d=` domain
+/// and whether it fully verified.
+pub fn evaluate(
+    record: &DmarcRecord,
+    spf: Option<(&str, bool)>,
+    dkim: &[(String, bool)],
+    from_domain: &str,
+) -> Evaluation {
+    let spf_aligned =
+        matches!(spf, Some((domain, true)) if spf_aligned(record, domain, from_domain));
+    let dkim_aligned = dkim
+        .iter()
+        .any(|(domain, verified)| *verified && dkim_aligned(record, domain, from_domain));
+    let pass = spf_aligned || dkim_aligned;
+    Evaluation {
+        spf_aligned,
+        dkim_aligned,
+        pass,
+    }
+}
+
+fn spf_aligned(record: &DmarcRecord, spf_domain: &str, from_domain: &str) -> bool {
+    if record.aspf_strict {
+        aligned_strict(spf_domain, from_domain)
+    } else {
+        aligned_relaxed(spf_domain, from_domain)
+    }
+}
+
+fn dkim_aligned(record: &DmarcRecord, dkim_domain: &str, from_domain: &str) -> bool {
+    if record.adkim_strict {
+        aligned_strict(dkim_domain, from_domain)
+    } else {
+        aligned_relaxed(dkim_domain, from_domain)
+    }
+}
+
+/// What the verifier does with the message (RFC 7489 Section 7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Accepted normally.
+    Pass,
+    /// Accepted but flagged for the spam/quarantine pipeline.
+    Quarantine,
+    /// Rejected at end-of-data.
+    Reject,
+}
+
+/// Apply the message evaluation under the record's policy for its domain.
+/// `pct` is treated as 100 (no sampling; see module docs).
+pub fn apply(evaluation: &Evaluation, policy: DmarcPolicy) -> Action {
+    if evaluation.pass {
+        return Action::Pass;
+    }
+    match policy {
+        DmarcPolicy::Reject => Action::Reject,
+        DmarcPolicy::Quarantine => Action::Quarantine,
+        DmarcPolicy::None => Action::Pass,
+    }
+}
+
+/// Fetch the DMARC record for a From-header domain: TXT at
+/// `_dmarc.<from_domain>`, falling back to the organizational domain
+/// (RFC 7489 Section 3.6.2.1) using a last-two-labels heuristic in place
+/// of the Public Suffix List.
+pub async fn fetch_policy<R: SpfResolver + Sync>(
+    resolver: &R,
+    from_domain: &str,
+) -> Result<Option<DmarcRecord>, DmarcError> {
+    let name = format!("_dmarc.{from_domain}");
+    match fetch_one(resolver, &name).await {
+        Ok(Some(record)) => Ok(Some(record)),
+        Ok(None) => {
+            // Organizational-domain fallback: strip leading labels until
+            // two remain.
+            let labels: Vec<&str> = from_domain.split('.').collect();
+            if labels.len() > 2 {
+                let org = labels[labels.len() - 2..].join(".");
+                fetch_one(resolver, &format!("_dmarc.{org}")).await
+            } else {
+                Ok(None)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn fetch_one<R: SpfResolver + Sync>(
+    resolver: &R,
+    name: &str,
+) -> Result<Option<DmarcRecord>, DmarcError> {
+    let txts = resolver.txt(name).await.map_err(|_| DmarcError::Temp)?;
+    let mut found: Option<DmarcRecord> = None;
+    for txt in txts {
+        // A TXT record that parses as DMARC is a candidate; unrelated TXT
+        // records at the same name are ignored.
+        if let Ok(record) = DmarcRecord::parse(txt.trim()) {
+            if found.is_some() {
+                return Err(DmarcError::MultipleRecords);
+            }
+            found = Some(record);
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn record(txt: &str) -> DmarcRecord {
+        DmarcRecord::parse(txt).unwrap()
+    }
+
+    #[test]
+    fn parse_valid_records() {
+        let r = record("v=DMARC1; p=reject");
+        assert_eq!(r.policy, DmarcPolicy::Reject);
+        assert_eq!(r.subdomain_policy, None);
+        assert!(!r.adkim_strict && !r.aspf_strict);
+        assert_eq!(r.pct, 100);
+
+        let r = record(
+            "v=DMARC1; p=quarantine; sp=reject; adkim=s; aspf=s; pct=25; rua=mailto:agg@d.example",
+        );
+        assert_eq!(r.policy, DmarcPolicy::Quarantine);
+        assert_eq!(r.subdomain_policy, Some(DmarcPolicy::Reject));
+        assert!(r.adkim_strict && r.aspf_strict);
+        assert_eq!(r.pct, 25);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_records() {
+        assert!(DmarcRecord::parse("v=SPF1; p=reject").is_err()); // wrong version
+        assert!(DmarcRecord::parse("p=reject").is_err()); // no version
+        assert!(DmarcRecord::parse("v=DMARC1").is_err()); // no policy
+        assert!(DmarcRecord::parse("v=DMARC1; p=nonsense").is_err());
+        assert!(DmarcRecord::parse("v=DMARC1; p=reject; adkim=x").is_err());
+    }
+
+    #[test]
+    fn alignment_modes() {
+        assert!(aligned_relaxed("example.org", "example.org"));
+        assert!(aligned_relaxed("mail.example.org", "example.org"));
+        assert!(aligned_relaxed("example.org", "mail.example.org"));
+        assert!(!aligned_relaxed("notexample.org", "example.org"));
+
+        assert!(aligned_strict("Example.ORG", "example.org"));
+        assert!(!aligned_strict("mail.example.org", "example.org"));
+    }
+
+    #[test]
+    fn evaluate_spf_or_dkim() {
+        let r = record("v=DMARC1; p=reject");
+
+        // SPF aligned + passing.
+        let e = evaluate(&r, Some(("example.org", true)), &[], "example.org");
+        assert!(e.pass && e.spf_aligned && !e.dkim_aligned);
+
+        // SPF passing but unaligned (relaxed subdomain IS aligned).
+        let e = evaluate(&r, Some(("other.net", true)), &[], "example.org");
+        assert!(!e.pass);
+
+        // DKIM aligned + verified.
+        let e = evaluate(
+            &r,
+            Some(("other.net", false)),
+            &[("mail.example.org".to_string(), true)],
+            "example.org",
+        );
+        assert!(e.pass && e.dkim_aligned);
+
+        // DKIM aligned but NOT verified.
+        let e = evaluate(
+            &r,
+            None,
+            &[("example.org".to_string(), false)],
+            "example.org",
+        );
+        assert!(!e.pass);
+
+        // Strict SPF alignment rejects subdomains.
+        let strict = record("v=DMARC1; p=reject; aspf=s; adkim=s");
+        let e = evaluate(
+            &strict,
+            Some(("mail.example.org", true)),
+            &[],
+            "example.org",
+        );
+        assert!(!e.spf_aligned && !e.pass);
+    }
+
+    #[test]
+    fn apply_policies() {
+        let pass_eval = Evaluation {
+            spf_aligned: true,
+            dkim_aligned: false,
+            pass: true,
+        };
+        let fail_eval = Evaluation {
+            spf_aligned: false,
+            dkim_aligned: false,
+            pass: false,
+        };
+
+        assert_eq!(apply(&pass_eval, DmarcPolicy::Reject), Action::Pass);
+        assert_eq!(apply(&fail_eval, DmarcPolicy::Reject), Action::Reject);
+        assert_eq!(
+            apply(&fail_eval, DmarcPolicy::Quarantine),
+            Action::Quarantine
+        );
+        // p=none: monitor only, message passes.
+        assert_eq!(apply(&fail_eval, DmarcPolicy::None), Action::Pass);
+    }
+
+    #[test]
+    fn subdomain_policy_selection() {
+        let r = record("v=DMARC1; p=none; sp=reject");
+        assert_eq!(
+            r.policy_for("example.org", "example.org"),
+            DmarcPolicy::None
+        );
+        assert_eq!(
+            r.policy_for("example.org", "mail.example.org"),
+            DmarcPolicy::Reject
+        );
+        // Not a subdomain (no dot-prefix match).
+        assert_eq!(
+            r.policy_for("example.org", "notexample.org"),
+            DmarcPolicy::None
+        );
+    }
+
+    #[derive(Default, Clone)]
+    struct MockResolver {
+        txt: HashMap<String, Vec<String>>,
+    }
+
+    impl SpfResolver for MockResolver {
+        async fn txt(&self, domain: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self.txt.get(domain).cloned().unwrap_or_default())
+        }
+        async fn a(&self, _domain: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
+            Ok(vec![])
+        }
+        async fn mx(&self, _domain: &str) -> anyhow::Result<Vec<(u16, String)>> {
+            Ok(vec![])
+        }
+        async fn ptr(&self, _domain: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_policy_direct_and_org_fallback() {
+        let mut resolver = MockResolver::default();
+        resolver.txt.insert(
+            "_dmarc.example.org".to_string(),
+            vec!["v=DMARC1; p=reject".to_string()],
+        );
+
+        let r = fetch_policy(&resolver, "example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.policy, DmarcPolicy::Reject);
+
+        // A subdomain with no own record falls back to the organizational
+        // domain's record.
+        let r = fetch_policy(&resolver, "mail.example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.policy, DmarcPolicy::Reject);
+
+        // Unrelated TXT records are ignored.
+        let mut resolver = MockResolver::default();
+        resolver.txt.insert(
+            "_dmarc.example.org".to_string(),
+            vec!["some unrelated TXT record".to_string()],
+        );
+        assert!(fetch_policy(&resolver, "example.org")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

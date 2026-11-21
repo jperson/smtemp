@@ -6,11 +6,10 @@ members = [
     "dnsq",
     "smtp",
     "dns",
-    "sendmail",
+    "smtp-client",
     "spf",
+    "dmarc",
     "dkim",
-    "imfpest",
-    "mimepest",
     "mailparse",
 ]
 

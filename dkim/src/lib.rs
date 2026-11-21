@@ -1,3 +1,9 @@
+//! DKIM verification (RFC 6376, RFC 8463) built on the [`mailparse`]
+//! crate: canonicalization, body hashing, signed-header-data
+//! construction, public-key records, and cryptographic verification
+//! (RSA PKCS#1 v1.5 and Ed25519, SHA-256).
+#![warn(missing_docs)]
+
 //! DKIM (RFC 6376) parsing, canonicalization, and hashing, built on the
 //! `mailparse` crate.
 //!
@@ -19,8 +25,8 @@
 
 use base64::prelude::*;
 use rsa::pkcs1::DecodeRsaPublicKey as _;
-use rsa::pkcs8::DecodePublicKey as _;
 use rsa::pkcs1v15::{Signature as Pkcs1v15Signature, VerifyingKey};
+use rsa::pkcs8::DecodePublicKey as _;
 use rsa::signature::Verifier;
 use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
@@ -30,44 +36,60 @@ use thiserror::Error;
 
 use mailparse::{parse_message, ParsedMessage, RawHeader};
 
+/// Errors from DKIM signature parsing, key handling, and verification.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum DkimError {
+    /// A required tag (v/a/b/bh/d/s/h) is absent.
     #[error("missing required tag: {0}")]
     MissingTag(&'static str),
 
+    /// The DKIM-Signature enum wraps per-tag problems; this variant is a
+    /// present tag with an unusable value (v=2, l= not a number, ...).
     #[error("invalid value for tag: {0}")]
     InvalidTag(&'static str),
 
+    /// The a= or k= names an algorithm this verifier does not implement.
     #[error("unsupported hash or key algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
+    /// The DKIM-Signature header was not valid UTF-8.
     #[error("invalid UTF-8 in DKIM-Signature header")]
     InvalidUtf8,
 
+    /// The DNS query for the key record failed (transport or rcode).
     #[error("DNS lookup for the public key failed: {0}")]
     KeyLookupFailed(String),
 
+    /// The key-record name exists but carries no parseable DKIM key.
     #[error("no usable DKIM key record found at {0}")]
     NoKeyRecord(String),
 
+    /// The key record has an empty p= tag (explicit revocation).
     #[error("public key is revoked (empty p= tag)")]
     RevokedKey,
 
+    /// The key record does not decode to a usable public key.
     #[error("invalid public key: {0}")]
     InvalidKey(String),
 
+    /// The key record's h= tag does not list the signature's hash.
     #[error("hash algorithm {0} is not accepted by the public key record")]
     HashNotAccepted(String),
 
+    /// The key record's s= tag does not include "email".
     #[error("key record does not permit the email service")]
     ServiceNotPermitted,
 
+    /// The i= identity's domain does not align with d= (strict mode).
     #[error("AUID (i=) domain does not match the signing domain (d=)")]
     DomainMismatch,
 
+    /// The signature's x= timestamp is in the past.
     #[error("signature expired (x= is in the past)")]
     Expired,
 
+    /// The b= value does not decode to a valid signature for the key
+    /// type.
     #[error("invalid signature encoding: {0}")]
     InvalidSignature(String),
 }
@@ -189,8 +211,7 @@ impl<'a> DkimSignature<'a> {
             None => ("simple", "simple"),
         };
 
-        let signed_headers =
-            signed_headers.ok_or(DkimError::MissingTag("h"))?;
+        let signed_headers = signed_headers.ok_or(DkimError::MissingTag("h"))?;
         if signed_headers.is_empty() {
             return Err(DkimError::InvalidTag("h"));
         }
@@ -228,8 +249,11 @@ impl<'a> DkimSignature<'a> {
 }
 
 /// A `DKIM-Signature` header found in a message, paired with its parsed tags.
+/// One `DKIM-Signature` header found in a message, paired with its parsed
+/// tags.
 #[derive(Debug)]
 pub struct ParsedSignature<'a, 'm> {
+    /// The parsed signature tags.
     pub signature: DkimSignature<'m>,
     /// The raw header the signature was parsed from. Note the two
     /// lifetimes: the header lives inside the `ParsedMessage`, while the
@@ -248,7 +272,10 @@ pub fn find_signatures<'a, 'm>(msg: &'a ParsedMessage<'m>) -> Vec<ParsedSignatur
             let raw = std::str::from_utf8(h.raw_value).ok()?;
             DkimSignature::parse(raw)
                 .ok()
-                .map(|signature| ParsedSignature { signature, header: h })
+                .map(|signature| ParsedSignature {
+                    signature,
+                    header: h,
+                })
         })
         .collect()
 }
@@ -504,12 +531,14 @@ pub fn signed_header_data(
     }
 
     let without_b = dkim_sig_without_b(sig_header.raw_value);
-    data.extend_from_slice(&canonicalize_header(sig.header_canon, sig_header.name, &without_b));
+    data.extend_from_slice(&canonicalize_header(
+        sig.header_canon,
+        sig_header.name,
+        &without_b,
+    ));
 
     Ok(data)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -624,24 +653,31 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(sig.selector, "protonmail3");
         assert_eq!(sig.timestamp, Some(1730510168));
         assert_eq!(sig.expiry, Some(1730769368));
-        assert_eq!(sig.body_hash, "evU+ZAhaA7uoDunwy9tpxgyXQlVvxX0ZJTSDyRIcuew=");
+        assert_eq!(
+            sig.body_hash,
+            "evU+ZAhaA7uoDunwy9tpxgyXQlVvxX0ZJTSDyRIcuew="
+        );
         assert_eq!(sig.signed_headers, vec!["Date", "To", "From", "Subject"]);
         assert_eq!(sig.identity, Some("@protonmail.com"));
-        assert_eq!(sig.key_query_name(), "protonmail3._domainkey.protonmail.com");
+        assert_eq!(
+            sig.key_query_name(),
+            "protonmail3._domainkey.protonmail.com"
+        );
         // The b= value keeps its folds; strip_fws yields pure base64.
-        assert_eq!(strip_fws(sig.signature), "OcGMbHQ7D6awrQVpP/eSLuPPz8cUpAuPSdXMlV6KdvNXpA==");
+        assert_eq!(
+            strip_fws(sig.signature),
+            "OcGMbHQ7D6awrQVpP/eSLuPPz8cUpAuPSdXMlV6KdvNXpA=="
+        );
     }
 
     #[test]
     fn test_parse_rejects_missing_and_invalid_tags() {
-        assert!(DkimSignature::parse("v=2; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From")
-            .is_err());
-        assert!(DkimSignature::parse("a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From")
-            .is_err());
-        assert!(DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=")
-            .is_err());
+        assert!(DkimSignature::parse("v=2; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From").is_err());
+        assert!(DkimSignature::parse("a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From").is_err());
+        assert!(DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=").is_err());
         // c= with only the header algorithm defaults the body to simple.
-        let sig = DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From; c=relaxed").unwrap();
+        let sig = DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From; c=relaxed")
+            .unwrap();
         assert_eq!((sig.header_canon, sig.body_canon), ("relaxed", "simple"));
     }
 
@@ -715,11 +751,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         )
         .unwrap();
         // Stand-in signature header (its own b= handling is tested above).
-        let stand_in = msg
-            .headers
-            .iter()
-            .find(|h| h.name_eq("subject"))
-            .unwrap();
+        let stand_in = msg.headers.iter().find(|h| h.name_eq("subject")).unwrap();
 
         let data = signed_header_data(&msg, &sig, stand_in).unwrap();
         // Bottom-up: "two" is selected before "one".
@@ -730,10 +762,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
     #[test]
     fn test_parse_key_record() {
-        let key = DkimKeyRecord::parse(
-            "v=DKIM1; k=rsa; p=MIIBIjAN; s=email; t=s:y; h=sha256:sha1",
-        )
-        .unwrap();
+        let key = DkimKeyRecord::parse("v=DKIM1; k=rsa; p=MIIBIjAN; s=email; t=s:y; h=sha256:sha1")
+            .unwrap();
         assert_eq!(key.version, "DKIM1");
         assert_eq!(key.key_type, "rsa");
         assert_eq!(key.public_key, "MIIBIjAN");
@@ -767,14 +797,18 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
     #[test]
     fn test_auid_matching() {
         let key = DkimKeyRecord::parse("v=DKIM1; p=abc").unwrap();
-        let parse_i =
-            |i: &'static str| DkimSignature::parse(i).unwrap();
+        let parse_i = |i: &'static str| DkimSignature::parse(i).unwrap();
 
-        let sub = parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@sub.example.org");
-        let same = parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@example.org");
-        let upper = parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=user@EXAMPLE.ORG");
-        let other = parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@other.net");
-        let prefix = parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@notexample.org");
+        let sub =
+            parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@sub.example.org");
+        let same =
+            parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@example.org");
+        let upper =
+            parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=user@EXAMPLE.ORG");
+        let other =
+            parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@other.net");
+        let prefix =
+            parse_i("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From; i=@notexample.org");
 
         assert!(auid_matches(&sub, &key)); // subdomain
         assert!(auid_matches(&same, &key)); // exact
@@ -788,22 +822,20 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(auid_matches(&same, &strict));
 
         // No i= tag: always aligned.
-        let no_i =
-            DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From")
-                .unwrap();
+        let no_i = DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=example.org; s=s; h=From")
+            .unwrap();
         assert!(auid_matches(&no_i, &key));
     }
 
     #[test]
     fn test_expiry() {
-        let sig = DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From; x=1000")
-            .unwrap();
+        let sig =
+            DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From; x=1000").unwrap();
         assert!(is_expired(&sig, 1001));
         assert!(!is_expired(&sig, 1000)); // x= == now is not yet expired
         assert!(!is_expired(&sig, 999));
 
-        let no_x =
-            DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From").unwrap();
+        let no_x = DkimSignature::parse("v=1; a=rsa-sha256; b=x; bh=x; d=d; s=s; h=From").unwrap();
         assert!(!is_expired(&no_x, u64::MAX));
     }
 
@@ -844,8 +876,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         let signing_key: SigningKey<rsa::sha2::Sha256> = SigningKey::new(private);
         let signature = signing_key.sign(&data);
         let sig_bytes: Box<[u8]> = signature.into();
-        let final_message =
-            step1.replace("PLACEHOLDER_SIG", &BASE64_STANDARD.encode(sig_bytes));
+        let final_message = step1.replace("PLACEHOLDER_SIG", &BASE64_STANDARD.encode(sig_bytes));
 
         // 4. Verify the intact message.
         let final_bytes = final_message.as_bytes().to_vec();
@@ -904,8 +935,10 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         // RFC 8463: PureEdDSA over the SHA-256 digest of the canonicalized
         // signed header data.
         let signature = signing_key.sign(Sha256::digest(&data).as_slice());
-        let final_message = step1
-            .replace("PLACEHOLDER_SIG", &BASE64_STANDARD.encode(signature.to_bytes()));
+        let final_message = step1.replace(
+            "PLACEHOLDER_SIG",
+            &BASE64_STANDARD.encode(signature.to_bytes()),
+        );
 
         // Positive: intact message verifies.
         let final_bytes = final_message.as_bytes().to_vec();
@@ -1026,14 +1059,21 @@ impl DkimKeyRecord {
             }
         }
 
-        let public_key =
-            public_key.ok_or(DkimError::InvalidKey("missing p= tag".to_string()))?;
+        let public_key = public_key.ok_or(DkimError::InvalidKey("missing p= tag".to_string()))?;
 
         Ok(DkimKeyRecord {
             version,
-            key_type: if key_type.is_empty() { "rsa".to_string() } else { key_type },
+            key_type: if key_type.is_empty() {
+                "rsa".to_string()
+            } else {
+                key_type
+            },
             public_key,
-            service: if service.is_empty() { vec!["*".to_string()] } else { service },
+            service: if service.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                service
+            },
             flags,
             hashes,
         })
@@ -1041,7 +1081,9 @@ impl DkimKeyRecord {
 
     /// Whether the record permits use for email (RFC 6376 Section 3.6.1.4).
     fn permits_email(&self) -> bool {
-        self.service.iter().any(|s| s == "*" || s.eq_ignore_ascii_case("email"))
+        self.service
+            .iter()
+            .any(|s| s == "*" || s.eq_ignore_ascii_case("email"))
     }
 
     /// Whether `hash` (e.g. "sha256") is acceptable; an empty `h=` tag
@@ -1197,11 +1239,13 @@ fn verify_ed25519(
         .map_err(|e| DkimError::InvalidSignature(e.to_string()))?;
 
     let digest = Sha256::digest(signed_data);
-    Ok(public_key
-        .verify(digest.as_slice(), &signature)
-        .is_ok())
+    Ok(public_key.verify(digest.as_slice(), &signature).is_ok())
 }
 
+/// The outcome of checking one DKIM signature.
+///
+/// `body_hash_ok` and `signature_ok` are independent: the body hash checks
+/// the message body against the `bh=` tag, while the signature check
 /// The outcome of checking one DKIM signature.
 ///
 /// `body_hash_ok` and `signature_ok` are independent: the body hash checks
@@ -1211,8 +1255,12 @@ fn verify_ed25519(
 /// both are true.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DkimResult<'a> {
+    /// The parsed signature tags.
     pub signature: DkimSignature<'a>,
+    /// The canonicalized body's hash matched the `bh=` tag.
     pub body_hash_ok: bool,
+    /// The RSA/Ed25519 verification of the signed header data succeeded
+    /// against the published public key.
     pub signature_ok: bool,
     /// The first structural error encountered, if any.
     pub error: Option<DkimError>,

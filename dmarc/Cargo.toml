@@ -1,0 +1,13 @@
+[package]
+name = "dmarc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+spf = { path = "../spf" }
+
+anyhow = "1.0.86"
+
+[dev-dependencies]
+tokio = { version = "1.39.2", features = ["rt", "macros"] }

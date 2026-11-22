@@ -96,10 +96,12 @@ file — there is no default, and its absence is a hard error at startup.
 | `--max-connections <N>` | `max-connections` | `500` | Server-wide cap on simultaneous connections; over-capacity connections are answered `421` and closed. |
 | `--max-conn-per-ip <N>` | `max-conn-per-ip` | `10` | Maximum simultaneous connections from a single source IP. |
 | `--max-conn-rate-per-ip <N>` | `max-conn-rate-per-ip` | `60` | Maximum new connections per 60-second window from a single source IP (flood/churn budget). Both per-IP refusals answer `421 4.7.0` and close. |
+| `--max-dns-per-ip <N>` | `max-dns-per-ip` | `4` | Maximum concurrent DNS-backed checks (SPF for HELO and MAIL FROM, DKIM + DMARC at end-of-data) from a single source IP, so one client can't fill the shared resolver capacity with slow lookups. A check over the limit waits up to 10 s, then gets a temporary failure (`451 4.7.0`; HELO just records SPF `TempError`). Never a permanent rejection. 0 is a startup error. |
 | `--tls-cert <FILE>` | `tls-cert` | *(none)* | PEM certificate enabling STARTTLS (RFC 3207). Must be given together with `--tls-key`. When absent, STARTTLS is refused with `454` and never advertised. |
 | `--tls-key <FILE>` | `tls-key` | *(none)* | PEM private key for STARTTLS. |
 | `--auth-users <SPEC>` | `auth-users` | *(none)* | SASL credentials for AUTH PLAIN/LOGIN, as comma-separated `user:password` pairs (e.g. `alice:secret,bob:hunter2`). When set, `AUTH PLAIN LOGIN` is advertised **only over TLS** (RFC 8310); AUTH on a plaintext session is refused with `538`. ⚠️ Credentials are stored **in plaintext** in the process arguments/config file (shell history, `ps` output) — acceptable for testing only, not for production (see PLAN.md, Phase 8). |
 | `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. |
+| `--dns-connections <N>` | `dns-connections` | `2` | Pipelined DNS-over-TLS connections to the resolver (1–16; out of range is a startup error). Each carries up to 64 queries in flight, so slow lookups for one domain don't stall others. Size it from the periodic `dns stats` log line: sustained `waits` mean every connection is at its in-flight limit. |
 | `--spool-dir <DIR>` | `spool-dir` | `spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. Messages past the delivery retry budget land in `spool/dead-letter/`. |
 | `--maildir-dir <DIR>` | `maildir-dir` | `maildir` | Local delivery root: one maildir per recipient address (`{root}/{domain}/{local}/new`), written via the `DeliverySink` trait. Delivery happens immediately after acceptance and is retried from the queue until it succeeds; each delivered copy carries `Return-Path:` and a per-recipient `Received:` trace header. |
 | `--local-domains <SPEC>` | `local-domains` | *(the `--domain` value)* | Comma-separated list of recipient domains we accept mail for. The value of `--domain` is always added implicitly. Relay access is closed regardless of authentication — mail for any other recipient domain is refused with `550 5.7.1`. Superseded by `--authority` when given. |
@@ -123,12 +125,14 @@ max-read-duration-ms = 15000
 max-connections = 500
 max-conn-per-ip = 10
 max-conn-rate-per-ip = 60
+max-dns-per-ip = 4
 
 tls-cert = "/etc/mailserv/cert.pem"
 tls-key = "/etc/mailserv/key.pem"
 auth-users = "alice:secret,bob:hunter2"
 
 resolver = "1.1.1.1"
+dns-connections = 2
 spool-dir = "spool"
 maildir-dir = "maildir"
 local-domains = "example.org,example.net"
@@ -255,7 +259,7 @@ cargo doc --workspace --no-deps  # rustdoc (missing_docs is warn-by-default)
 cargo test --workspace
 ```
 
-This runs ~193 tests across the workspace in four layers (see DESIGN.md
+This runs ~207 tests across the workspace in four layers (see DESIGN.md
 §9 for the rationale):
 
 1. **Unit** — pure logic per crate (DKIM canonicalization, DMARC

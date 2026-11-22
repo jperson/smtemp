@@ -14,12 +14,14 @@ use rustls_pki_types::ServerName;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
@@ -253,6 +255,7 @@ struct DnsStats {
     exchanges_ok: AtomicU64,
     exchange_errors: AtomicU64,
     timeouts: AtomicU64,
+    late_replies: AtomicU64,
     waits: AtomicU64,
     wait_total_us: AtomicU64,
     wait_max_us: AtomicU64,
@@ -277,22 +280,26 @@ pub struct DnsStatsSnapshot {
     pub connect_failures: u64,
     /// Exchanges that returned a validated response.
     pub exchanges_ok: u64,
-    /// Exchanges that failed at the connection or protocol level (the
-    /// connection was discarded).
+    /// Query attempts that failed at the connection or protocol level
+    /// (the connection was closed; the query retried once).
     pub exchange_errors: u64,
-    /// Exchanges (or connects) that hit the per-exchange timeout.
+    /// Queries (or connects) that hit the per-query timeout. A timed-out
+    /// query abandons its transaction ID; the connection stays usable.
     pub timeouts: u64,
-    /// Cache misses that found every pooled connection busy and had to
-    /// wait for one.
+    /// Responses that arrived for a transaction ID no longer in flight
+    /// (the query had timed out or been cancelled); discarded.
+    pub late_replies: u64,
+    /// Cache misses that found every connection at its in-flight limit
+    /// and had to wait for capacity.
     pub waits: u64,
-    /// Total time cache misses spent waiting for a connection, in
+    /// Total time cache misses spent waiting for capacity, in
     /// microseconds (divide by `queries - cache_hits` for the mean).
     pub wait_total_us: u64,
-    /// Longest single wait for a connection, in microseconds.
+    /// Longest single wait for capacity, in microseconds.
     pub wait_max_us: u64,
-    /// Queries waiting for a connection right now.
+    /// Queries waiting for capacity right now.
     pub waiting: u64,
-    /// Queries holding a connection right now.
+    /// Queries in flight (holding capacity) right now.
     pub in_flight: u64,
     /// Highest `in_flight` value observed.
     pub peak_in_flight: u64,
@@ -314,58 +321,378 @@ impl Drop for GaugeGuard<'_> {
     }
 }
 
-/// A shared DNS-over-TLS client: a small pool of lazily-established TLS
-/// connections reused across queries (previously every query paid a
-/// full TCP+TLS handshake and a fresh rustls configuration), plus a
-/// TTL-based result cache shared by every consumer (SPF, DKIM, DMARC).
+/// Lock a std mutex, recovering the data if a previous holder panicked.
+/// The tables guarded here stay consistent across a panic (every update
+/// is a single insert/remove), and the guard types below lock in `Drop`,
+/// where a second panic would abort the process.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// -- Pipelined connections (DESIGN §6.1) --------------------------------
+
+/// Default number of pipelined DoT connections per [`DnsClient`].
+pub const DEFAULT_CONNECTIONS: usize = 2;
+
+/// Upper bound on [`DnsClient::with_connections`].
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// Default limit on queries in flight on one connection
+/// ([`DnsClient::with_max_in_flight`]); below the per-connection limits
+/// common public resolvers enforce.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 64;
+
+/// What a waiting query receives from its connection.
+#[derive(Debug)]
+enum Outcome {
+    /// The validated response to this query.
+    Response(DnsMessage),
+    /// The connection failed before answering; the query may retry on a
+    /// new connection.
+    Failed(String),
+}
+
+/// One query waiting for its response on a pipelined connection.
+#[derive(Debug)]
+struct PendingQuery {
+    /// Unique per submission, so a cancelled query's cleanup can never
+    /// remove a later query that reused the same transaction ID.
+    token: u64,
+    /// The query as sent, for validating the response (question echo).
+    query: DnsMessage,
+    /// Where the response (or the connection failure) is delivered.
+    reply: oneshot::Sender<Outcome>,
+}
+
+/// The in-flight table of one connection.
+#[derive(Debug, Default)]
+struct PendingTable {
+    /// Waiting queries by transaction ID (unique among those in flight).
+    queries: HashMap<u16, PendingQuery>,
+    /// Set once the connection has failed or closed: no new submissions.
+    closed: bool,
+}
+
+/// State shared between one connection's handle, its reader task, and
+/// its writer task.
+#[derive(Debug)]
+struct Shared {
+    table: Mutex<PendingTable>,
+    stats: Arc<DnsStats>,
+}
+
+impl Shared {
+    /// Mark the connection closed and fail every waiting query (they
+    /// retry once on a new connection). Idempotent.
+    fn fail_all(&self, reason: &str) {
+        let drained: Vec<PendingQuery> = {
+            let mut table = lock(&self.table);
+            table.closed = true;
+            table.queries.drain().map(|(_, p)| p).collect()
+        };
+        for pending in drained {
+            let _ = pending.reply.send(Outcome::Failed(reason.to_string()));
+        }
+    }
+
+    /// Deliver a response to the query waiting on its transaction ID.
+    ///
+    /// A response whose ID matches nothing in flight is a late reply to a
+    /// query that already timed out or was cancelled: it is counted and
+    /// discarded, and the connection stays usable. Returns `Err` when a
+    /// response matches an ID but fails validation (question echo, QR,
+    /// EDNS0 conformance): the resolver's view of this connection can no
+    /// longer be trusted, so the caller tears the connection down.
+    fn complete(&self, resp: DnsMessage) -> Result<()> {
+        let pending = lock(&self.table)
+            .queries
+            .remove(&resp.header.transaction_id);
+        let Some(pending) = pending else {
+            self.stats.late_replies.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
+        if let Err(e) =
+            validate_response(&pending.query, &resp).and_then(|()| resp.edns0().map(drop))
+        {
+            let _ = pending.reply.send(Outcome::Failed(e.to_string()));
+            return Err(e);
+        }
+        let _ = pending.reply.send(Outcome::Response(resp));
+        Ok(())
+    }
+}
+
+/// Removes its query from the in-flight table when dropped — whether the
+/// query got its answer, timed out, or its future was cancelled — so
+/// abandoned queries never leak table entries.
+struct PendingGuard {
+    shared: Arc<Shared>,
+    id: u16,
+    token: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let mut table = lock(&self.shared.table);
+        if table
+            .queries
+            .get(&self.id)
+            .is_some_and(|p| p.token == self.token)
+        {
+            table.queries.remove(&self.id);
+        }
+    }
+}
+
+/// One pipelined DNS-over-TLS connection (RFC 7766 §6.2.1.1, RFC 7858
+/// §3.4): many queries in flight at once, replies matched by
+/// transaction ID and question echo, in whatever order the resolver
+/// sends them.
 ///
-/// Each pooled connection carries one exchange at a time (up to
-/// [`POOL_SIZE`] queries run concurrently); a query that fails at the
-/// connection level — stale idle
-/// connections are common — retries once on a freshly established
-/// connection. Any failed or timed-out exchange discards the
-/// connection: a half-completed exchange must never be followed by
-/// another query on the same stream, or responses would be mispaired.
+/// A reader task owns the read half and a writer task owns the write
+/// half. Queries hand whole frames to the writer over a channel, so a
+/// query cancelled mid-send can never leave a partial frame on the wire.
+/// Dropping the handle (when it is replaced in its slot and the last
+/// query using it finishes) aborts both tasks and closes the connection.
+#[derive(Debug)]
+struct Pipeline {
+    shared: Arc<Shared>,
+    outbound: mpsc::UnboundedSender<Vec<u8>>,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+}
+
+impl Pipeline {
+    /// Start the reader and writer tasks on an established connection.
+    fn start(stream: DotStream, stats: Arc<DnsStats>) -> Self {
+        let (read_half, write_half) = tokio::io::split(stream);
+        let shared = Arc::new(Shared {
+            table: Mutex::new(PendingTable::default()),
+            stats,
+        });
+        let (outbound, frames) = mpsc::unbounded_channel();
+        let reader = tokio::spawn(read_loop(read_half, Arc::clone(&shared)));
+        let writer = tokio::spawn(write_loop(write_half, frames, Arc::clone(&shared)));
+        Pipeline {
+            shared,
+            outbound,
+            reader,
+            writer,
+        }
+    }
+
+    /// Whether the connection has failed or been closed by the resolver.
+    fn is_closed(&self) -> bool {
+        lock(&self.shared.table).closed
+    }
+
+    /// Queue one query on this connection.
+    ///
+    /// Returns `Ok(Some((reply, guard)))` once the query is registered and
+    /// handed to the writer (keep `guard` alive while waiting), `Ok(None)`
+    /// if the connection is already closed (retry on a new one), and
+    /// `Err` only if the query cannot be encoded.
+    fn submit(
+        &self,
+        domain: &str,
+        qtype: u16,
+        token: u64,
+    ) -> Result<Option<(oneshot::Receiver<Outcome>, PendingGuard)>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let frame;
+        let id;
+        {
+            let mut table = lock(&self.shared.table);
+            if table.closed {
+                return Ok(None);
+            }
+            id = free_transaction_id(&table.queries);
+            let query = DnsMessage::new(
+                id,
+                vec![DnsQuestion {
+                    name: Label::new(domain.to_string()),
+                    record_type: qtype,
+                    record_class: 0x01,
+                }],
+            );
+            let bytes = query.to_vec()?;
+            let len = u16::try_from(bytes.len()).context("DNS query too large")?;
+            let mut buf = Vec::with_capacity(bytes.len() + 2);
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(&bytes);
+            frame = buf;
+            table.queries.insert(
+                id,
+                PendingQuery {
+                    token,
+                    query,
+                    reply: reply_tx,
+                },
+            );
+        }
+        let guard = PendingGuard {
+            shared: Arc::clone(&self.shared),
+            id,
+            token,
+        };
+        if self.outbound.send(frame).is_err() {
+            // The writer is gone: the connection is dead. Dropping the
+            // guard unregisters the query.
+            self.shared.fail_all("DNS connection writer stopped");
+            return Ok(None);
+        }
+        Ok(Some((reply_rx, guard)))
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+/// A random transaction ID not currently in flight on this connection.
+/// IDs stay unpredictable (RFC 5452 hygiene, though TLS already
+/// authenticates the channel); the table holds at most the in-flight
+/// limit, so a free ID is found almost immediately.
+fn free_transaction_id(in_flight: &HashMap<u16, PendingQuery>) -> u16 {
+    let mut rng = rand::thread_rng();
+    loop {
+        let id: u16 = rng.gen();
+        if !in_flight.contains_key(&id) {
+            return id;
+        }
+    }
+}
+
+/// The reader task: deliver each response to its waiter until the
+/// connection ends. A resolver-side close is seen here as EOF straight
+/// away, so the next query reconnects instead of first failing on a dead
+/// stream. Any end — EOF, I/O error, malformed frame, or a response that
+/// fails validation — closes the connection and fails every waiter.
+async fn read_loop(mut read_half: ReadHalf<DotStream>, shared: Arc<Shared>) {
+    let reason = loop {
+        let len = match read_half.read_u16().await {
+            Ok(len) => len,
+            Err(_) => break "DNS connection closed by resolver".to_string(),
+        };
+        let mut buf = vec![0; usize::from(len)];
+        if read_half.read_exact(&mut buf).await.is_err() {
+            break "DNS connection closed mid-response".to_string();
+        }
+        let resp = match DnsMessage::from_bytes(&buf) {
+            Ok((_, resp)) => resp,
+            Err(e) => break format!("malformed DNS response: {e}"),
+        };
+        if let Err(e) = shared.complete(resp) {
+            break format!("invalid DNS response: {e}");
+        }
+    };
+    shared.fail_all(&reason);
+}
+
+/// The writer task: write queued query frames, batching whatever is
+/// already queued before each flush. A write failure closes the
+/// connection and fails every waiter.
+async fn write_loop(
+    mut write_half: WriteHalf<DotStream>,
+    mut frames: mpsc::UnboundedReceiver<Vec<u8>>,
+    shared: Arc<Shared>,
+) {
+    while let Some(frame) = frames.recv().await {
+        let mut result = write_half.write_all(&frame).await;
+        while result.is_ok() {
+            match frames.try_recv() {
+                Ok(next) => result = write_half.write_all(&next).await,
+                Err(_) => break,
+            }
+        }
+        if result.is_ok() {
+            result = write_half.flush().await;
+        }
+        if result.is_err() {
+            shared.fail_all("write to DNS resolver failed");
+            return;
+        }
+    }
+}
+
+/// One connection slot: the current pipelined connection (if any) and
+/// how many queries are assigned to it.
+#[derive(Debug, Default)]
+struct Slot {
+    /// Locked only to reuse or (re)establish the connection, so queries
+    /// arriving while it connects wait for that one handshake rather
+    /// than each opening their own.
+    conn: AsyncMutex<Option<Arc<Pipeline>>>,
+    /// Queries currently assigned to this slot (bounded by the client's
+    /// in-flight limit).
+    load: AtomicUsize,
+}
+
+/// A query's claim on a slot; releases its share of the slot's load when
+/// dropped (including on cancellation).
+struct SlotClaim<'a> {
+    slot: &'a Slot,
+}
+
+impl Drop for SlotClaim<'_> {
+    fn drop(&mut self) {
+        self.slot.load.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A shared DNS-over-TLS client: a few lazily-established, **pipelined**
+/// TLS connections (DESIGN §6.1), plus a TTL-based result cache shared
+/// by every consumer (SPF, DKIM, DMARC).
+///
+/// Each connection carries up to [`DnsClient::max_in_flight`] queries at
+/// once; a query goes to the least-loaded connection (ties prefer the
+/// lowest slot, so a quiet server keeps one warm connection), and when
+/// every connection is at its limit it waits for capacity. A slow lookup
+/// therefore occupies one in-flight entry, not a whole connection.
+///
+/// A query that times out simply abandons its transaction ID — the
+/// connection stays usable and a late reply is discarded. A connection
+/// that fails (EOF, I/O error, malformed or invalid response) fails all
+/// of its waiting queries, which retry once on a fresh connection.
 #[derive(Debug)]
 pub struct DnsClient {
     /// The resolver address (DNS-over-TLS on port 853).
     server: Ipv4Addr,
-    /// Per-exchange timeout; a timeout poisons the connection.
+    /// Per-query timeout (and the connect timeout).
     timeout: Duration,
     /// TLS configuration (webpki roots in production; a test root for
-    /// the mock-server integration test).
+    /// the mock-server integration tests).
     config: Arc<ClientConfig>,
     /// Endpoint override (mock DoT server on an ephemeral port);
     /// production always derives `server:853`.
     endpoint: Option<String>,
     /// Validated responses keyed by (qname, qtype).
     cache: Mutex<DnsCache>,
-    /// The connection pool: [`POOL_SIZE`] independently locked slots,
-    /// each holding an established connection or nothing. One exchange
-    /// runs per slot at a time, so responses are never mispaired.
-    conns: Vec<AsyncMutex<Option<DotStream>>>,
-    /// Round-robin cursor for waiting on a slot when all are busy.
-    next_slot: std::sync::atomic::AtomicUsize,
+    /// The connection slots.
+    slots: Vec<Slot>,
+    /// Queries allowed in flight per connection.
+    max_in_flight: usize,
+    /// Client-wide capacity: `slots × max_in_flight` permits. A query
+    /// holds one for its whole lifetime, which bounds every slot's load.
+    capacity: Semaphore,
+    /// Source of [`PendingQuery::token`]s.
+    next_token: AtomicU64,
     /// Metrics (see [`DnsClient::stats`]).
-    stats: DnsStats,
+    stats: Arc<DnsStats>,
 }
 
-/// Concurrent DNS-over-TLS connections per [`DnsClient`] (H6, security
-/// report). With a single serialized connection one slow lookup (an
-/// attacker can publish records whose authoritative servers never
-/// answer) held every session's DNS for the whole per-exchange
-/// timeout. With a pool, a slow lookup occupies one slot while the
-/// others keep serving.
-pub const POOL_SIZE: usize = 8;
-
 impl DnsClient {
-    /// A client for `server` with the default 5-second per-exchange
-    /// timeout.
+    /// A client for `server` with the default 5-second per-query
+    /// timeout, [`DEFAULT_CONNECTIONS`] connections and
+    /// [`DEFAULT_MAX_IN_FLIGHT`] queries in flight per connection.
     pub fn new(server: Ipv4Addr) -> Self {
         DnsClient::with_timeout(server, Duration::from_secs(5))
     }
 
-    /// A client with an explicit per-exchange timeout.
+    /// A client with an explicit per-query timeout.
     pub fn with_timeout(server: Ipv4Addr, timeout: Duration) -> Self {
         DnsClient::with_config(server, default_client_config(), timeout, None)
     }
@@ -387,10 +714,39 @@ impl DnsClient {
             config,
             endpoint,
             cache: Mutex::new(DnsCache::default()),
-            conns: (0..POOL_SIZE).map(|_| AsyncMutex::new(None)).collect(),
-            next_slot: std::sync::atomic::AtomicUsize::new(0),
-            stats: DnsStats::default(),
+            slots: (0..DEFAULT_CONNECTIONS).map(|_| Slot::default()).collect(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            capacity: Semaphore::new(DEFAULT_CONNECTIONS * DEFAULT_MAX_IN_FLIGHT),
+            next_token: AtomicU64::new(0),
+            stats: Arc::new(DnsStats::default()),
         }
+    }
+
+    /// Use `connections` pipelined connections (clamped to
+    /// `1..=`[`MAX_CONNECTIONS`]). Call before the first query.
+    pub fn with_connections(mut self, connections: usize) -> Self {
+        let connections = connections.clamp(1, MAX_CONNECTIONS);
+        self.slots = (0..connections).map(|_| Slot::default()).collect();
+        self.capacity = Semaphore::new(connections * self.max_in_flight);
+        self
+    }
+
+    /// Allow `max_in_flight` queries in flight per connection (at least
+    /// 1). Call before the first query.
+    pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = max_in_flight.max(1);
+        self.capacity = Semaphore::new(self.slots.len() * self.max_in_flight);
+        self
+    }
+
+    /// The number of connection slots.
+    pub fn connections(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The per-connection in-flight limit.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
     }
 
     /// A snapshot of this client's metrics.
@@ -405,6 +761,7 @@ impl DnsClient {
             exchanges_ok: get(&s.exchanges_ok),
             exchange_errors: get(&s.exchange_errors),
             timeouts: get(&s.timeouts),
+            late_replies: get(&s.late_replies),
             waits: get(&s.waits),
             wait_total_us: get(&s.wait_total_us),
             wait_max_us: get(&s.wait_max_us),
@@ -428,124 +785,144 @@ impl DnsClient {
     ///
     /// Cache hits (a prior validated response for the same lowercase
     /// qname and qtype whose TTL has not expired) are returned without
-    /// touching the connection. A miss serializes on the pooled
-    /// connection: an existing connection is reused, a connection-level
-    /// failure retries exactly once on a freshly established one, and a
-    /// timed-out or otherwise failed exchange discards the connection
-    /// so a half-completed response can never be mispaired with the
-    /// next query.
+    /// touching a connection. A miss takes a unit of client capacity
+    /// (waiting if every connection is at its in-flight limit), claims
+    /// the least-loaded connection slot, and is pipelined on that
+    /// connection. A connection-level failure retries exactly once on a
+    /// fresh connection; a timeout abandons the query without harming the
+    /// connection.
     ///
     /// Returns `Ok(response)` — a validated response (ID, QR, question
     /// echo, EDNS0 conformance), possibly from the cache and possibly
     /// carrying a non-zero error rcode, which callers map to their own
     /// semantics — or `Err` when the resolver could not be consulted
-    /// (connect failure after the retry, I/O error, protocol
-    /// violation, or the per-exchange timeout elapsing).
+    /// (connect failure, connection failure after the retry, protocol
+    /// violation, or the per-query timeout elapsing).
     pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
         let stats = &self.stats;
         stats.queries.fetch_add(1, Ordering::Relaxed);
         let key = (domain.trim().to_ascii_lowercase(), qtype);
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .expect("DNS cache poisoned")
-            .get(&key, Instant::now())
-        {
+        if let Some(hit) = lock(&self.cache).get(&key, Instant::now()) {
             stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
 
-        // Held across the exchange: one query in flight per slot, so
-        // responses can never be mispaired. Take the first idle slot
-        // (keeps a quiet server on one warm connection); when every slot
-        // is busy, wait on one chosen round-robin.
-        let mut conn = match self.conns.iter().find_map(|slot| slot.try_lock().ok()) {
-            Some(guard) => guard,
-            None => {
+        // Capacity: one permit per in-flight query, client-wide. Held for
+        // the query's whole lifetime (and released on cancellation).
+        let _permit = match self.capacity.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
                 stats.waits.fetch_add(1, Ordering::Relaxed);
                 let _waiting = GaugeGuard::new(&stats.waiting);
                 let started = Instant::now();
-                let i = self
-                    .next_slot
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % self.conns.len();
-                let guard = self.conns[i].lock().await;
+                let permit = self
+                    .capacity
+                    .acquire()
+                    .await
+                    .expect("the capacity semaphore is never closed");
                 let waited = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 stats.wait_total_us.fetch_add(waited, Ordering::Relaxed);
                 stats.wait_max_us.fetch_max(waited, Ordering::Relaxed);
-                guard
+                permit
             }
         };
         let _in_flight = GaugeGuard::new(&stats.in_flight);
         stats
             .peak_in_flight
             .fetch_max(stats.in_flight.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        let claim = self.claim_slot().await;
         for attempt in 0..2 {
-            let mut stream = match conn.take() {
-                Some(stream) => stream,
-                // H6 (security report): the connect (TCP + TLS
-                // handshake) MUST be bounded like the exchange — a
-                // black-holed resolver used to hold the shared
-                // connection mutex for the kernel's connect timeout
-                // (~2 min), stalling every lookup in every session.
-                None => {
-                    stats.connects.fetch_add(1, Ordering::Relaxed);
-                    match tokio::time::timeout(
-                        self.timeout,
-                        connect(&self.endpoint_str(), &self.config),
-                    )
-                    .await
-                    {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(e)) => {
-                            stats.connect_failures.fetch_add(1, Ordering::Relaxed);
-                            return Err(e.context("DNS query failed"));
-                        }
-                        Err(_) => {
-                            stats.connect_failures.fetch_add(1, Ordering::Relaxed);
-                            stats.timeouts.fetch_add(1, Ordering::Relaxed);
-                            return Err(anyhow!("DNS connect timed out"));
-                        }
+            let pipeline = self.get_or_connect(claim.slot).await?;
+            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+            let reason = match pipeline.submit(domain, qtype, token)? {
+                None => "DNS connection closed".to_string(),
+                Some((reply, _pending)) => match tokio::time::timeout(self.timeout, reply).await {
+                    Ok(Ok(Outcome::Response(resp))) => {
+                        stats.exchanges_ok.fetch_add(1, Ordering::Relaxed);
+                        lock(&self.cache).insert(key, &resp, Instant::now());
+                        return Ok(resp);
                     }
-                }
+                    Ok(Ok(Outcome::Failed(reason))) => reason,
+                    Ok(Err(_)) => "DNS connection closed".to_string(),
+                    // Abandon this transaction ID; the connection stays
+                    // usable and a late reply is discarded.
+                    Err(_) => {
+                        stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                        return Err(anyhow!("DNS query timed out"));
+                    }
+                },
             };
-            match tokio::time::timeout(self.timeout, exchange(&mut stream, domain, qtype)).await {
-                Ok(Ok(resp)) => {
-                    stats.exchanges_ok.fetch_add(1, Ordering::Relaxed);
-                    *conn = Some(stream);
-                    self.cache.lock().expect("DNS cache poisoned").insert(
-                        key,
-                        &resp,
-                        Instant::now(),
-                    );
-                    return Ok(resp);
-                }
-                // Connection-level or protocol failure: the stream is
-                // suspect (idle-closed, torn, or the peer misbehaved).
-                // Poison it and retry once on a fresh connection.
-                Ok(Err(e)) => {
-                    stats.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                    drop(stream);
-                    if attempt == 0 {
-                        continue;
-                    }
-                    return Err(e.context("DNS query failed"));
-                }
-                // A timed-out exchange leaves the stream with unknown
-                // pending state: it must never be reused.
-                Err(_) => {
-                    stats.timeouts.fetch_add(1, Ordering::Relaxed);
-                    drop(stream);
-                    return Err(anyhow!("DNS query timed out"));
-                }
+            // Connection-level failure: retry once on a fresh connection
+            // (the slot replaces a closed connection on the next use).
+            stats.exchange_errors.fetch_add(1, Ordering::Relaxed);
+            if attempt == 1 {
+                return Err(anyhow!("DNS query failed: {reason}"));
             }
         }
-        unreachable!("each loop iteration returns")
+        unreachable!("the second attempt always returns")
+    }
+
+    /// Claim the least-loaded slot (ties: the lowest index). The caller
+    /// holds a capacity permit, so some slot is below the in-flight
+    /// limit; a claim that loses a race to a full slot is rolled back
+    /// and retried.
+    async fn claim_slot(&self) -> SlotClaim<'_> {
+        loop {
+            let slot = self
+                .slots
+                .iter()
+                .min_by_key(|slot| slot.load.load(Ordering::Relaxed))
+                .expect("a client always has at least one slot");
+            if slot.load.fetch_add(1, Ordering::Relaxed) < self.max_in_flight {
+                return SlotClaim { slot };
+            }
+            slot.load.fetch_sub(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The slot's open connection, or a newly established one if it has
+    /// none or its connection has closed.
+    ///
+    /// Returns `Err` if connecting fails or exceeds the timeout. The
+    /// connect (TCP + TLS handshake) is bounded like a query (H6,
+    /// security report): a black-holed resolver must not hold the slot
+    /// for the kernel's connect timeout.
+    async fn get_or_connect(&self, slot: &Slot) -> Result<Arc<Pipeline>> {
+        let mut conn = slot.conn.lock().await;
+        if let Some(pipeline) = conn.as_ref() {
+            if !pipeline.is_closed() {
+                return Ok(Arc::clone(pipeline));
+            }
+        }
+        // Drop a closed connection now; its tasks stop once the queries
+        // still holding it finish.
+        *conn = None;
+        let stats = &self.stats;
+        stats.connects.fetch_add(1, Ordering::Relaxed);
+        match tokio::time::timeout(self.timeout, connect(&self.endpoint_str(), &self.config)).await
+        {
+            Ok(Ok(stream)) => {
+                let pipeline = Arc::new(Pipeline::start(stream, Arc::clone(&self.stats)));
+                *conn = Some(Arc::clone(&pipeline));
+                Ok(pipeline)
+            }
+            Ok(Err(e)) => {
+                stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+                Err(e.context("DNS query failed"))
+            }
+            Err(_) => {
+                stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+                stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow!("DNS connect timed out"))
+            }
+        }
     }
 
     /// The connect endpoint: `server:853`, or the test override.
     ///
-    /// Returns the `ip:port` string the pooled connection dials.
+    /// Returns the `ip:port` string the client dials.
     fn endpoint_str(&self) -> String {
         self.endpoint
             .clone()
@@ -591,40 +968,6 @@ async fn connect(endpoint: &str, config: &Arc<ClientConfig>) -> Result<DotStream
         .connect(dnsname, stream)
         .await
         .context("TLS handshake with DNS resolver failed")
-}
-
-/// One request/response exchange on an established connection.
-///
-/// Sends a fresh query (new random transaction ID) and reads exactly
-/// one length-prefixed response. Returns `Ok(response)` only after the
-/// response is validated against the query (ID, QR, question echo) and
-/// passes the EDNS0 conformance check; returns `Err` on any I/O,
-/// framing, parse, or validation failure — the caller treats the
-/// connection as suspect and discards it.
-async fn exchange(stream: &mut DotStream, domain: &str, qtype: u16) -> Result<DnsMessage> {
-    let mut rng = StdRng::from_entropy();
-    let id: u16 = rng.gen();
-
-    let question = DnsQuestion {
-        name: Label::new(domain.to_string()),
-        record_type: qtype,
-        record_class: 0x01,
-    };
-
-    let msg = DnsMessage::new(id, vec![question]);
-    let query = msg.to_vec()?;
-
-    stream.write_u16(query.len() as u16).await?;
-    stream.write_all(query.as_slice()).await?;
-
-    let len: u16 = stream.read_u16().await?;
-    let mut buf = vec![0; usize::from(len)];
-    let count = stream.read_exact(&mut buf).await?;
-
-    let (_, dq) = DnsMessage::from_bytes(&buf[0..count])?;
-    validate_response(&msg, &dq)?;
-    dq.edns0()?;
-    Ok(dq)
 }
 
 #[cfg(test)]
@@ -889,9 +1232,13 @@ mod tests {
         assert_eq!(queries.load(Ordering::SeqCst), 4);
 
         // Metrics mirror what happened: 5 queries, 1 cache hit, 2
-        // connections, 4 answered exchanges, 1 discarded stale
-        // connection (c.test's first attempt), nothing left in flight.
+        // connections, 4 answered exchanges, nothing left in flight. The
+        // reader task normally sees the server's close as EOF before
+        // c.test is sent, so c.test reconnects without a failed attempt;
+        // if c.test wins that race it fails once and retries. Either way
+        // at most one attempt fails.
         let stats = client.stats();
+        assert!(stats.exchange_errors <= 1, "{stats:?}");
         assert_eq!(
             stats,
             DnsStatsSnapshot {
@@ -900,8 +1247,9 @@ mod tests {
                 connects: 2,
                 connect_failures: 0,
                 exchanges_ok: 4,
-                exchange_errors: 1,
+                exchange_errors: stats.exchange_errors,
                 timeouts: 0,
+                late_replies: 0,
                 waits: 0,
                 wait_total_us: 0,
                 wait_max_us: 0,
@@ -1020,5 +1368,378 @@ mod tests {
         cancelled.abort();
         let _ = cancelled.await;
         assert_eq!(client.stats().in_flight, 0);
+    }
+
+    // -- Pipelining (DESIGN §6.1) --------------------------------------
+
+    /// A pipelining-capable mock DoT resolver.
+    struct Mock {
+        addr: std::net::SocketAddr,
+        cert: rustls_pki_types::CertificateDer<'static>,
+        conns: Arc<std::sync::atomic::AtomicU32>,
+        queries: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    /// How the mock answers.
+    #[derive(Clone, Copy)]
+    enum MockMode {
+        /// Every query is answered concurrently after `delay_for(name)`,
+        /// so replies come back in completion order, not query order.
+        Concurrent(fn(&str) -> Duration),
+        /// Like `Concurrent` (no delay), except the first connection
+        /// reads this many queries and then closes without answering.
+        CloseFirstAfter(u32),
+        /// Read this many queries, then answer them all in reverse order
+        /// in a single write (several replies arrive in one read).
+        ReverseBatch(usize),
+    }
+
+    /// A response to `query`: one A record (192.0.2.1) with TTL 0, so
+    /// nothing is cached and repeated names reach the mock.
+    fn mock_answer(query: &DnsMessage) -> Vec<u8> {
+        let mut resp = DnsMessage::new(query.header.transaction_id, query.questions.clone());
+        resp.header.qr = 1;
+        resp.answers.push(DnsResourceRecord {
+            name: Label::new(String::new()),
+            record_type: 1,
+            record_class: 1,
+            ttl: 0,
+            rdlength: 4,
+            rdata: QType::A("192.0.2.1".parse().unwrap()),
+        });
+        let bytes = resp.to_vec().unwrap();
+        let mut frame = (bytes.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        frame
+    }
+
+    async fn spawn_mock(mode: MockMode) -> Mock {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.key_pair.serialize_der().into(),
+        );
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conns = Arc::new(AtomicU32::new(0));
+        let queries = Arc::new(AtomicU32::new(0));
+
+        let (conns_task, queries_task) = (Arc::clone(&conns), Arc::clone(&queries));
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let conn_number = conns_task.fetch_add(1, Ordering::SeqCst) + 1;
+                let acceptor = acceptor.clone();
+                let queries = Arc::clone(&queries_task);
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    let (mut rd, mut wr) = tokio::io::split(tls);
+                    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    let writer = tokio::spawn(async move {
+                        while let Some(frame) = rx.recv().await {
+                            if wr.write_all(&frame).await.is_err() || wr.flush().await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    let mut batch: Vec<DnsMessage> = Vec::new();
+                    let mut read_on_conn = 0u32;
+                    while let Ok(len) = rd.read_u16().await {
+                        let mut buf = vec![0; usize::from(len)];
+                        if rd.read_exact(&mut buf).await.is_err() {
+                            break;
+                        }
+                        let Ok((_, query)) = DnsMessage::from_bytes(&buf) else {
+                            break;
+                        };
+                        queries.fetch_add(1, Ordering::SeqCst);
+                        read_on_conn += 1;
+                        match mode {
+                            MockMode::Concurrent(delay_for) => {
+                                let name = String::from(&query.questions[0].name);
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay_for(&name)).await;
+                                    let _ = tx.send(mock_answer(&query));
+                                });
+                            }
+                            MockMode::CloseFirstAfter(n) => {
+                                if conn_number == 1 {
+                                    if read_on_conn >= n {
+                                        // Close with every query unanswered.
+                                        writer.abort();
+                                        return;
+                                    }
+                                } else {
+                                    let _ = tx.send(mock_answer(&query));
+                                }
+                            }
+                            MockMode::ReverseBatch(n) => {
+                                batch.push(query);
+                                if batch.len() == n {
+                                    let mut all = Vec::new();
+                                    for q in batch.drain(..).rev() {
+                                        all.extend(mock_answer(&q));
+                                    }
+                                    let _ = tx.send(all);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Mock {
+            addr,
+            cert: cert_der,
+            conns,
+            queries,
+        }
+    }
+
+    /// A client trusting `mock`'s certificate and dialing its port.
+    fn mock_client(mock: &Mock, timeout: Duration) -> DnsClient {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(mock.cert.clone()).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            config,
+            timeout,
+            Some(format!("127.0.0.1:{}", mock.addr.port())),
+        )
+    }
+
+    /// Names starting with "slow" answer after 1.5 s; "late" after 800 ms.
+    fn slow_names(name: &str) -> Duration {
+        if name.starts_with("slow") {
+            Duration::from_millis(1500)
+        } else if name.starts_with("late") {
+            Duration::from_millis(800)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Several queries on ONE connection; the resolver answers them in
+    /// reverse order, all in a single write. Every query gets its own
+    /// answer (matched by ID and question), on one connection.
+    #[tokio::test]
+    async fn out_of_order_replies_in_one_read_are_matched() {
+        let mock = spawn_mock(MockMode::ReverseBatch(3)).await;
+        let client = Arc::new(mock_client(&mock, Duration::from_secs(5)).with_connections(1));
+        let mut tasks = Vec::new();
+        for name in ["one.test", "two.test", "three.test"] {
+            let client = Arc::clone(&client);
+            tasks.push(tokio::spawn(async move {
+                let resp = client.query(name, 1).await.unwrap();
+                String::from(&resp.questions[0].name)
+            }));
+        }
+        for (task, name) in tasks
+            .into_iter()
+            .zip(["one.test", "two.test", "three.test"])
+        {
+            assert_eq!(task.await.unwrap(), name, "each query gets its own answer");
+        }
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(
+            mock.conns.load(SeqCst),
+            1,
+            "all three shared one connection"
+        );
+        assert_eq!(client.stats().exchanges_ok, 3);
+    }
+
+    /// With a single connection, a fast query sent while a slow one is
+    /// pending completes first (it is not queued behind it).
+    #[tokio::test]
+    async fn fast_query_overtakes_slow_one_on_the_same_connection() {
+        let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;
+        let client = Arc::new(mock_client(&mock, Duration::from_secs(5)).with_connections(1));
+        let slow = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query("slow.test", 1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        client.query("fast.test", 1).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "fast query waited {:?}",
+            started.elapsed()
+        );
+        slow.await.unwrap().unwrap();
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_eq!(mock.conns.load(SeqCst), 1);
+        assert_eq!(client.stats().peak_in_flight, 2);
+    }
+
+    /// A query that times out abandons its ID; the connection stays up,
+    /// the next query uses it, and the late reply is discarded.
+    #[tokio::test]
+    async fn timeout_keeps_the_connection_and_discards_the_late_reply() {
+        let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;
+        let client = mock_client(&mock, Duration::from_millis(300)).with_connections(1);
+
+        let err = client.query("late.test", 1).await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        client.query("fast.test", 1).await.unwrap();
+
+        // The late reply arrives ~800 ms after it was sent.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        client.query("fast2.test", 1).await.unwrap();
+
+        use std::sync::atomic::Ordering::SeqCst;
+        let stats = client.stats();
+        assert_eq!(
+            mock.conns.load(SeqCst),
+            1,
+            "the timeout did not cost a reconnect"
+        );
+        assert_eq!(stats.connects, 1);
+        assert_eq!(stats.timeouts, 1);
+        assert_eq!(stats.late_replies, 1);
+        assert_eq!(stats.exchange_errors, 0);
+        assert_eq!(stats.exchanges_ok, 2);
+    }
+
+    /// The resolver closes a connection with several queries pending:
+    /// every waiter fails and retries once on a new connection, and all
+    /// of them succeed.
+    #[tokio::test]
+    async fn connection_close_retries_every_pending_query() {
+        let mock = spawn_mock(MockMode::CloseFirstAfter(3)).await;
+        let client = Arc::new(mock_client(&mock, Duration::from_secs(5)).with_connections(1));
+        let mut tasks = Vec::new();
+        for name in ["a.test", "b.test", "c.test"] {
+            let client = Arc::clone(&client);
+            tasks.push(tokio::spawn(async move { client.query(name, 1).await }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        use std::sync::atomic::Ordering::SeqCst;
+        let stats = client.stats();
+        assert_eq!(mock.conns.load(SeqCst), 2);
+        assert_eq!(mock.queries.load(SeqCst), 6, "3 unanswered + 3 retried");
+        assert_eq!(stats.exchange_errors, 3);
+        assert_eq!(stats.exchanges_ok, 3);
+    }
+
+    /// Back-pressure: with every connection at its in-flight limit, a
+    /// further query waits for capacity (and is counted as a wait)
+    /// instead of exceeding the limit.
+    #[tokio::test]
+    async fn in_flight_limit_applies_back_pressure() {
+        let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;
+        let client = Arc::new(
+            mock_client(&mock, Duration::from_secs(5))
+                .with_connections(1)
+                .with_max_in_flight(2),
+        );
+        let mut slow = Vec::new();
+        for i in 0..2 {
+            let client = Arc::clone(&client);
+            slow.push(tokio::spawn(async move {
+                client.query(&format!("slow{i}.test"), 1).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.stats().in_flight, 2);
+
+        let started = Instant::now();
+        client.query("fast.test", 1).await.unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1000),
+            "the third query should wait for capacity, waited {waited:?}"
+        );
+        for task in slow {
+            task.await.unwrap().unwrap();
+        }
+        let stats = client.stats();
+        assert_eq!(stats.waits, 1);
+        assert_eq!(stats.peak_in_flight, 2, "the limit was never exceeded");
+        assert_eq!(stats.waiting, 0);
+    }
+
+    /// A cancelled query frees its capacity, its slot load, and its
+    /// in-flight table entry; its eventual reply is discarded as late.
+    #[tokio::test]
+    async fn cancelled_query_frees_its_in_flight_entry() {
+        let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;
+        let client = Arc::new(mock_client(&mock, Duration::from_secs(5)).with_connections(1));
+        let cancelled = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query("slow.test", 1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.stats().in_flight, 1);
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        let stats = client.stats();
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(client.slots[0].load.load(Ordering::Relaxed), 0);
+        let pipeline = client.slots[0].conn.lock().await.clone().unwrap();
+        assert!(lock(&pipeline.shared.table).queries.is_empty());
+        assert_eq!(
+            client.capacity.available_permits(),
+            client.max_in_flight(),
+            "capacity returned"
+        );
+
+        // The slow reply still arrives and is discarded; the connection
+        // stays usable.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        client.query("fast.test", 1).await.unwrap();
+        assert_eq!(client.stats().late_replies, 1);
+        assert!(!pipeline.is_closed());
+    }
+
+    /// H6 (security report, re-opened in round 4): with the old 8-slot
+    /// pool, 8 slow lookups (one client IP's worth of sessions) stalled
+    /// every other lookup. Pipelined, 20 slow lookups in flight still
+    /// leave a fast lookup unaffected, at the default configuration.
+    #[tokio::test]
+    async fn many_slow_lookups_do_not_stall_others() {
+        let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;
+        let client = Arc::new(mock_client(&mock, Duration::from_secs(5)));
+        let mut slow = Vec::new();
+        for i in 0..20 {
+            let client = Arc::clone(&client);
+            slow.push(tokio::spawn(async move {
+                client.query(&format!("slow{i}.test"), 1).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(client.stats().in_flight, 20);
+
+        let started = Instant::now();
+        client.query("fast.test", 1).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "fast lookup waited {:?} behind 20 slow ones",
+            started.elapsed()
+        );
+        for task in slow {
+            task.await.unwrap().unwrap();
+        }
+        use std::sync::atomic::Ordering::SeqCst;
+        assert!(mock.conns.load(SeqCst) <= DEFAULT_CONNECTIONS as u32);
+        assert_eq!(client.stats().waits, 0);
     }
 }

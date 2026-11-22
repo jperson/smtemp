@@ -32,7 +32,7 @@ Design goals, in order:
 3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
    canonicalization inputs are preserved exactly where security checks
    depend on them.
-4. **Deterministic tests.** The suite (193 tests) runs offline; live
+4. **Deterministic tests.** The suite (207 tests) runs offline; live
    network behavior is behind `#[ignore]` opt-ins and fixture mocks
    (the `mailserv` integration tests exercise the real resolver path —
    see README, Testing).
@@ -221,6 +221,10 @@ enforces MAIL-before-RCPT again next time).
   maildir directories); others get `553 5.1.3`.
 - **Framing DoS**: line caps, per-message size accounting, accept-loop
   backoff.
+- **DNS DoS**: pipelined resolver connections, a 20 s SPF evaluation
+  deadline, and a per-source-IP limit on concurrent DNS-backed checks
+  (`--max-dns-per-ip`, which tempfails with `451` when exhausted); see
+  §6.1.
 
 **Known, deliberate exemptions** (documented policy choices, not bugs):
 authenticated submissions skip SPF/DMARC rejection; `p=none` DMARC logs
@@ -243,7 +247,7 @@ real response must parse to Ok/Err, never panic).
 
 SPF evaluation goes through the `SpfResolver` **trait** (`txt`, `a`, `mx`,
 `ptr`): production uses `DotResolver` around one process-wide `DnsClient`
-(a small pool of DoT connections, TTL cache) built from the resolver address chosen
+(pipelined DoT connections, TTL cache; §6.1) built from the resolver address chosen
 at startup (`--resolver` / config-file `resolver` key, default 1.1.1.1,
 threaded through `SessionConfig` into
 `UserSession`); tests use fixture mocks — the same property that makes
@@ -254,214 +258,151 @@ exists) bounds every evaluation regardless of record hostility.
 DMARC reuses `SpfResolver` for its record fetch, which is why the `dmarc`
 crate is pure logic with no DNS dependency of its own.
 
-### 6.1 DNS connections: the current pool and the pipelining plan
+### 6.1 DNS connections: pipelining
 
 Every SPF, DKIM-key and DMARC lookup in the process goes through one
 `DnsClient`, so its connection handling sets how much DNS the whole
 server can do at once. It also sets how much harm one hostile domain can
 do: an attacker can publish records whose authoritative servers never
-answer, and each lookup then holds a connection for the full 5 s timeout.
+answer, so each of their lookups stays outstanding for the full 5 s
+timeout.
 
-**What exists today** (`dns/src/lib.rs`, added for H6 in REPORT.md):
+**How it works** (`dns/src/lib.rs`). This replaced an 8-slot pool that
+carried one exchange per connection: eight slow lookups, which one client
+IP could hold, stalled every other session's DNS (H6 in REPORT.md).
 
-- `POOL_SIZE` (8) slots, each an `AsyncMutex<Option<DotStream>>`.
-  Connections open lazily, the first time a slot is used.
-- A query takes the first idle slot (`try_lock`). If all are busy, it
-  waits on one slot chosen round-robin.
-- Each connection carries **one exchange at a time**, which is what
-  keeps replies from being matched to the wrong query. A failed or
-  timed-out exchange throws the connection away. A failure on a reused
-  connection is retried once on a fresh one, because idle connections
-  are often closed by the resolver.
-- Connecting (TCP + TLS) and each exchange are both limited to the
-  timeout.
-- **Safe to cancel:** the stream is taken out of its slot for the length
-  of the exchange. If a session's future is dropped mid-query (e.g. the
-  connection-duration cap fires), the stream is dropped with it and the
-  slot is left empty, never half-used.
-- The pool sits behind the unchanged `DnsClient::query`, so `spf`,
-  `dkim` and `dmarc` didn't change.
+- **Connections:** a few pipelined DoT connections (RFC 7766 §6.2.1.1,
+  RFC 7858 §3.4). The default is 2, set with `--dns-connections` /
+  `dns-connections` (1–16; an out-of-range value is a startup error).
+  Each carries up to 64 queries in flight (`DEFAULT_MAX_IN_FLIGHT`).
+  Connections open lazily. A slot is locked while connecting, so queries
+  arriving during a handshake wait for that one handshake instead of each
+  opening their own.
+- **Choosing a connection:** a query takes a unit of client-wide capacity
+  (a semaphore of connections × in-flight limit), then the least-loaded
+  connection; ties go to the lowest slot, so a quiet server keeps one
+  warm connection. When every connection is at its limit, the query waits
+  for capacity. That wait is what the `waits` / `wait_*` metrics measure.
+- **One reader task and one writer task per connection.** Queries hand
+  whole frames to the writer over a channel, so a query cancelled
+  mid-send can never leave a partial frame on the wire. The writer
+  batches whatever is queued before each flush.
+- **Matching replies:** each reply goes to the waiter registered under its
+  transaction ID, then must pass `validate_response` (QR flag, question
+  echo) and the EDNS0 conformance check.
+  - IDs are random and never reused while still in flight on that
+    connection.
+  - A reply that matches an ID but fails validation means the resolver's
+    view of the connection can't be trusted, so the connection is torn
+    down.
+- **Timeouts** no longer cost the connection. The waiter gives up, its
+  entry is removed, and a late reply is counted (`late_replies`) and
+  discarded.
+- **Connection failure** (EOF, I/O error, malformed frame, invalid reply)
+  fails every waiting query at once, and each retries once on a fresh
+  connection. The reader sees a resolver-side close as EOF straight away
+  and marks the connection closed, so the next query reconnects without
+  first failing on a dead stream. That is why no client-side idle timer
+  was needed.
+- **Cancellation:** each pending entry is removed by a drop guard. The
+  guard carries a per-query token, so it can't remove a later query that
+  reused the same transaction ID. Capacity, slot load and the
+  `in_flight` gauge are drop guards too.
+- **Lifecycle:** a closed connection is replaced in its slot on next use.
+  The old connection's tasks are aborted when the last query holding it
+  finishes; dropping the `DnsClient` closes everything.
+- **Unchanged:** connecting (TCP + TLS) and each query are both limited to
+  the timeout, and the `DnsClient::query` signature is the same, so
+  `spf`, `dkim` and `dmarc` didn't change.
 
-**Where it falls short:**
+**Metrics:** `DnsClient::stats()` returns a `DnsStatsSnapshot`:
+- cumulative counters: queries, cache hits, connects, connect failures,
+  replies OK, failed attempts (`exchange_errors`), timeouts,
+  `late_replies`, waits for capacity, and total wait time;
+- gauges: `waiting` and `in_flight`;
+- peaks: `wait_max_us` and `peak_in_flight`, cleared by `reset_peaks()`.
 
-1. **Waiting is tied to one slot.** When all 8 are busy, a query waits
-   on its round-robin slot even if another slot frees sooner. If its
-   slot is held by a slow lookup, it waits up to the full timeout.
-2. **No fairness between sessions.** Eight concurrent slow lookups (one
-   attacker with a few connections, each SPF evaluation allowed up to 10
-   lookups) still fill the whole pool, so legitimate sessions queue
-   behind them. The pool narrows this from one stalled connection to
-   eight; it doesn't remove it.
-3. **Fixed size.** `POOL_SIZE` is a constant. It isn't tied to
-   `--max-connections` and can't be configured.
-4. **No back-off when the resolver is down.** With 1.1.1.1 unreachable,
-   every cache miss tries its own connect and waits the full timeout.
-   Nothing marks the resolver as down, so sessions pile up on connect
-   attempts.
-5. **No sharing of duplicate misses.** Concurrent misses for the same
-   `(name, type)` (e.g. a burst of mail from one sender domain) each send
-   their own query, and up to 8 can run at once.
-6. **Idle connections are only noticed on use.** A connection closed by
-   the resolver is discovered on the next query, which costs a wasted
-   write and the retry. A burst after a quiet spell can also open up to 8
-   TLS handshakes at once.
-7. **One upstream.** There's a single resolver address (IPv4 only) and
+`mailserv` logs these as a `dns stats` line every 60 s while DNS is in
+use, together with `connections` and `max_in_flight`. Use it to size
+`--dns-connections`. Sustained `waits` mean every connection is at its
+in-flight limit.
+
+**SPF evaluation deadline:** `spf::check_host` limits a whole evaluation
+to `spf::EVALUATION_DEADLINE` (20 s), across every lookup it makes.
+Running out gives `TempError` → `451`, logged at `warn`.
+- RFC 7208 §4.6.4 says the limit SHOULD allow at least 20 s, so 20 s is
+  the floor. It is still well below the old worst case of 10 × 5 s plus
+  the include TXT lookups.
+- `check_host_within` takes an explicit limit, which tests use.
+- *Interaction to note:* the default 30 s whole-connection cap (M11 in
+  REPORT.md) is shorter than a HELO evaluation plus a MAIL FROM
+  evaluation that both run to the limit. That cap should become
+  per-phase (M11).
+
+**Tests** (mock DoT resolvers in `dns` tests):
+- replies out of order, several in one read, on one connection;
+- a fast query overtaking a slow one on the same connection;
+- a timeout that keeps the connection and discards the late reply;
+- a connection closed with three queries pending (each retries once and
+  succeeds);
+- back-pressure at the in-flight limit;
+- a cancelled query freeing its capacity, slot load and table entry;
+- 20 slow lookups in flight not delaying an unrelated one (this test
+  fails if the in-flight limit is set back to 1, i.e. the old behaviour).
+
+**Per-source-IP DNS limit** (`mailserv/src/limit.rs`, `DnsLimiter`):
+pipelining raised the bar for H6 from 8 slow lookups to `connections ×
+64` (128 by default). That is more than one IP's sessions could hold
+before this limit existed, but enough IPs could still fill it. A
+per-session limit wouldn't help, since an attacker just opens more
+sessions, so the limit is per source IP.
+- A session holds one of its IP's permits around each DNS-backed check:
+  the HELO SPF evaluation, the MAIL FROM SPF evaluation, and DKIM +
+  DMARC together at end-of-data. The permit is released before the spool
+  write, so disk I/O never holds DNS capacity.
+- The limit is `--max-dns-per-ip` / `max-dns-per-ip`, default 4 (0 is a
+  startup error). Since each SPF evaluation makes its lookups one after
+  another, this bounds one IP to about 4 lookups in flight out of the
+  client's 128.
+- With the share exhausted, a check waits up to 10 s
+  (`limit::DNS_LIMIT_WAIT`). That absorbs bursts from busy legitimate
+  senders: cached lookups free permits in milliseconds. A live burst of 6
+  concurrent sessions from one IP at a limit of 2 saw 4 short waits and
+  no refusals.
+- If no permit frees up in time, the outcome is always **temporary**:
+  - HELO proceeds with SPF `TempError` (which never rejects HELO);
+  - MAIL FROM gets `451 4.7.0`;
+  - end-of-data gets `451 4.7.0`.
+
+  Skipping DKIM/DMARC instead would fail DMARC and permanently reject
+  legitimate mail.
+- IPs are keyed per address, like the connection limiter. An IPv6 /64
+  isn't aggregated, because large senders send from many addresses
+  within one /64.
+- An IP's entry exists only while some check holds or waits for its
+  permits, and is removed on the last release, including a cancelled
+  wait. Memory is bounded by the checks in progress.
+- The `dns stats` log line carries `ip_limit_waits`, `ip_limit_refusals`,
+  `ip_limit_active_ips` and `max_dns_per_ip`.
+
+#### Still open
+
+1. **Back-off when the resolver is down.** With the resolver unreachable,
+   every cache miss tries to connect and waits the full timeout. After N
+   consecutive connect failures, new queries should fail straight away
+   for a short cool-down. SPF/DMARC already treat that as `TempError` →
+   `451`, so this is safe. Log the state change, and add it to the
+   metrics.
+2. **Share duplicate misses.** Concurrent misses for the same
+   `(name, type)` each send their own query. A map from key to a shared
+   in-flight result would let later callers wait for the first answer.
+   Do this once the `dns stats` log shows enough repeated-miss traffic to
+   matter.
+3. **One upstream.** There is a single resolver address (IPv4 only) and
    no failover.
 
-#### The plan: pipelining
-
-**Decision:** the DNS client moves to pipelining (several queries in
-flight on one connection), because DNS throughput is on the critical
-path at MX volume. Finishing the slot pool first is **not** a
-prerequisite. The work splits into two groups:
-
-- **Needed either way.** These fix problems pipelining doesn't touch
-  (shortfalls 2, 4, 5, 6), so they are part of the plan.
-- **Only without pipelining.** These are slot-pool improvements that
-  pipelining makes unnecessary (shortfalls 1, 3). They're recorded at the
-  end in case the plan changes, but aren't planned.
-
-#### Needed either way
-
-Each item is small and independent. All but two live in
-`dns/src/lib.rs`: the deadline is in `spf`, and fairness belongs in
-`mailserv`.
-
-- **Metrics/logs — DONE.** `DnsClient::stats()` returns a
-  `DnsStatsSnapshot`:
-  - cumulative counters: queries, cache hits, connects, connect failures,
-    exchanges OK, exchange errors (discarded connections), timeouts,
-    waits for a connection, and total wait time;
-  - gauges: `waiting` and `in_flight`, kept by drop guards, so a
-    cancelled query can't leave them raised;
-  - peaks: `wait_max_us` and `peak_in_flight`, cleared by
-    `reset_peaks()`.
-
-  `mailserv` logs a `dns stats` line every 60 s while DNS is in use,
-  with the interval's peaks and the mean wait. This is the baseline to
-  measure pipelining against, and the signal for sizing it. Back-off
-  state gets added with back-off.
-- **Per-evaluation deadline — DONE.** `spf::check_host` limits a whole
-  evaluation to `spf::EVALUATION_DEADLINE` (20 s), across every lookup
-  it makes, and running out gives `TempError` → `451`.
-  - RFC 7208 §4.6.4 says the limit SHOULD allow at least 20 s, so 20 s
-    is the floor, not the 10 s an earlier draft suggested. It is still
-    well below the old worst case of 10 × 5 s plus the include TXT
-    lookups.
-  - `check_host_within` takes an explicit limit, which tests use.
-    `mailserv` logs a hit at `warn` (`spf evaluation exceeded its time
-    limit`).
-  - *Interaction to note:* the default 30 s whole-connection cap (M11 in
-    REPORT.md) is shorter than a HELO evaluation plus a MAIL FROM
-    evaluation that both run to the limit. A connection held by a
-    hostile record tree can still hit the 30 s cap first. That cap
-    should become per-phase (M11).
-- **Per-session fairness (2) — open:** cap how many lookups one SMTP
-  session can have in flight (e.g. 2). The simplest form is a
-  per-`UserSession` semaphore held around each `check_host` /
-  `verify_dkim` / `fetch_policy` call, which needs no `DnsClient` change.
-  Pipelining raises the bar from "fill 8 connections" to "fill the
-  in-flight limit", but doesn't remove the need for it.
-- **Back-off when the resolver is down (4):** after N consecutive
-  connect failures, fail new queries straight away for a short cool-down
-  instead of each one connecting. SPF/DMARC already treat that as
-  `TempError` → `451`, so this is safe. Log the state change. Pipelining
-  can't help when the connection can't be made at all.
-- **Share duplicate misses (5):** a map from `(name, type)` to a shared
-  in-flight result (`futures::future::Shared` or a `tokio::sync::watch`).
-  Later callers wait for the first query's answer instead of sending
-  their own, and the cache still fills from the one response. This is a
-  cache concern, independent of how queries travel.
-- **Idle handling (6):** close a connection idle for longer than a
-  configured timeout (e.g. 10 s, below typical resolver idle timeouts)
-  rather than finding out on the next write. Optionally send the RFC 7828
-  `edns-tcp-keepalive` option to learn the resolver's idle timeout. With
-  pipelining, the reader task also sees a resolver-side close as EOF
-  straight away (see below).
-
-#### Pipelining
-
-RFC 7766 §6.2.1.1 and RFC 7858 §3.4 expect DoT clients to send several
-queries on one connection and match the replies, which may come back
-out of order. This is a change of structure inside `dns`, not a
-contained edit. It's roughly 250–350 lines, mostly new, and the
-`DnsClient::query` signature stays the same, so `spf`, `dkim` and `dmarc`
-don't change.
-
-- **One reader task and one writer task per connection**, plus a
-  pending map from transaction ID to a `oneshot` sender. Replies are
-  matched by ID **and** the question echo (`validate_response` already
-  checks both). That is what makes pairing safe without the
-  one-exchange-per-connection rule.
-- **Transaction IDs** come from a per-connection allocator that never
-  reuses an ID still in flight (16-bit space, random start).
-- **A timeout no longer poisons the connection:** the waiter gives up,
-  its map entry is removed, and a late reply is discarded by ID. A real
-  connection failure (EOF, TLS error, malformed frame) fails every
-  pending waiter at once, and they retry once on a new connection, as
-  today.
-- **A limit on queries in flight per connection** (back-pressure; e.g.
-  64, below common resolver limits). When a connection is full, new
-  queries go to the next connection. The outer structure is a small
-  `Vec` of pipelined connections (default 2, configurable as
-  `--dns-connections` / `dns-connections`) with simple
-  least-loaded-first selection. It replaces the 8 slot mutexes and
-  doesn't need the slot-pool rework below.
-- **Cancellation:** dropping a waiting future must remove its map entry
-  (a drop guard), so cancelled sessions can't leak entries. Today's
-  guarantee (a cancelled query never leaves a connection half-used)
-  carries over, because the connection itself never belongs to one
-  query.
-- **Lifecycle:** tasks are spawned per connection, so `DnsClient` needs
-  shutdown on drop and must survive the resolver closing the connection
-  under it (reconnect lazily on the next query).
-
-#### Order of work
-
-1. Metrics/logs and the per-evaluation deadline (**done**), then
-   per-session fairness and back-off. These are small and land
-   independently. Collect a baseline from the `dns stats` log under real
-   traffic before step 2.
-2. Pipelining (it replaces the slot pool), with idle handling built into
-   the reader task.
-3. Sharing duplicate misses, once metrics show how much repeated-miss
-   traffic there is.
-
-#### Tests
-
-The existing mock DoT servers in `dns`, `spf` and `mailserv` tests are
-the base. Extend them to:
-
-- answer out of order, including replies for several queries in one
-  read;
-- delay chosen names (already used by
-  `slow_lookup_does_not_block_other_lookups`, which must keep passing
-  with pipelining);
-- send a late reply after the client timed out (it must be discarded,
-  and the connection must stay usable);
-- close the connection with several queries pending (every waiter fails
-  and retries once);
-- refuse connections (back-off);
-- count queries (duplicate-miss sharing).
-
-Add one test that runs more slow lookups than the in-flight limit and
-shows that a fast lookup from a *different* session still finishes
-promptly (fairness), and one that checks a dropped query future frees
-its in-flight slot.
-
-#### Only without pipelining (recorded, not planned)
-
-If the plan ever changes back to a pool without pipelining, these two
-items would also be needed. Pipelining makes both unnecessary.
-
-- **Wait on any free connection (1):** replace the per-slot mutexes with
-  a `tokio::sync::Semaphore` (permits = pool size) plus a
-  `Mutex<Vec<(DotStream, Instant)>>` stack of idle connections, so a
-  waiter gets whichever connection frees first. One exchange per
-  connection, drop on failure or timeout, retry once.
-- **Configurable pool size (3):** `--dns-connections` sized to load
-  (fewer than about `max-connections / 25` queues lookups), capped by
-  resolver limits on connections per client.
+`edns-tcp-keepalive` (RFC 7828) negotiation remains optional. EOF
+detection already handles resolver-side idle closes.
 
 ---
 
@@ -498,7 +439,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-193 tests, four layers:
+207 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -532,10 +473,8 @@ Honest, tracked list (details in PLAN):
   delimiters, `%%`/`%_`/`%-`, URL-escaping); `%{p}` expands to the
   specified `unknown` (no PTR validation) and `exp=` explanations are
   not fetched.
-- DNS: a fixed pool of 8 DoT connections per process (§6.1 covers its
-  limits and the plan to move to pipelining), one exchange per
-  connection at a time (no pipelining), so a slow lookup occupies one
-  slot rather than stalling every session; the resolver address
+- DNS: no resolver back-off and no sharing of duplicate misses yet
+  (§6.1, "Still open"); the resolver address
   is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only.
 - Per-IP limits are per-address, not per-subnet (IPv6 prefix aggregation
   is future hardening); no RCPT-command rate limiting inside a session.

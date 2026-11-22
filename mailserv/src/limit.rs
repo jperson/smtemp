@@ -18,12 +18,21 @@
 //! state per IP; memory is bounded by the sweep on each admission,
 //! which drops IPs with no active connections once their window has
 //! rolled over.
+//!
+//! The [`DnsLimiter`] bounds a second resource per source IP: concurrent
+//! **DNS-backed evaluations** (SPF for HELO and MAIL FROM, DKIM + DMARC
+//! at end-of-data). Every session shares one resolver client, so without
+//! it a client could publish records whose authoritative servers never
+//! answer and fill the client's in-flight capacity with its own slow
+//! lookups (H6 in REPORT.md, DESIGN §6.1).
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 /// Why a connection was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +144,160 @@ impl ConnectionLimiter {
     }
 }
 
+/// Default concurrent DNS-backed evaluations per source IP
+/// (`--max-dns-per-ip`).
+pub const DEFAULT_DNS_PER_IP: usize = 4;
+
+/// How long an evaluation waits for its IP's DNS share before the
+/// command gets a temporary failure. Long enough to absorb bursts from a
+/// busy legitimate sender (cached lookups free permits in milliseconds),
+/// short enough that a client holding its whole share with slow lookups
+/// is told to retry well inside the connection-duration cap.
+pub const DNS_LIMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// The source IP's DNS share stayed exhausted for the whole wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsBusy;
+
+/// One IP's share: its semaphore and how many evaluations hold or wait
+/// for a permit (the entry is removed when that reaches zero).
+#[derive(Debug)]
+struct DnsShare {
+    semaphore: Arc<Semaphore>,
+    users: usize,
+}
+
+/// Counters for the periodic `dns stats` log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DnsLimitStats {
+    /// Evaluations that found their IP's share exhausted and waited.
+    pub waits: u64,
+    /// Evaluations that waited the full [`DNS_LIMIT_WAIT`] and got a
+    /// temporary failure.
+    pub refusals: u64,
+    /// IPs with an evaluation holding or waiting for a permit right now.
+    pub active_ips: usize,
+}
+
+/// Per-source-IP limit on concurrent DNS-backed evaluations.
+///
+/// A session holds a [`DnsPermit`] around each evaluation that queries
+/// the resolver. With the share exhausted, a new evaluation waits up to
+/// the configured wait; if no permit frees up in that time it returns
+/// [`DnsBusy`] and the caller answers with a temporary failure — never a
+/// permanent one, because a rate limit must not turn into, say, a DMARC
+/// rejection of legitimate mail.
+///
+/// IPs are tracked per address, like [`ConnectionLimiter`] (an IPv6 /64
+/// is not aggregated: large senders send from many addresses within one
+/// /64). Memory is bounded by the evaluations in progress: an IP's entry
+/// exists only while some evaluation holds or waits for its permits.
+#[derive(Debug)]
+pub struct DnsLimiter {
+    per_ip: usize,
+    wait: Duration,
+    shares: std::sync::Mutex<HashMap<IpAddr, DnsShare>>,
+    waits: AtomicU64,
+    refusals: AtomicU64,
+}
+
+/// A held share of an IP's DNS capacity. Releases the permit and
+/// unregisters from the IP's entry when dropped — including when the
+/// evaluation (or a wait for the permit) is cancelled.
+#[derive(Debug)]
+pub struct DnsPermit {
+    limiter: Arc<DnsLimiter>,
+    ip: IpAddr,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for DnsPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut shares = self.limiter.lock_shares();
+        if let Some(share) = shares.get_mut(&self.ip) {
+            share.users -= 1;
+            if share.users == 0 {
+                shares.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl DnsLimiter {
+    /// A limiter allowing `per_ip` concurrent evaluations per source IP
+    /// (at least 1), each waiting at most `wait` for a permit.
+    pub fn new(per_ip: usize, wait: Duration) -> Self {
+        DnsLimiter {
+            per_ip: per_ip.max(1),
+            wait,
+            shares: std::sync::Mutex::new(HashMap::new()),
+            waits: AtomicU64::new(0),
+            refusals: AtomicU64::new(0),
+        }
+    }
+
+    /// The per-IP limit.
+    pub fn per_ip(&self) -> usize {
+        self.per_ip
+    }
+
+    fn lock_shares(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, DnsShare>> {
+        self.shares
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take one of `ip`'s permits, waiting up to the configured wait.
+    ///
+    /// Returns `Ok(permit)` — hold it for the whole evaluation — or
+    /// `Err(DnsBusy)` if the IP's share stayed exhausted for the entire
+    /// wait. Cancellation-safe: dropping the future unregisters it.
+    pub async fn acquire(self: &Arc<Self>, ip: IpAddr) -> Result<DnsPermit, DnsBusy> {
+        let semaphore = {
+            let mut shares = self.lock_shares();
+            let share = shares.entry(ip).or_insert_with(|| DnsShare {
+                semaphore: Arc::new(Semaphore::new(self.per_ip)),
+                users: 0,
+            });
+            share.users += 1;
+            Arc::clone(&share.semaphore)
+        };
+        // Registered: from here every exit path (including cancellation)
+        // must unregister, which the permit's Drop does.
+        let mut held = DnsPermit {
+            limiter: Arc::clone(self),
+            ip,
+            permit: None,
+        };
+        if let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() {
+            held.permit = Some(permit);
+            return Ok(held);
+        }
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        match tokio::time::timeout(self.wait, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                held.permit = Some(permit);
+                Ok(held)
+            }
+            // Timed out (the semaphore is never closed).
+            _ => {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                Err(DnsBusy)
+            }
+        }
+    }
+
+    /// Current counters.
+    pub fn stats(&self) -> DnsLimitStats {
+        DnsLimitStats {
+            waits: self.waits.load(Ordering::Relaxed),
+            refusals: self.refusals.load(Ordering::Relaxed),
+            active_ips: self.lock_shares().len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +386,80 @@ mod tests {
         for reason in [LimitReason::TooManyConcurrent, LimitReason::RateLimited] {
             assert!(reason.reply().starts_with(b"421 4.7.0"));
         }
+    }
+
+    // -- DnsLimiter --------------------------------------------------------
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// An IP gets at most `per_ip` concurrent permits; a further request
+    /// waits the configured time and is refused. Other IPs are
+    /// unaffected.
+    #[tokio::test]
+    async fn dns_limit_caps_each_ip() {
+        let limiter = Arc::new(DnsLimiter::new(2, Duration::from_millis(100)));
+        let a = ip("192.0.2.1");
+        let _p1 = limiter.acquire(a).await.unwrap();
+        let _p2 = limiter.acquire(a).await.unwrap();
+
+        let started = Instant::now();
+        assert_eq!(limiter.acquire(a).await.unwrap_err(), DnsBusy);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "it waited first"
+        );
+
+        // Another address has its own share.
+        let _other = limiter.acquire(ip("192.0.2.2")).await.unwrap();
+        let stats = limiter.stats();
+        assert_eq!((stats.waits, stats.refusals, stats.active_ips), (1, 1, 2));
+    }
+
+    /// A waiter gets the permit as soon as a holder releases it.
+    #[tokio::test]
+    async fn dns_limit_waiter_proceeds_on_release() {
+        let limiter = Arc::new(DnsLimiter::new(1, Duration::from_secs(5)));
+        let a = ip("192.0.2.1");
+        let held = limiter.acquire(a).await.unwrap();
+        let waiter = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            async move { limiter.acquire(a).await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let released = Instant::now();
+        drop(held);
+        waiter.await.unwrap().unwrap();
+        assert!(released.elapsed() < Duration::from_millis(500));
+        assert_eq!(limiter.stats().refusals, 0);
+    }
+
+    /// Entries live only while an evaluation holds or waits for a permit
+    /// — including a waiter that is cancelled — so memory stays bounded.
+    #[tokio::test]
+    async fn dns_limit_entries_are_removed_when_unused() {
+        let limiter = Arc::new(DnsLimiter::new(1, Duration::from_secs(5)));
+        let a = ip("2001:db8::1");
+        let held = limiter.acquire(a).await.unwrap();
+        let cancelled = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            async move { limiter.acquire(a).await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(
+            limiter.lock_shares()[&a].users,
+            1,
+            "the cancelled waiter unregistered"
+        );
+
+        drop(held);
+        assert_eq!(limiter.stats().active_ips, 0);
+
+        // A fresh evaluation starts a fresh, full share.
+        let _again = limiter.acquire(a).await.unwrap();
+        assert_eq!(limiter.stats().active_ips, 1);
     }
 }

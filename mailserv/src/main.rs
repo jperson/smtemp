@@ -76,6 +76,12 @@ struct Args {
     #[arg(long, value_name = "N")]
     max_conn_rate_per_ip: Option<u32>,
 
+    /// Maximum concurrent DNS-backed checks (SPF, DKIM, DMARC) for one
+    /// source IP. Further checks wait up to 10 s, then get a temporary
+    /// failure (451).
+    #[arg(long, value_name = "N")]
+    max_dns_per_ip: Option<usize>,
+
     /// PEM certificate for STARTTLS (requires --tls-key).
     #[arg(long)]
     tls_cert: Option<String>,
@@ -94,6 +100,11 @@ struct Args {
     /// DKIM key, and DMARC lookups.
     #[arg(long)]
     resolver: Option<Ipv4Addr>,
+
+    /// Pipelined DNS-over-TLS connections to the resolver (1-16, default
+    /// 2). Each carries up to 64 queries in flight.
+    #[arg(long, value_name = "N")]
+    dns_connections: Option<usize>,
 
     /// Queue directory where accepted messages are spooled before
     /// delivery. Spooling is part of the acceptance contract: the 250 is
@@ -124,8 +135,10 @@ struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, resolver, spool-dir, maildir-dir,
+    /// tls-cert, tls-key, auth-users, resolver, dns-connections,
+    /// spool-dir, maildir-dir,
     /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
+    /// max-dns-per-ip,
     /// local-domains, authority); every key
     /// optional.
     #[arg(long, value_name = "FILE")]
@@ -145,10 +158,12 @@ struct FileConfig {
     max_connections: Option<u32>,
     max_conn_per_ip: Option<u32>,
     max_conn_rate_per_ip: Option<u32>,
+    max_dns_per_ip: Option<usize>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
     resolver: Option<Ipv4Addr>,
+    dns_connections: Option<usize>,
     spool_dir: Option<String>,
     maildir_dir: Option<String>,
     local_domains: Option<String>,
@@ -167,11 +182,17 @@ struct Config {
     max_connections: u32,
     max_conn_per_ip: u32,
     max_conn_rate_per_ip: u32,
+    /// Concurrent DNS-backed checks per source IP (default
+    /// [`limit::DEFAULT_DNS_PER_IP`]).
+    max_dns_per_ip: usize,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
     /// DNS-over-TLS resolver address; always resolved (default 1.1.1.1).
     resolver: Ipv4Addr,
+    /// Pipelined DoT connections to the resolver (default
+    /// [`dns::DEFAULT_CONNECTIONS`]).
+    dns_connections: usize,
     /// Queue directory for accepted messages (default "spool").
     spool_dir: String,
     /// Local delivery root (default "maildir").
@@ -234,6 +255,11 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .max_conn_rate_per_ip
             .or(file.max_conn_rate_per_ip)
             .unwrap_or(60),
+        max_dns_per_ip: match cli.max_dns_per_ip.or(file.max_dns_per_ip) {
+            None => limit::DEFAULT_DNS_PER_IP,
+            Some(0) => anyhow::bail!("max-dns-per-ip must be at least 1"),
+            Some(n) => n,
+        },
         tls_cert: cli.tls_cert.or(file.tls_cert),
         tls_key: cli.tls_key.or(file.tls_key),
         auth_users: cli.auth_users.or(file.auth_users),
@@ -242,6 +268,14 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
                 .parse()
                 .expect("DEFAULT_RESOLVER is a valid IPv4 address")
         }),
+        dns_connections: match cli.dns_connections.or(file.dns_connections) {
+            None => dns::DEFAULT_CONNECTIONS,
+            Some(n) if (1..=dns::MAX_CONNECTIONS).contains(&n) => n,
+            Some(n) => anyhow::bail!(
+                "dns-connections must be between 1 and {}, got {n}",
+                dns::MAX_CONNECTIONS
+            ),
+        },
         spool_dir: cli
             .spool_dir
             .or(file.spool_dir)
@@ -267,6 +301,10 @@ const BAD_ADDRESS: &[u8] = b"501 5.1.7 Bad sender address syntax\r\n";
 /// Malformed or unacceptable address in a RCPT TO path (RFC 3463: 5.1.3
 /// bad destination mailbox address syntax).
 const BAD_RCPT: &[u8] = b"553 5.1.3 Bad recipient address syntax\r\n";
+/// The source IP's share of DNS-backed checks stayed exhausted for the
+/// whole wait ([`limit::DNS_LIMIT_WAIT`]); retryable.
+const DNS_BUSY: &[u8] =
+    b"451 4.7.0 Too many concurrent DNS checks from your address, try again later\r\n";
 /// RFC 5321 Section 4.5.3.1.8: at least 100 recipients.
 const MAX_RCPT: usize = 100;
 /// RFC 5321 Section 3.3: DATA with no accepted recipients.
@@ -657,14 +695,26 @@ fn log_spf_error(identity: &str, domain: &str, error: &spf::SpfError) {
     }
 }
 
+/// Log that a check was refused because its source IP's DNS share stayed
+/// exhausted (`stage`: helo, mail_from, end_of_data). The session's span
+/// already carries the peer.
+fn log_dns_busy(stage: &str) {
+    warn!(
+        stage,
+        wait_ms = u64::try_from(limit::DNS_LIMIT_WAIT.as_millis()).unwrap_or(u64::MAX),
+        "per-IP DNS limit: no permit within the wait; temporary failure"
+    );
+}
+
 /// How often the DNS client's metrics are logged.
 const DNS_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Log the DNS client's metrics once per [`DNS_STATS_INTERVAL`] while it
-/// is being used (DESIGN §6.1: the baseline for sizing the pool and for
-/// measuring pipelining). Counters are cumulative; the peaks cover the
+/// is being used, together with the per-source-IP DNS limiter's counters
+/// (DESIGN §6.1: the signals for sizing `--dns-connections` and
+/// `--max-dns-per-ip`). Counters are cumulative; the peaks cover the
 /// interval just ended. Quiet intervals (no new queries) are skipped.
-async fn report_dns_stats(dns: Arc<dns::DnsClient>) {
+async fn report_dns_stats(dns: Arc<dns::DnsClient>, dns_limit: Arc<limit::DnsLimiter>) {
     let mut ticker = tokio::time::interval(DNS_STATS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick fires immediately
@@ -672,6 +722,7 @@ async fn report_dns_stats(dns: Arc<dns::DnsClient>) {
     loop {
         ticker.tick().await;
         let s = dns.stats();
+        let l = dns_limit.stats();
         dns.reset_peaks();
         if s.queries == last_queries {
             continue;
@@ -686,13 +737,19 @@ async fn report_dns_stats(dns: Arc<dns::DnsClient>) {
             exchanges_ok = s.exchanges_ok,
             exchange_errors = s.exchange_errors,
             timeouts = s.timeouts,
+            late_replies = s.late_replies,
             waits = s.waits,
             wait_mean_us = s.wait_total_us.checked_div(misses).unwrap_or(0),
             wait_max_us = s.wait_max_us,
             waiting = s.waiting,
             in_flight = s.in_flight,
             peak_in_flight = s.peak_in_flight,
-            pool_size = dns::POOL_SIZE,
+            connections = dns.connections(),
+            max_in_flight = dns.max_in_flight(),
+            ip_limit_waits = l.waits,
+            ip_limit_refusals = l.refusals,
+            ip_limit_active_ips = l.active_ips,
+            max_dns_per_ip = dns_limit.per_ip(),
             "dns stats"
         );
     }
@@ -721,10 +778,14 @@ struct UserSession<'session> {
 
     pub session_id: Uuid,
     domain: &'session str,
-    /// Shared DNS client (pooled DoT connection + TTL cache) for SPF,
+    /// Shared DNS client (pipelined DoT connections + TTL cache) for SPF,
     /// DKIM key, and DMARC lookups.
     #[serde(skip_serializing)]
     dns: Arc<dns::DnsClient>,
+    /// Per-source-IP limit on concurrent DNS-backed checks, shared by
+    /// every session.
+    #[serde(skip_serializing)]
+    dns_limit: Arc<limit::DnsLimiter>,
     peer: SocketAddr,
 
     helo: Option<String>,
@@ -782,6 +843,7 @@ impl<'session> UserSession<'session> {
 
             domain: &cfg.domain,
             dns: cfg.dns.clone(),
+            dns_limit: cfg.dns_limit.clone(),
             peer,
 
             helo: None,
@@ -857,25 +919,34 @@ impl smtp::SmtpSession for UserSession<'_> {
         self.spf_helo = if h.starts_with('[') {
             None
         } else {
-            match spf::check_host(
-                &spf::DotResolver::shared(self.dns.clone()),
-                self.peer.ip(),
-                &format!("postmaster@{h}"),
-                h.to_string(),
-                &self.helo,
-            )
-            .await
-            {
-                Ok(result) => Some(result),
-                // Map evaluation errors to their results: transient DNS
-                // failures and an exceeded evaluation deadline are
-                // TempError, unusable records and exhausted lookup
-                // budgets are PermError. The reason is logged — it is
-                // otherwise lost in the mapping.
-                Err(e) => {
-                    log_spf_error("helo", h, &e);
-                    Some(e.to_result())
+            // The evaluation holds one of this source IP's DNS permits
+            // (DESIGN §6.1). If none frees up in time, the HELO identity
+            // is TempError, which never rejects HELO: MAIL FROM decides.
+            match self.dns_limit.acquire(self.peer.ip()).await {
+                Err(limit::DnsBusy) => {
+                    log_dns_busy("helo");
+                    Some(SpfResult::TempError)
                 }
+                Ok(_permit) => match spf::check_host(
+                    &spf::DotResolver::shared(self.dns.clone()),
+                    self.peer.ip(),
+                    &format!("postmaster@{h}"),
+                    h.to_string(),
+                    &self.helo,
+                )
+                .await
+                {
+                    Ok(result) => Some(result),
+                    // Map evaluation errors to their results: transient
+                    // DNS failures and an exceeded evaluation deadline are
+                    // TempError, unusable records and exhausted lookup
+                    // budgets are PermError. The reason is logged — it is
+                    // otherwise lost in the mapping.
+                    Err(e) => {
+                        log_spf_error("helo", h, &e);
+                        Some(e.to_result())
+                    }
+                },
             }
         };
 
@@ -1062,6 +1133,13 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         let result = match identity {
             Some((sender, domain)) => {
+                // One of this source IP's DNS permits (DESIGN §6.1). If
+                // none frees up in time, refuse temporarily: the sender
+                // retries; nothing is recorded.
+                let Ok(_permit) = self.dns_limit.acquire(self.peer.ip()).await else {
+                    log_dns_busy("mail_from");
+                    return smtp::Control::tempfail(DNS_BUSY);
+                };
                 match spf::check_host(
                     &spf::DotResolver::shared(self.dns.clone()),
                     self.peer.ip(),
@@ -1245,6 +1323,17 @@ impl smtp::SmtpSession for UserSession<'_> {
         // The raw message as received: the accumulated DATA lines, with
         // line endings exactly as the client sent them.
         let raw = self.data.clone();
+
+        // DKIM key lookups and the DMARC policy fetch hold one of this
+        // source IP's DNS permits (DESIGN §6.1). If none frees up in
+        // time, the message is refused *temporarily*: skipping the checks
+        // instead would fail DMARC and permanently reject legitimate mail.
+        let Ok(dns_permit) = self.dns_limit.acquire(self.peer.ip()).await else {
+            log_dns_busy("end_of_data");
+            self.clear_envelope();
+            self.message_count += 1;
+            return smtp::Control::tempfail(DNS_BUSY);
+        };
         let results = dkim::verify_dkim(&raw, &self.dns).await;
         let mut dkim_summaries: Vec<DkimSummary> = Vec::new();
 
@@ -1364,6 +1453,9 @@ impl smtp::SmtpSession for UserSession<'_> {
                 }
             }
         }
+        // DNS work for this message is done; the spool write and delivery
+        // below must not hold the source IP's DNS share.
+        drop(dns_permit);
 
         // Spool before accepting: the 250 is only sent after a durable
         // write (Phase 7). The backend is blocking (fsync, and object
@@ -1624,14 +1716,23 @@ async fn main() -> Result<()> {
     // One shared DNS client for the whole process (Phase 10): the pooled
     // DNS-over-TLS connection and the TTL result cache serve SPF, DKIM,
     // and DMARC alike — previously every query paid a full TLS handshake.
-    let dns_client = Arc::new(dns::DnsClient::new(config.resolver));
+    let dns_client =
+        Arc::new(dns::DnsClient::new(config.resolver).with_connections(config.dns_connections));
     info!(
         resolver = %config.resolver,
-        pool_size = dns::POOL_SIZE,
+        connections = dns_client.connections(),
+        max_in_flight = dns_client.max_in_flight(),
         spf_deadline_ms = u64::try_from(spf::EVALUATION_DEADLINE.as_millis()).unwrap_or(u64::MAX),
-        "DNS-over-TLS client ready (connection pool, TTL cache)"
+        max_dns_per_ip = config.max_dns_per_ip,
+        "DNS-over-TLS client ready (pipelined connections, TTL cache)"
     );
-    tokio::spawn(report_dns_stats(dns_client.clone()));
+    // Per-source-IP share of DNS work (DESIGN §6.1, H6): one client must
+    // not fill the shared resolver capacity with its own slow lookups.
+    let dns_limit = Arc::new(limit::DnsLimiter::new(
+        config.max_dns_per_ip,
+        limit::DNS_LIMIT_WAIT,
+    ));
+    tokio::spawn(report_dns_stats(dns_client.clone(), dns_limit.clone()));
 
     // Connection caps (Phase 10): a server-wide semaphore plus per-IP
     // concurrency and connection-rate budgets, enforced in the accept
@@ -1709,6 +1810,7 @@ async fn main() -> Result<()> {
             auth_users: auth_users.clone(),
             authority: authority.clone(),
             dns: dns_client.clone(),
+            dns_limit: dns_limit.clone(),
             spool: Some(spool.clone()),
             sink: Some(sink.clone()),
         };
@@ -1793,6 +1895,8 @@ struct SessionConfig {
     authority: Arc<dyn authority::RecipientResolver>,
     /// Shared DNS client used for SPF, DKIM key, and DMARC lookups.
     dns: Arc<dns::DnsClient>,
+    /// Per-source-IP limit on concurrent DNS-backed checks.
+    dns_limit: Arc<limit::DnsLimiter>,
     /// Spool backend for accepted messages; None drops them (tests).
     spool: Option<Arc<dyn spool::SpoolWriter>>,
     /// Local delivery sink; None leaves messages queued (tests).
@@ -2135,6 +2239,125 @@ mod tests {
         assert!(resolve_config(Args::parse_from(["mailserv"]), FileConfig::default()).is_err());
     }
 
+    /// `max-dns-per-ip`: default, file, CLI precedence; 0 is an error.
+    #[test]
+    fn max_dns_per_ip_resolution() {
+        use clap::Parser as _;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+        let resolved = resolve_config(args(&[]), FileConfig::default()).unwrap();
+        assert_eq!(resolved.max_dns_per_ip, limit::DEFAULT_DNS_PER_IP);
+        let file: FileConfig = toml::from_str("max-dns-per-ip = 8").unwrap();
+        assert_eq!(
+            resolve_config(args(&[]), file.clone())
+                .unwrap()
+                .max_dns_per_ip,
+            8
+        );
+        assert_eq!(
+            resolve_config(args(&["--max-dns-per-ip", "2"]), file)
+                .unwrap()
+                .max_dns_per_ip,
+            2
+        );
+        let err =
+            resolve_config(args(&["--max-dns-per-ip", "0"]), FileConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("max-dns-per-ip"), "{err}");
+    }
+
+    /// Per-IP DNS limit (DESIGN §6.1, H6): with this source IP's share
+    /// exhausted, every DNS-backed stage fails *temporarily*, never
+    /// permanently — HELO proceeds with SPF TempError, MAIL FROM and
+    /// end-of-data get `451 4.7.0` — and once the share frees up the
+    /// checks run again. The DNS client points at a closed local port, so
+    /// nothing touches the network.
+    #[tokio::test]
+    async fn per_ip_dns_limit_tempfails_each_stage() {
+        let dns_limit = Arc::new(limit::DnsLimiter::new(1, Duration::from_millis(100)));
+        let cfg = SessionConfig {
+            domain: "mail.test".to_string(),
+            max_data: 1024 * 1024,
+            auth_users: None,
+            authority: Arc::new(authority::StaticAuthority::new(vec![
+                "mail.test".to_string()
+            ])),
+            dns: Arc::new(dns::DnsClient::with_timeout(
+                "127.0.0.1".parse().unwrap(),
+                Duration::from_millis(500),
+            )),
+            dns_limit: Arc::clone(&dns_limit),
+            spool: None,
+            sink: None,
+        };
+        let peer: SocketAddr = "192.0.2.7:40000".parse().unwrap();
+        let mut session = UserSession::new(peer, false, &cfg);
+
+        // Another session from the same IP holds its whole share.
+        let held = dns_limit.acquire(peer.ip()).await.unwrap();
+
+        // HELO: accepted, identity recorded as TempError.
+        let control = session.helo(false, "client.example").await;
+        assert!(control.is_accept(), "{control:?}");
+        assert_eq!(session.spf_helo, Some(SpfResult::TempError));
+
+        // MAIL FROM: 451, nothing recorded, so it can be retried.
+        let control = session.mail_from("<a@sender.example>").await;
+        assert_eq!(control, smtp::Control::tempfail(DNS_BUSY));
+        assert_eq!(session.mail_from, None);
+
+        // End-of-data: 451 rather than skipping DKIM/DMARC; the envelope
+        // is cleared.
+        session.mail_from = Some("a@sender.example".to_string());
+        session.data = b"From: a@sender.example\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
+        let control = session.end_data().await;
+        assert_eq!(control, smtp::Control::tempfail(DNS_BUSY));
+        assert_eq!(session.mail_from, None);
+        assert!(session.data.is_empty());
+        assert_eq!(dns_limit.stats().refusals, 3);
+
+        // Once the share frees up, the check really runs: the unreachable
+        // resolver now gives the ordinary SPF TempError reply instead.
+        drop(held);
+        let control = session.mail_from("<a@sender.example>").await;
+        assert_eq!(control, smtp::Control::tempfail(SPF_TEMPFAIL));
+        assert_eq!(
+            dns_limit.stats().active_ips,
+            0,
+            "permit released after the check"
+        );
+    }
+
+    /// `dns-connections`: defaults to the dns crate's default, the file
+    /// value applies, the CLI wins, and out-of-range values are a startup
+    /// error rather than being silently clamped.
+    #[test]
+    fn dns_connections_resolution() {
+        use clap::Parser as _;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+
+        let resolved = resolve_config(args(&[]), FileConfig::default()).unwrap();
+        assert_eq!(resolved.dns_connections, dns::DEFAULT_CONNECTIONS);
+
+        let file: FileConfig = toml::from_str("dns-connections = 4").unwrap();
+        let resolved = resolve_config(args(&[]), file.clone()).unwrap();
+        assert_eq!(resolved.dns_connections, 4);
+        let resolved = resolve_config(args(&["--dns-connections", "3"]), file).unwrap();
+        assert_eq!(resolved.dns_connections, 3);
+
+        for bad in ["0", "17"] {
+            let err = resolve_config(args(&["--dns-connections", bad]), FileConfig::default())
+                .unwrap_err();
+            assert!(err.to_string().contains("dns-connections"), "{err}");
+        }
+    }
+
     #[test]
     fn resolver_from_config_file_wins_over_default() {
         use clap::Parser as _;
@@ -2194,6 +2417,10 @@ mod tests {
                         // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
                         // evaluates to None and DMARC has no policy.
                         dns: Arc::new(dns::DnsClient::new("1.1.1.1".parse().unwrap())),
+                        dns_limit: Arc::new(limit::DnsLimiter::new(
+                            limit::DEFAULT_DNS_PER_IP,
+                            limit::DNS_LIMIT_WAIT,
+                        )),
                         spool,
                         sink,
                     },
@@ -3024,6 +3251,10 @@ mod tests {
                 "mail.test".to_string()
             ])),
             dns: spawn_mock_dmarc_resolver().await,
+            dns_limit: Arc::new(limit::DnsLimiter::new(
+                limit::DEFAULT_DNS_PER_IP,
+                limit::DNS_LIMIT_WAIT,
+            )),
             spool: None,
             sink: None,
         };

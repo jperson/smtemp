@@ -13,7 +13,7 @@
 > (REPORT.md) is triaged in §6: all critical and high findings (and the
 > round-2 findings N1–N7) are fixed and regression-tested; the medium
 > and low findings are tracked there.
-> Workspace state: **193 tests, 0 failures,
+> Workspace state: **207 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -228,18 +228,20 @@ future signer). Do not invest here until after V1 ships.
       (SIGTERM → stop accepting, drain in-flight) **still open**.)
 - [x] Config file (`--config`, TOML, CLI-over-file precedence).
 - [x] DNS result caching + connection reuse: `dns::DnsClient` — one
-      shared client per process holds a pooled DNS-over-TLS connection
-      (mutex-serialized exchanges; any failed or timed-out exchange
-      poisons the connection so a half-completed read can never be
-      mispaired with the next query, and connection-level failures
-      retry once on a fresh connection) and a TTL-based result cache
+      shared client per process holds pipelined DNS-over-TLS connections
+      (DESIGN §6.1: default 2 connections × 64 queries in flight,
+      replies matched by transaction ID + question echo, a timed-out
+      query abandons its ID without harming the connection, and
+      connection-level failures fail every waiter, which retries once on a
+      fresh connection) and a TTL-based result cache
       (positive: minimum answer TTL; NXDOMAIN/NODATA: SOA-derived
       negative TTL per RFC 2308; clamped to 1 h; bounded to 4096
       entries). SPF, DKIM, and DMARC all share it — one session went
       from ~4 full TLS handshakes to one connection. Verified against a
       real 1.1.1.1 endpoint and a mock DoT server (reuse, cache-hit,
-      transparent reconnect). *Still open: connection *pooling* beyond
-      one serialized connection (contention at very high query rates);
+      transparent reconnect, pipelining). *Still open: resolver back-off,
+      duplicate-miss sharing (DESIGN §6.1; the per-source-IP DNS limit is
+      done, `--max-dns-per-ip`);
       EDNS0 option negotiation is minimal.*
 - [x] Configurable resolver: `--resolver <IP>` / `resolver` config-file
       key (CLI > file > default); default 1.1.1.1; resolved once in
@@ -539,7 +541,7 @@ running binary. A round-2 re-review found gaps in the first fixes
 | H5 | High | Each refused connection ran inline in the accept loop (up to ~2.5 s), so an attacker holding the connection budgets stalled ALL accepts — the limiter as amplifier | **FIXED** — refusals spawn into a bounded permit pool (32); when saturated, sockets close without the courtesy reply |
 | H8 | High | Grace-mode domains refused every *permanent* mailbox (`is_some_and` treated `expires: null` as expired) | **FIXED** — `is_none_or`; `grace-days` capped at 366 (bounded arithmetic); permanent + future-expiry regression tests |
 | M15 | Medium | Authority hot-reload: one bad publish made every RCPT `451` until fixed, and re-parsed the broken file per RCPT | **FIXED** — last-good snapshot serves through a bad publish; failed change token memoized (no per-RCPT re-parse); change token is (mtime, size); next good publish applies. Round 3 (N5): a failed reload is logged at `error` (stale policy is never silent) |
-| H6 | High | One serialized DNS connection shared process-wide; connect had NO timeout — a black-holed resolver held the mutex ~2 min, and an attacker-chosen slow record stalled every session's lookups | **FIXED** — connect bounded by the per-exchange timeout, and `DnsClient` now holds a pool of 8 connections (one exchange each), so a slow lookup occupies one slot instead of every session's DNS; regression test (slow lookup in flight, unrelated lookup completes immediately). *Open: pipelining; see also L2 (cache eviction)* |
+| H6 | High | One serialized DNS connection shared process-wide; connect had NO timeout — a black-holed resolver held the mutex ~2 min, and an attacker-chosen slow record stalled every session's lookups | **FIXED** — connect bounded by the per-query timeout; `DnsClient` is now **pipelined** (default 2 connections × 64 queries in flight, `--dns-connections`; replies matched by ID + question echo; a timeout keeps the connection). The round-3 8-slot pool was re-opened in the round-4 review (8 slow lookups from one IP filled it) and is replaced. Regression test: 20 slow lookups in flight don't delay an unrelated one (fails with the in-flight limit set to 1). A per-source-IP limit on concurrent DNS-backed checks (`--max-dns-per-ip`, default 4; tempfails with `451`, never a permanent reject) now bounds what any one client can hold. *Open: resolver back-off, duplicate-miss sharing (DESIGN §6.1)* |
 | H2 | High | SPF macro expansion replaced every letter after the first `%` | **FIXED** — RFC 7208 §7 expander (letters, digit/`r` transformers, delimiters, `%%`/`%_`/`%-`, URL-escaping, 253-octet truncation; IPv6 nibble `%{i}`, epoch `%{t}`, `%{p}` = `unknown`); `include:` lexes `%`; RFC §7.4 example tests |
 | H3 | High | ESMTP parameters (`SIZE=`, `BODY=`) ended up inside the address: SPF bypass, bounces with `SIZE=` refused | **FIXED** — `<path> [params]` split (RFC 5321 §4.1.2); `SIZE=` over the limit → `552` at MAIL; control characters in paths refused |
 | H7 | High | Unlimited DKIM signatures per message (CPU + DNS amplification) | **FIXED** — at most `dkim::MAX_SIGNATURES` (5, topmost) evaluated; offline regression test |

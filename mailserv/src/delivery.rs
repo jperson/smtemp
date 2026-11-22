@@ -123,14 +123,40 @@ fn split_recipient(recipient: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow::anyhow!("no '@' in recipient {recipient:?}"))?;
     let local = local.to_ascii_lowercase();
     let domain = domain.to_ascii_lowercase();
+    // Both components must be a single path segment: never empty, no
+    // leading dot (so never `.` or `..`), no `..` run, and only RFC 5321
+    // dot-atom characters minus `/` (the same set the session enforces at
+    // RCPT time; `\` and control characters are not atext).
+    let safe = |b: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'.' | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'='
+                    | b'?'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+                    | b'~'
+            )
+    };
     for component in [&local, &domain] {
         if component.is_empty()
             || component.len() > 128
             || component.starts_with('.')
             || component.contains("..")
-            || !component
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'=' | b'-'))
+            || !component.bytes().all(safe)
         {
             return Err(anyhow::anyhow!(
                 "unsafe mailbox path component in {recipient:?}"

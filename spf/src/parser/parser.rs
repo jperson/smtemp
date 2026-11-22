@@ -136,16 +136,38 @@ impl SpfMacroSubs {
     /// Build the substitution set for one evaluation.
     pub fn new(peer: IpAddr, sender: &String, domain: &String, helo: &Option<String>) -> Self {
         let (local_part, sender_domain) = sender.split_once('@').unzip();
-        let timestamp = jiff::Timestamp::now().to_string();
+        // RFC 7208 Section 7.3: `t` is seconds since the epoch.
+        let timestamp = jiff::Timestamp::now().as_second().to_string();
         let ip_type: &'static str = if peer.is_ipv4() { "in-addr" } else { "ip6" };
+        // RFC 7208 Section 7.3: `i` is dotted-quad for IPv4 and
+        // dot-separated nibbles for IPv6.
+        let ip_macro = match peer {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => v6
+                .octets()
+                .iter()
+                .flat_map(|b| [b >> 4, b & 0x0f])
+                .map(|n| format!("{n:x}"))
+                .collect::<Vec<_>>()
+                .join("."),
+        };
 
         SpfMacroSubs {
             s: Some(sender.to_string()),
-            l: local_part.map(|s| s.to_string()),
+            // RFC 7208 Section 4.3: an empty local-part is "postmaster".
+            l: local_part.map(|s| {
+                if s.is_empty() {
+                    "postmaster".to_string()
+                } else {
+                    s.to_string()
+                }
+            }),
             o: sender_domain.map(|s| s.to_string()),
             d: Some(domain.to_string()),
-            i: Some(peer.to_string()),
-            p: None,
+            i: Some(ip_macro),
+            // RFC 7208 Section 7.3: `p` is not validated here (its use is
+            // discouraged); "unknown" is the specified fallback.
+            p: Some("unknown".to_string()),
             h: helo.to_owned(),
             c: Some(peer.to_string()),
             r: Some(domain.to_string()),
@@ -361,52 +383,125 @@ fn parse_exists(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism>
     }
 }
 
+/// Expand an RFC 7208 Section 7 macro-string.
+///
+/// ```text
+/// macro-string = *( macro-expand / macro-literal )
+/// macro-expand = ( "%{" macro-letter transformers *delimiter "}" )
+///                / "%%" / "%_" / "%-"
+/// transformers = *DIGIT [ "r" ]
+/// delimiter    = "." / "-" / "+" / "," / "/" / "_" / "="
+/// ```
+///
+/// A macro value is split on the given delimiters (default `.`),
+/// optionally reversed (`r`), cut to its rightmost N parts (digits), and
+/// re-joined with `.`. An upper-case macro letter URL-escapes the result.
+/// Any other use of `%` is a syntax error (the caller maps it to
+/// PermError). An expanded domain-spec longer than 253 octets loses
+/// labels from the left (Section 7.3).
 fn expand_macro_string(subs: &SpfMacroSubs, s: &String) -> Result<String> {
-    let mut r: Vec<u8> = Vec::new();
-
-    macro_rules! macro_sub {
-        ($s:expr) => {{
-            match &$s {
-                Some(i) => r.extend_from_slice(i.as_bytes()),
-                _ => (),
-            }
-        }};
+    if memchr::memchr(b'%', s.as_bytes()).is_none() {
+        return Ok(s.to_string());
     }
-
-    if let Some(p) = memchr::memchr(b'%', s.as_bytes()) {
-        r.extend_from_slice(&s.as_bytes()[..p]);
-        for &c in &s.as_bytes()[p + 1..] {
-            if c == b's' && subs.s.is_some() {
-                macro_sub!(subs.s);
-            } else if c == b'l' && subs.l.is_some() {
-                macro_sub!(subs.l);
-            } else if c == b'o' && subs.o.is_some() {
-                macro_sub!(subs.o);
-            } else if c == b'd' && subs.d.is_some() {
-                macro_sub!(subs.d);
-            } else if c == b'i' && subs.i.is_some() {
-                macro_sub!(subs.i);
-            } else if c == b'p' && subs.p.is_some() {
-                macro_sub!(subs.p);
-            } else if c == b'h' && subs.h.is_some() {
-                macro_sub!(subs.h);
-            } else if c == b'c' && subs.c.is_some() {
-                macro_sub!(subs.c);
-            } else if c == b'r' && subs.r.is_some() {
-                macro_sub!(subs.r);
-            } else if c == b't' && subs.t.is_some() {
-                macro_sub!(subs.t);
-            } else if c == b'v' && subs.v.is_some() {
-                macro_sub!(subs.v);
-            } else if c == b'{' || c == b'}' {
-                continue;
-            } else {
-                r.push(c);
-            }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
         }
-        String::from_utf8(r).or(Err(anyhow!("Failed to expand macro")))
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('_') => out.push(' '),
+            Some('-') => out.push_str("%20"),
+            Some('{') => {
+                let body: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                out.push_str(&expand_one_macro(subs, &body)?);
+            }
+            _ => return Err(anyhow!("invalid macro: '%' must start a macro-expand")),
+        }
+    }
+    // A missing closing brace makes take_while consume to the end; detect
+    // it by re-checking the source.
+    if s.matches("%{").count() > s.matches('}').count() {
+        return Err(anyhow!("unterminated macro"));
+    }
+    while out.len() > 253 {
+        match out.split_once('.') {
+            Some((_, rest)) => out = rest.to_string(),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Expand the inside of one `%{...}` macro (letter, transformers,
+/// delimiters).
+fn expand_one_macro(subs: &SpfMacroSubs, body: &str) -> Result<String> {
+    let mut it = body.chars();
+    let letter = it.next().ok_or_else(|| anyhow!("empty macro"))?;
+    let value = match letter.to_ascii_lowercase() {
+        's' => &subs.s,
+        'l' => &subs.l,
+        'o' => &subs.o,
+        'd' => &subs.d,
+        'i' => &subs.i,
+        'p' => &subs.p,
+        'h' => &subs.h,
+        'c' => &subs.c,
+        'r' => &subs.r,
+        't' => &subs.t,
+        'v' => &subs.v,
+        other => return Err(anyhow!("unknown macro letter {other:?}")),
+    };
+    let value = value.as_deref().unwrap_or("");
+
+    let rest: String = it.collect();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let rest = &rest[digits.len()..];
+    let (reverse, delimiters) = match rest.strip_prefix(['r', 'R']) {
+        Some(d) => (true, d),
+        None => (false, rest),
+    };
+    if !delimiters.chars().all(|c| ".-+,/_=".contains(c)) {
+        return Err(anyhow!("invalid macro delimiter in {body:?}"));
+    }
+    let delimiters = if delimiters.is_empty() {
+        "."
     } else {
-        Ok(s.to_string())
+        delimiters
+    };
+
+    let mut parts: Vec<&str> = value.split(|c| delimiters.contains(c)).collect();
+    if reverse {
+        parts.reverse();
+    }
+    if !digits.is_empty() {
+        let keep: usize = digits.parse().map_err(|_| anyhow!("bad macro digits"))?;
+        if keep == 0 {
+            return Err(anyhow!("macro transformer digits must be non-zero"));
+        }
+        if keep < parts.len() {
+            parts = parts.split_off(parts.len() - keep);
+        }
+    }
+    let expanded = parts.join(".");
+
+    if letter.is_ascii_uppercase() {
+        // RFC 7208 Section 7.3: URL-escape everything outside the
+        // unreserved set (RFC 3986).
+        Ok(expanded
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect())
+    } else {
+        Ok(expanded)
     }
 }
 
@@ -512,6 +607,103 @@ mod tests {
         let result = expand_macro_string(&subs, &s).unwrap();
 
         assert_eq!(expected, result);
+    }
+
+    /// H2 (security report): RFC 7208 Section 7 macro expansion. The
+    /// expected values are the RFC's own examples (Section 7.4) for
+    /// sender strong-bad@email.example.com, IP 192.0.2.3.
+    #[test]
+    fn macro_expansion_rfc_examples() {
+        let subs = SpfMacroSubs::new(
+            "192.0.2.3".parse().unwrap(),
+            &"strong-bad@email.example.com".to_string(),
+            &"email.example.com".to_string(),
+            &Some("mx.example.org".to_string()),
+        );
+        let x = |s: &str| expand_macro_string(&subs, &s.to_string()).unwrap();
+
+        assert_eq!(x("%{s}"), "strong-bad@email.example.com");
+        assert_eq!(x("%{o}"), "email.example.com");
+        assert_eq!(x("%{d}"), "email.example.com");
+        assert_eq!(x("%{d4}"), "email.example.com");
+        assert_eq!(x("%{d3}"), "email.example.com");
+        assert_eq!(x("%{d2}"), "example.com");
+        assert_eq!(x("%{d1}"), "com");
+        assert_eq!(x("%{dr}"), "com.example.email");
+        assert_eq!(x("%{d2r}"), "example.email");
+        assert_eq!(x("%{l}"), "strong-bad");
+        assert_eq!(x("%{l-}"), "strong.bad");
+        assert_eq!(x("%{lr}"), "strong-bad");
+        assert_eq!(x("%{lr-}"), "bad.strong");
+        assert_eq!(x("%{l1r-}"), "strong");
+        assert_eq!(
+            x("%{ir}.%{v}._spf.%{d2}"),
+            "3.2.0.192.in-addr._spf.example.com"
+        );
+        assert_eq!(x("%{lr-}.lp._spf.%{d2}"), "bad.strong.lp._spf.example.com");
+        assert_eq!(
+            x("%{ir}.%{v}.%{l1r-}.lp._spf.%{d2}"),
+            "3.2.0.192.in-addr.strong.lp._spf.example.com"
+        );
+        assert_eq!(
+            x("%{d2}.trusted-domains.example.net"),
+            "example.com.trusted-domains.example.net"
+        );
+        // Literal text with no macro letters is untouched (the old
+        // implementation replaced every letter after the first '%').
+        assert_eq!(
+            x("%{i}._spf.mta.salesforce.com"),
+            "192.0.2.3._spf.mta.salesforce.com"
+        );
+        // Escapes and URL-encoding.
+        assert_eq!(x("a%%b%_c%-d"), "a%b c%20d");
+        assert_eq!(x("%{S}"), "strong-bad%40email.example.com");
+
+        // IPv6 `i` is dot-separated nibbles (RFC 7208 Section 7.4).
+        let v6 = SpfMacroSubs::new(
+            "2001:db8::cb01".parse().unwrap(),
+            &"a@b.example".to_string(),
+            &"b.example".to_string(),
+            &None,
+        );
+        assert_eq!(
+            expand_macro_string(&v6, &"%{ir}.%{v}._spf.%{d2}".to_string()).unwrap(),
+            "1.0.b.c.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6._spf.b.example"
+        );
+
+        // Syntax errors are errors (PermError), never a guess.
+        for bad in ["%x", "%{q}", "%{d0}", "%{d", "%{d*}", "trailing%"] {
+            assert!(
+                expand_macro_string(&subs, &bad.to_string()).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// H2: `include:` with a macro domain-spec lexes and expands (the
+    /// lexer used to exclude `%`, silently dropping such terms).
+    #[test]
+    fn include_with_macro_parses() {
+        let subs = SpfMacroSubs::new(
+            "192.0.2.3".parse().unwrap(),
+            &"user@example.com".to_string(),
+            &"example.com".to_string(),
+            &None,
+        );
+        let spf = parse(&subs, "v=spf1 include:%{d}._spf.example.net -all").unwrap();
+        assert_eq!(
+            spf.terms,
+            vec![
+                SpfTerm::Directive(SpfDirective {
+                    qualifier: SpfQualifier::Plus,
+                    mechanism: SpfMechanism::Include("example.com._spf.example.net".into()),
+                }),
+                SpfTerm::Directive(SpfDirective {
+                    qualifier: SpfQualifier::Dash,
+                    mechanism: SpfMechanism::All,
+                }),
+            ]
+        );
     }
 
     #[test]

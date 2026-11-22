@@ -255,7 +255,7 @@ cargo doc --workspace --no-deps  # rustdoc (missing_docs is warn-by-default)
 cargo test --workspace
 ```
 
-This runs ~185 tests across the workspace in four layers (see DESIGN.md
+This runs ~193 tests across the workspace in four layers (see DESIGN.md
 §9 for the rationale):
 
 1. **Unit** — pure logic per crate (DKIM canonicalization, DMARC

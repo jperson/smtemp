@@ -236,13 +236,14 @@ fn cache_ttl(resp: &DnsMessage) -> Option<Duration> {
     Some(Duration::from_secs(ttl.min(MAX_CACHE_TTL)))
 }
 
-/// A shared DNS-over-TLS client: one lazily-established TLS connection
-/// reused across queries (previously every query paid a full TCP+TLS
-/// handshake and a fresh rustls configuration), plus a TTL-based result
-/// cache shared by every consumer (SPF, DKIM, DMARC).
+/// A shared DNS-over-TLS client: a small pool of lazily-established TLS
+/// connections reused across queries (previously every query paid a
+/// full TCP+TLS handshake and a fresh rustls configuration), plus a
+/// TTL-based result cache shared by every consumer (SPF, DKIM, DMARC).
 ///
-/// Queries are serialized over the connection (one exchange at a
-/// time); a query that fails at the connection level — stale idle
+/// Each pooled connection carries one exchange at a time (up to
+/// [`POOL_SIZE`] queries run concurrently); a query that fails at the
+/// connection level — stale idle
 /// connections are common — retries once on a freshly established
 /// connection. Any failed or timed-out exchange discards the
 /// connection: a half-completed exchange must never be followed by
@@ -261,9 +262,21 @@ pub struct DnsClient {
     endpoint: Option<String>,
     /// Validated responses keyed by (qname, qtype).
     cache: Mutex<DnsCache>,
-    /// The pooled connection, if one is established.
-    conn: AsyncMutex<Option<DotStream>>,
+    /// The connection pool: [`POOL_SIZE`] independently locked slots,
+    /// each holding an established connection or nothing. One exchange
+    /// runs per slot at a time, so responses are never mispaired.
+    conns: Vec<AsyncMutex<Option<DotStream>>>,
+    /// Round-robin cursor for waiting on a slot when all are busy.
+    next_slot: std::sync::atomic::AtomicUsize,
 }
+
+/// Concurrent DNS-over-TLS connections per [`DnsClient`] (H6, security
+/// report). With a single serialized connection one slow lookup (an
+/// attacker can publish records whose authoritative servers never
+/// answer) held every session's DNS for the whole per-exchange
+/// timeout. With a pool, a slow lookup occupies one slot while the
+/// others keep serving.
+pub const POOL_SIZE: usize = 8;
 
 impl DnsClient {
     /// A client for `server` with the default 5-second per-exchange
@@ -294,7 +307,8 @@ impl DnsClient {
             config,
             endpoint,
             cache: Mutex::new(DnsCache::default()),
-            conn: AsyncMutex::new(None),
+            conns: (0..POOL_SIZE).map(|_| AsyncMutex::new(None)).collect(),
+            next_slot: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -326,9 +340,20 @@ impl DnsClient {
             return Ok(hit);
         }
 
-        // Held across the exchange: one query in flight at a time, so
-        // responses can never be mispaired between pipelined queries.
-        let mut conn = self.conn.lock().await;
+        // Held across the exchange: one query in flight per slot, so
+        // responses can never be mispaired. Take the first idle slot
+        // (keeps a quiet server on one warm connection); when every slot
+        // is busy, wait on one chosen round-robin.
+        let mut conn = match self.conns.iter().find_map(|slot| slot.try_lock().ok()) {
+            Some(guard) => guard,
+            None => {
+                let i = self
+                    .next_slot
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % self.conns.len();
+                self.conns[i].lock().await
+            }
+        };
         for attempt in 0..2 {
             let mut stream = match conn.take() {
                 Some(stream) => stream,
@@ -725,5 +750,93 @@ mod tests {
         client.query("d.test", 1).await.unwrap();
         assert_eq!(conns.load(Ordering::SeqCst), 2);
         assert_eq!(queries.load(Ordering::SeqCst), 4);
+    }
+
+    /// H6 (security report): a slow lookup (e.g. an attacker-published
+    /// record whose authoritative server never answers) must not stall
+    /// unrelated lookups. The mock answers names starting with "slow"
+    /// after 1.5 s and everything else immediately; a fast query issued
+    /// while the slow one is in flight completes on another pooled
+    /// connection without waiting.
+    #[tokio::test]
+    async fn slow_lookup_does_not_block_other_lookups() {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.key_pair.serialize_der().into(),
+        );
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    while let Ok(len) = tls.read_u16().await {
+                        let mut buf = vec![0; usize::from(len)];
+                        if tls.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let Ok((_, query)) = DnsMessage::from_bytes(&buf) else {
+                            return;
+                        };
+                        let name: String = query
+                            .questions
+                            .first()
+                            .map(|q| String::from(&q.name))
+                            .unwrap_or_default();
+                        if name.starts_with("slow") {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                        }
+                        let mut resp =
+                            DnsMessage::new(query.header.transaction_id, query.questions.clone());
+                        resp.header.qr = 1;
+                        let bytes = resp.to_vec().unwrap();
+                        if tls.write_u16(bytes.len() as u16).await.is_err()
+                            || tls.write_all(&bytes).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let client = Arc::new(DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            config,
+            Duration::from_secs(5),
+            Some(format!("127.0.0.1:{}", addr.port())),
+        ));
+
+        let slow = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query("slow.test", 1).await }
+        });
+        // Let the slow query take its connection first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = Instant::now();
+        client.query("fast.test", 1).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "fast lookup waited {:?} behind the slow one",
+            started.elapsed()
+        );
+        slow.await.unwrap().unwrap();
     }
 }

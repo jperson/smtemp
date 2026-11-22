@@ -463,12 +463,23 @@ impl FileAuthority {
         }
         match Self::load(&self.path) {
             Ok(data) => {
+                tracing::info!(file = %self.path.display(), "recipient authority reloaded");
                 *snapshot = Arc::new(Loaded { stamp, data });
             }
-            Err(_) => {
+            Err(e) => {
                 // Serve the last good snapshot; memoize this change
                 // token so the broken file is not re-parsed per lookup.
                 // It will load successfully on the next content change.
+                // N5 (security report): the failure is logged loudly —
+                // recipient policy is now stale (e.g. an expiry or a
+                // domain removal in the rejected publish is NOT in
+                // effect) and operators must know. Logged once per
+                // change, not per lookup.
+                tracing::error!(
+                    file = %self.path.display(),
+                    error = %format!("{e:#}"),
+                    "authority reload failed; serving the last good policy (stale)"
+                );
                 let last_good = Arc::clone(&snapshot);
                 *snapshot = Arc::new(Loaded {
                     stamp,

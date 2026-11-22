@@ -175,7 +175,9 @@ enum Line {
     /// the newline was reached (and consumed) before the cap was
     /// exceeded — when false, the remainder of the line is still on the
     /// wire and must be drained before any further line is read.
-    Overflow { terminated: bool },
+    /// `last` is the last octet read so far (used to tell a CRLF ending
+    /// from a bare LF once the line is drained).
+    Overflow { terminated: bool, last: Option<u8> },
 }
 
 /// Read one line (up to and including '\n'), never buffering more than
@@ -198,8 +200,12 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
                 line.extend_from_slice(&buf[..=pos]);
                 reader.consume(pos + 1);
                 return Ok(if overflows {
-                    let _ = line;
-                    Line::Overflow { terminated: true }
+                    // The octet before the '\n' (CR for a CRLF ending).
+                    let last = line.len().checked_sub(2).map(|i| line[i]);
+                    Line::Overflow {
+                        terminated: true,
+                        last,
+                    }
                 } else {
                     Line::Complete(line)
                 });
@@ -209,7 +215,10 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
                 line.extend_from_slice(buf);
                 reader.consume(n);
                 if line.len() > cap {
-                    return Ok(Line::Overflow { terminated: false });
+                    return Ok(Line::Overflow {
+                        terminated: false,
+                        last: line.last().copied(),
+                    });
                 }
             }
         }
@@ -217,20 +226,27 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
 }
 
 /// Consume bytes up to and including the next '\n' (or EOF), discarding
-/// them. Used to drain the remainder of an over-long line.
-async fn drain_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<()> {
+/// them. Used to drain the remainder of an over-long line. `last` is the
+/// last octet already consumed before the drain. Returns whether the line
+/// ended with CRLF (false for a bare LF or EOF).
+async fn drain_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    mut last: Option<u8>,
+) -> std::io::Result<bool> {
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         match buf.iter().position(|&b| b == b'\n') {
             Some(pos) => {
+                let before = if pos > 0 { Some(buf[pos - 1]) } else { last };
                 reader.consume(pos + 1);
-                return Ok(());
+                return Ok(before == Some(b'\r'));
             }
             None => {
                 let n = buf.len();
+                last = buf.last().copied();
                 reader.consume(n);
             }
         }
@@ -423,10 +439,25 @@ pub trait SmtpSession {
                 session_state.greeted = true;
             }
 
+            // Whether the previous message-data line ended with a bare LF.
+            // The DATA terminator is `<CRLF>.<CRLF>`: a `.` line only ends
+            // the transfer when the line before it ended with CRLF.
+            // Otherwise `<LF>.<CRLF>` would end DATA here while an upstream
+            // relay treats it as body text — the SMTP-smuggling parser
+            // differential (CVE-2023-51764 class). Such a `.` line is
+            // message data; it is handed to the handler dot-stuffed so
+            // the ordinary unstuffing delivers it as a literal ".".
+            let mut after_bare_lf = false;
+
             loop {
-                let cap = match session_state.state {
-                    SmtpState::Data | SmtpState::Discard => Self::MAX_DATA_LINE,
-                    _ => Self::MAX_CMD_LINE,
+                let in_data = matches!(session_state.state, SmtpState::Data | SmtpState::Discard);
+                if !in_data {
+                    after_bare_lf = false;
+                }
+                let cap = if in_data {
+                    Self::MAX_DATA_LINE
+                } else {
+                    Self::MAX_CMD_LINE
                 };
 
                 let line = match timeout(
@@ -444,7 +475,13 @@ pub trait SmtpSession {
                 };
 
                 match line {
-                    Line::Complete(line) => {
+                    Line::Complete(mut line) => {
+                        if in_data {
+                            if after_bare_lf && line == b".\r\n" {
+                                line.insert(0, b'.');
+                            }
+                            after_bare_lf = line.ends_with(b"\n") && !line.ends_with(b"\r\n");
+                        }
                         let (reply, next) = self.handler(&session_state.state, &line).await;
                         session_state.state = next;
                         if !reply.is_empty() {
@@ -459,7 +496,7 @@ pub trait SmtpSession {
                             _ => {}
                         }
                     }
-                    Line::Overflow { terminated, .. } => {
+                    Line::Overflow { terminated, last } => {
                         // Only drain when the line's newline is still on
                         // the wire; a line that arrived fully within one
                         // buffered chunk was already consumed to its end.
@@ -468,16 +505,19 @@ pub trait SmtpSession {
                         // silent mid-line must not block the session
                         // forever.
                         let drained = if terminated {
-                            Ok(Ok(()))
+                            Ok(Ok(last == Some(b'\r')))
                         } else {
                             timeout(
                                 Duration::from_millis(*max_read_duration_ms),
-                                drain_line(stream),
+                                drain_line(stream, last),
                             )
                             .await
                         };
-                        if !matches!(drained, Ok(Ok(()))) {
+                        let Ok(Ok(ended_crlf)) = drained else {
                             return Ok(EndReason::Closed);
+                        };
+                        if in_data {
+                            after_bare_lf = !ended_crlf;
                         }
                         match session_state.state {
                             SmtpState::Data => {
@@ -2203,6 +2243,67 @@ mod tests {
         );
         assert_eq!(session.end_data_calls, 1);
         assert_eq!(session.helo.as_deref(), Some("client.example"));
+    }
+
+    /// SMTP smuggling, `<LF>.<CRLF>` variant (CVE-2023-51764): a `.` line
+    /// only terminates DATA when the line before it ended with CRLF.
+    /// After a bare-LF line, `.<CRLF>` is message data, so the smuggled
+    /// commands that follow stay in the body and never reach the
+    /// command parser.
+    #[tokio::test]
+    async fn lf_dot_crlf_does_not_terminate_data() {
+        let (client, server) = duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let task = tokio::spawn(async move {
+            let mut session = TestSession::default();
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &2000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+
+        let mut client = BufReader::new(client);
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        client.write_all(b"HELO client.example\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client.write_all(b"MAIL FROM:<a@b>\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client.write_all(b"RCPT TO:<c@d>\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut client).await;
+
+        client
+            .write_all(b"first\n.\r\nMAIL FROM:<evil@x>\r\nlast\r\n.\r\n")
+            .await
+            .unwrap();
+        // Exactly one end-of-data reply: the real terminator.
+        assert_eq!(read_reply(&mut client).await, "250 accepted\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "221 Bye\r\n");
+        drop(client);
+
+        let (session, result) = task.await.unwrap();
+        result.unwrap();
+        assert_eq!(session.end_data_calls, 1);
+        assert_eq!(
+            session.data_lines,
+            vec![
+                b"first\n".to_vec(),
+                b".\r\n".to_vec(),
+                b"MAIL FROM:<evil@x>\r\n".to_vec(),
+                b"last\r\n".to_vec(),
+            ]
+        );
+        assert_eq!(session.mail_from.as_deref(), Some("<a@b>"));
     }
 
     /// An over-long command line is answered with 500 and the session

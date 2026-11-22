@@ -19,7 +19,7 @@ pub enum Token<'source> {
     All(&'source str),
 
     /// `include:<domain>`.
-    #[regex(r"include:[\x21-\x24\x26-\x7E]*\s*", |lex| lex.slice().trim())]
+    #[regex(r"include:[\x21-\x7E]*\s*", |lex| lex.slice().trim())]
     Include(&'source str),
 
     /// `a[:domain-spec]`.

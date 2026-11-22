@@ -10,9 +10,10 @@
 > rejection). The DNS resolver is configurable (`--resolver` / config
 > file, default 1.1.1.1); accepted messages are **durably spooled and
 > delivered to local maildirs**. The external security review
-> (REPORT.md) is triaged in §6: all four critical findings are fixed
-> and regression-tested; the remaining highs/medias are tracked there.
-> Workspace state: **185 tests, 0 failures,
+> (REPORT.md) is triaged in §6: all critical and high findings (and the
+> round-2 findings N1–N7) are fixed and regression-tested; the medium
+> and low findings are tracked there.
+> Workspace state: **193 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -524,37 +525,27 @@ work is additive rather than a rewrite.
 
 An external security review (commit `6b0a655`) reported **4 critical,
 8 high, 17 medium, and 12 low** findings, several verified against the
-running binary. Fixed in this pass:
+running binary. A round-2 re-review found gaps in the first fixes
+(N1–N7); round 3 closed them along with the remaining highs. Fixed:
 
 | # | Sev | Finding | Verdict |
 |---|---|---|---|
-| C1 | **Critical** | Path traversal in maildir delivery: any RCPT local-part could write files anywhere the service user could write (`/` and `..` in local-parts; `Path::join` with an absolute path discards the root) | **FIXED** — RCPT-time local-part validation (mailbox-safe set: alnum + `. _ + = -`, no leading dot, no `..`, ≤64 octets, else `501`) plus sink-side component validation as defense in depth; traversal/unusual-local-part regression tests |
-| C2 | **Critical** | SMTP smuggling: `RSET` (and any verb) inside DATA ran as commands; bare-LF `.` terminated DATA (CVE-2023-51764/51765/51766 class) — a relay passing such a body would inject a spoofed message from its own trusted IP | **FIXED** — `Data`/`Discard` are pure framing modes: every line is data, the ONLY exit is `<CRLF>.<CRLF>`; a bare-LF `.` is an empty data line. Full CVE-scenario regression test; DESIGN §4.1 updated |
-| C3 | **Critical** | DKIM verdicts accumulated across messages on one connection, so a replayed genuine signature made a later unsigned spoof pass DMARC | **FIXED** — DMARC consumes only the current message's results; regression test (fake verified facebook.com verdict + unsigned spoof of the same domain must still be rejected; live DNS) |
-| C4 | **Critical** | DMARC was skipped whenever the header parser failed (duplicate `From:`, any 8-bit header byte, grammar failure) — an attacker could dodge `p=reject` with one bad byte | **FIXED** — From domain extracted from raw bytes with a tolerant byte-level scan (folding handled, `From:`-in-body ignored); no `From:` / multiple `From:` / unparseable From are hard `550 5.7.1` rejects per RFC 7489 §6.6.1; extractor unit tests + integration test |
+| C1 | **Critical** | Path traversal in maildir delivery: any RCPT local-part could write files anywhere the service user could write (`/` and `..` in local-parts; `Path::join` with an absolute path discards the root) | **FIXED** — RCPT-time local-part validation (RFC 5321 dot-atom text minus `/`, no leading dot, no `..`, ≤64 octets, else `553 5.1.3`; round 3 widened the set so `o'brien@` works — N4) plus sink-side component validation as defense in depth; traversal/unusual-local-part regression tests |
+| C2 | **Critical** | SMTP smuggling: `RSET` (and any verb) inside DATA ran as commands; bare-LF `.` terminated DATA (CVE-2023-51764/51765/51766 class) — a relay passing such a body would inject a spoofed message from its own trusted IP | **FIXED** — `Data`/`Discard` are pure framing modes: every line is data, the ONLY exit is `<CRLF>.<CRLF>`; a bare-LF `.` is an empty data line. Round 3 (N1): `.<CRLF>` only terminates after a CRLF-terminated line — `<LF>.<CRLF>` is data (read loop tracks the previous ending, incl. over-long lines). Framing regression tests over a duplex; DESIGN §4.1 updated |
+| C3 | **Critical** | DKIM verdicts accumulated across messages on one connection, so a replayed genuine signature made a later unsigned spoof pass DMARC | **FIXED** — DMARC consumes only the current message's results; regression test (fake verified facebook.com verdict + unsigned spoof of the same domain must still be rejected). Round 3 (N6): hermetic, served by a local mock DoT resolver |
+| C4 | **Critical** | DMARC was skipped whenever the header parser failed (duplicate `From:`, any 8-bit header byte, grammar failure) — an attacker could dodge `p=reject` with one bad byte | **FIXED** — From domain extracted from raw bytes with a tolerant byte-level scan (folding handled, `From:`-in-body ignored); no `From:` / multiple `From:` / unparseable From are hard `550 5.7.1` rejects per RFC 7489 §6.6.1. Round 3 (N2, N3): the value is read as an RFC 5322 mailbox-list — folded lines kept, comments and quoted strings never supply the `@`, `From :` counts, several author domains are `Multiple`; extractor unit tests + integration test |
 | H1 | High | SPF `a`/`mx`/`ptr`/`exists` queried type 22 (NSAP-PTR) instead of type 1 (A) — those mechanisms never matched, legitimate senders got `550`, void budgets tripped | **FIXED** — type 1; wire-level regression test runs `DotResolver` against a mock DoT server and asserts the qtype byte. *Open: AAAA for IPv6 senders* |
 | H4 | High | Message body lines starting with `QUIT`/`RSET` ended the session mid-DATA (undeliverable mail) | **FIXED** — same framing change as C2 |
 | H5 | High | Each refused connection ran inline in the accept loop (up to ~2.5 s), so an attacker holding the connection budgets stalled ALL accepts — the limiter as amplifier | **FIXED** — refusals spawn into a bounded permit pool (32); when saturated, sockets close without the courtesy reply |
 | H8 | High | Grace-mode domains refused every *permanent* mailbox (`is_some_and` treated `expires: null` as expired) | **FIXED** — `is_none_or`; `grace-days` capped at 366 (bounded arithmetic); permanent + future-expiry regression tests |
-| M15 | Medium | Authority hot-reload: one bad publish made every RCPT `451` until fixed, and re-parsed the broken file per RCPT | **FIXED** — last-good snapshot serves through a bad publish; failed change token memoized (no per-RCPT re-parse); change token is (mtime, size); next good publish applies |
-| H6 | High | One serialized DNS connection shared process-wide; connect had NO timeout — a black-holed resolver held the mutex ~2 min, and an attacker-chosen slow record stalled every session's lookups | **PARTIALLY FIXED** — connect is now bounded by the per-exchange timeout (mutex hold ≤ 2×timeout). *Open: true pooling/pipelining for concurrency; see also L2 (cache eviction)* |
+| M15 | Medium | Authority hot-reload: one bad publish made every RCPT `451` until fixed, and re-parsed the broken file per RCPT | **FIXED** — last-good snapshot serves through a bad publish; failed change token memoized (no per-RCPT re-parse); change token is (mtime, size); next good publish applies. Round 3 (N5): a failed reload is logged at `error` (stale policy is never silent) |
+| H6 | High | One serialized DNS connection shared process-wide; connect had NO timeout — a black-holed resolver held the mutex ~2 min, and an attacker-chosen slow record stalled every session's lookups | **FIXED** — connect bounded by the per-exchange timeout, and `DnsClient` now holds a pool of 8 connections (one exchange each), so a slow lookup occupies one slot instead of every session's DNS; regression test (slow lookup in flight, unrelated lookup completes immediately). *Open: pipelining; see also L2 (cache eviction)* |
+| H2 | High | SPF macro expansion replaced every letter after the first `%` | **FIXED** — RFC 7208 §7 expander (letters, digit/`r` transformers, delimiters, `%%`/`%_`/`%-`, URL-escaping, 253-octet truncation; IPv6 nibble `%{i}`, epoch `%{t}`, `%{p}` = `unknown`); `include:` lexes `%`; RFC §7.4 example tests |
+| H3 | High | ESMTP parameters (`SIZE=`, `BODY=`) ended up inside the address: SPF bypass, bounces with `SIZE=` refused | **FIXED** — `<path> [params]` split (RFC 5321 §4.1.2); `SIZE=` over the limit → `552` at MAIL; control characters in paths refused |
+| H7 | High | Unlimited DKIM signatures per message (CPU + DNS amplification) | **FIXED** — at most `dkim::MAX_SIGNATURES` (5, topmost) evaluated; offline regression test |
 
 **Open findings** (see REPORT.md for full detail; roughly priority order):
 
-- **H2 (high)**: SPF macro expansion is broken — every letter after the
-  first `%` is replaced, corrupting domain-specs of large senders
-  (Salesforce, Mimecast…). Real fix: an RFC 7208 §7 macro parser.
-  Interim mitigation option: PermError for any record containing macros
-  (safe, honest) instead of guessing.
-- **H3 (high)**: ESMTP parameters (`SIZE=`, `BODY=`) end up inside the
-  address: SPF bypass (bogus domain → NXDOMAIN → `None`) and every
-  null-sender bounce carrying `SIZE=` is refused. Fix: parse
-  `Reverse-path [SP parameters]` per RFC 5321 §4.1.2 and enforce
-  `SIZE=` against the advertised limit. (Overlaps Phase 9.)
-- **H7 (high)**: unlimited DKIM signatures per message, on the async
-  executor (CPU + DNS amplification; >10k signature headers in 1 MiB).
-  Fix: cap evaluated signatures (5–10), dedupe body-hash work, move
-  verification to `spawn_blocking` under a deadline.
 - **M1**: SPF parser stops silently at the first unrecognized term and
   the lexer is case-sensitive (`-ALL` dropped → Neutral instead of
   Fail; `v=spf10` matches). Fix: PermError on any unparseable term,
@@ -573,7 +564,7 @@ running binary. Fixed in this pass:
 - **M7**: no `Authentication-Results:` header added; forged inbound ones
   are not stripped (RFC 8601).
 - **M8**: trace-header injection — HELO/MAIL FROM free text (incl. bare
-  CR) is copied verbatim into `Received:`/`Return-Path:`. Validate HELO
+  CR) is copied verbatim into `Received:`/`Return-Path:`. *(Round 3: control characters in MAIL/RCPT paths are now refused; HELO validation still open.)* Validate HELO
   as domain/literal and reject control characters.
 - **M9**: catch-all deliveries collapse into one copy (idempotency key
   must include the envelope address — the temp-mail use case depends on
@@ -622,16 +613,15 @@ running binary. Fixed in this pass:
   backends build on them.
 
 **Test-coverage gaps** the report mapped to findings — the regression
-tests added this pass close C1, C2, C3, C4, H1, and H8; the others
+tests added in rounds 1–3 close C1–C4, H1–H8, and N1–N6; the others
 should be written alongside their fixes.
 
 ---
 
 ## 7. Quick-reference: current priority list
 
-1. **Security-report open findings** (§6): H3 (ESMTP parameter parsing —
-   SPF bypass), H2 (SPF macros — PermError interim), H7 (DKIM caps),
-   then the M-tier, highest-value first (M9 idempotency, M11
+1. **Security-report open findings** (§6): the critical and high
+   tiers are closed; next is the M-tier, highest-value first (M9 idempotency, M11
    commit/reply, M6/M4/M5 DMARC correctness, M12 limiter RAII,
    M14 storage hygiene).
 2. **Phase 10 — Ops** (rate limiting/RCPT-probe caps — catch-all

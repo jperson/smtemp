@@ -1034,6 +1034,34 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
     /// Live: fetch protonmail's real DKIM key over DNS-over-TLS.
     /// Opt-in because it touches the network.
+    /// H7 (security report): no matter how many signature headers a
+    /// message carries, at most MAX_SIGNATURES are evaluated (each one
+    /// costs a DNS lookup, a body hash, and a public-key operation). The
+    /// resolver points at a closed local port, so every key lookup fails
+    /// fast and offline.
+    #[tokio::test]
+    async fn signature_count_is_capped() {
+        let mut raw = Vec::new();
+        for i in 0..50 {
+            raw.extend_from_slice(
+                format!(
+                    "DKIM-Signature: v=1; a=rsa-sha256; d=d{i}.invalid; s=s; h=From; bh=AAAA; b=AAAA\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        raw.extend_from_slice(b"From: a@example.org\r\n\r\nbody\r\n");
+
+        let resolver = DnsClient::with_timeout(
+            "127.0.0.1".parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        );
+        let results = verify_dkim(&raw, &resolver).await;
+        assert_eq!(results.len(), MAX_SIGNATURES);
+        // The topmost signatures are the ones evaluated.
+        assert_eq!(results[0].signature.domain, "d0.invalid");
+    }
+
     #[tokio::test]
     #[ignore = "hits live DNS (DoT to 1.1.1.1)"]
     async fn live_fetch_public_key() {
@@ -1349,10 +1377,20 @@ pub fn verify_with_key<'m>(
     }
 }
 
+/// The most signatures [`verify_dkim`] evaluates per message (H7,
+/// security report). Each signature costs a key lookup, a full body
+/// canonicalization + hash, and a public-key operation; without a cap a
+/// 1 MiB message could carry >10,000 signature headers. Legitimate mail
+/// carries a handful (author domain, ESP, a forwarder or two), so the
+/// topmost (most recently added) signatures are evaluated and the rest
+/// are ignored — an ignored signature simply contributes no pass.
+pub const MAX_SIGNATURES: usize = 5;
+
 /// Verify every DKIM signature on a raw message: parse, check body hashes,
 /// fetch each signer's public key over DNS-over-TLS, and cryptographically
 /// verify the signed header data. Returns one result per signature; an
-/// empty result means the message had no parseable DKIM signature.
+/// empty result means the message had no parseable DKIM signature. At
+/// most [`MAX_SIGNATURES`] signatures (the topmost) are evaluated.
 pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimResult<'m>> {
     let Ok(msg) = parse_message(raw) else {
         return Vec::new();
@@ -1364,7 +1402,7 @@ pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimRes
         .unwrap_or(0);
 
     let mut results = Vec::new();
-    for parsed in find_signatures(&msg) {
+    for parsed in find_signatures(&msg).into_iter().take(MAX_SIGNATURES) {
         let result = match fetch_public_key(resolver, &parsed.signature).await {
             Ok(key) => verify_with_key(&msg, &parsed, &key, now),
             Err(e) => DkimResult {

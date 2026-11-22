@@ -264,6 +264,9 @@ const SPF_TEMPFAIL: &[u8] = b"451 4.4.3 Temporary SPF failure\r\n";
 const SPF_PERMERROR: &[u8] = b"550 5.7.7 SPF policy error\r\n";
 /// Malformed address in a MAIL FROM path.
 const BAD_ADDRESS: &[u8] = b"501 5.1.7 Bad sender address syntax\r\n";
+/// Malformed or unacceptable address in a RCPT TO path (RFC 3463: 5.1.3
+/// bad destination mailbox address syntax).
+const BAD_RCPT: &[u8] = b"553 5.1.3 Bad recipient address syntax\r\n";
 /// RFC 5321 Section 4.5.3.1.8: at least 100 recipients.
 const MAX_RCPT: usize = 100;
 /// RFC 5321 Section 3.3: DATA with no accepted recipients.
@@ -272,14 +275,43 @@ const NO_RECIPIENTS: &[u8] = b"503 5.5.1 No valid recipients\r\n";
 /// limit; the rest of the transfer is discarded.
 const MESSAGE_TOO_BIG: &[u8] = b"552 5.3.4 Message size exceeds fixed maximum message size\r\n";
 
-/// The address inside a MAIL FROM / RCPT TO path argument: strips
-/// surrounding whitespace and angle brackets. An empty result is the null
-/// sender (`MAIL FROM:<>`).
-fn clean_path(raw: &str) -> &str {
-    raw.trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim()
+/// Split a MAIL FROM / RCPT TO argument into the address inside the path
+/// and the trailing ESMTP parameters (RFC 5321 Section 4.1.2:
+/// `Path [SP Mail-parameters]`). The path is the text between `<` and the
+/// first `>`; a bare unbracketed address (accepted for leniency) ends at
+/// the first whitespace. An empty address is the null sender
+/// (`MAIL FROM:<>`).
+///
+/// Returns `None` for an unterminated `<` or an address containing
+/// control characters (a bare CR would otherwise reach the generated
+/// `Return-Path:`/`Received:` headers).
+fn clean_path(raw: &str) -> Option<(&str, &str)> {
+    let raw = raw.trim();
+    let (addr, params) = match raw.strip_prefix('<') {
+        Some(rest) => {
+            let close = rest.find('>')?;
+            (rest[..close].trim(), rest[close + 1..].trim())
+        }
+        None => match raw.find(char::is_whitespace) {
+            Some(i) => (&raw[..i], raw[i..].trim()),
+            None => (raw, ""),
+        },
+    };
+    if addr.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    Some((addr, params))
+}
+
+/// The value of the `SIZE=` ESMTP parameter (RFC 1870), if present and
+/// numeric.
+fn size_param(params: &str) -> Option<u64> {
+    params.split_ascii_whitespace().find_map(|p| {
+        let (key, value) = p.split_once('=')?;
+        key.eq_ignore_ascii_case("SIZE")
+            .then(|| value.parse().ok())
+            .flatten()
+    })
 }
 
 /// The domain of an address path: after the last '@'.
@@ -293,9 +325,11 @@ fn path_domain(addr: &str) -> Option<&str> {
 ///
 /// Returns `Some(reason)` when the address must be refused: the
 /// local-part is empty, longer than RFC 5321's 64-octet limit, contains
-/// anything outside the mailbox-safe set (ASCII alphanumerics plus
-/// `.`, `_`, `+`, `=`, `-`), or has path-oddities like a leading dot or
-/// a `..` run.
+/// anything outside the mailbox-safe set, or has path-oddities like a
+/// leading dot or a `..` run. The safe set is RFC 5321 dot-atom text
+/// (`atext` plus `.`) **minus `/`**, the one atext character with path
+/// meaning — so ordinary addresses such as `o'brien@` keep working.
+/// Quoted local-parts are refused (server policy).
 fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     let local = addr.rsplit_once('@')?.0;
     if local.is_empty() {
@@ -307,13 +341,36 @@ fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     if local.starts_with('.') || local.contains("..") {
         return Some("dot-run in local-part");
     }
-    if !local
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'=' | b'-'))
-    {
+    if !local.bytes().all(is_mailbox_safe) {
         return Some("character outside the mailbox-safe set");
     }
     None
+}
+
+/// RFC 5321 `atext` plus `.`, excluding `/` (see [`unsafe_local_part`]).
+fn is_mailbox_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'.' | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+        )
 }
 
 /// The outcome of scanning a raw message for its `From:` header (C4:
@@ -335,40 +392,44 @@ enum FromHeader {
 ///
 /// Works on bytes, not UTF-8 (real 8-bit mail exists), and never fails:
 /// every outcome is one of the [`FromHeader`] variants. Only the header
-/// block is scanned (up to the first empty line), `From:` is matched
-/// case-insensitively on the header name, folded continuation lines are
-/// folded into the value, and the domain is everything after the last
-/// `@` up to the first character that cannot appear in a domain
-/// (whitespace, `,`, `;`, `>`, `<`, `"`, or a control character).
+/// block is scanned (up to the first empty line), the `From` header name
+/// is matched case-insensitively (including the obsolete `From :` form
+/// with whitespace before the colon, RFC 5322 Section 4.5.3), folded
+/// continuation lines are unfolded into the value, and the value is read
+/// as an RFC 5322 mailbox-list (see [`from_domain_of`]).
 fn from_header_domain(raw: &[u8]) -> FromHeader {
     // The header block ends at the first empty line.
     let end = header_block_end(raw);
     let header_block = &raw[..end];
 
     let mut from_values: Vec<Vec<u8>> = Vec::new();
-    let mut current: Option<Vec<u8>> = None;
+    // Whether the most recent header line was a From header (so its
+    // continuation lines belong to the last entry of `from_values`).
+    let mut in_from = false;
     for line in split_header_lines(header_block) {
         if line.starts_with(b" ") || line.starts_with(b"\t") {
-            // Folded continuation of the previous header.
-            if let Some(value) = current.as_mut() {
-                value.extend_from_slice(trim_header_fws(line));
+            // Folded continuation of the previous header (RFC 5322
+            // Section 2.2.3: unfolding removes only the line break).
+            if in_from {
+                if let Some(value) = from_values.last_mut() {
+                    value.push(b' ');
+                    value.extend_from_slice(trim_header_fws(line));
+                }
             }
             continue;
         }
-        current = None;
-        if is_from_header(line) {
-            let value = trim_header_fws(&line[b"From:".len()..]);
-            current = Some(value.to_vec());
-            from_values.push(value.to_vec());
+        match from_header_value(line) {
+            Some(value) => {
+                from_values.push(trim_header_fws(value).to_vec());
+                in_from = true;
+            }
+            None => in_from = false,
         }
     }
 
     match from_values.len() {
         0 => FromHeader::None,
-        1 => match from_domain_of(&from_values[0]) {
-            Some(domain) => FromHeader::Parsed(domain),
-            None => FromHeader::Unparseable,
-        },
+        1 => from_domain_of(&from_values[0]),
         _ => FromHeader::Multiple,
     }
 }
@@ -395,9 +456,20 @@ fn header_block_end(raw: &[u8]) -> usize {
     raw.len()
 }
 
-/// Is this header line a `From:` header (case-insensitive name)?
-fn is_from_header(line: &[u8]) -> bool {
-    line.len() > b"From:".len() && line[..b"From:".len()].eq_ignore_ascii_case(b"From:")
+/// If this header line is a `From` header, its value (everything after
+/// the colon). The name is matched case-insensitively and may be
+/// followed by whitespace before the colon (obsolete syntax that mail
+/// clients still display, so it must count as a From header).
+fn from_header_value(line: &[u8]) -> Option<&[u8]> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    let name = &line[..colon];
+    let name_end = name
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(0, |p| p + 1);
+    name[..name_end]
+        .eq_ignore_ascii_case(b"From")
+        .then(|| &line[colon + 1..])
 }
 
 /// Split a header block into lines, tolerating CRLF and bare LF (the
@@ -432,25 +504,116 @@ fn trim_header_fws(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
-/// The domain of a From header value: everything after the last `@` up
-/// to the first character that cannot appear in a domain or route.
-/// Returns `None` when there is no `@` or the result is not a plausible
-/// domain (non-empty, printable ASCII, no path/control characters).
-fn from_domain_of(value: &[u8]) -> Option<String> {
-    let at = value.iter().rposition(|&b| b == b'@')?;
-    let raw_domain = &value[at + 1..];
-    let end = raw_domain
-        .iter()
-        .position(|b| {
-            matches!(
-                b,
-                b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'>' | b'<' | b'"' | 0x00..=0x1f
-            )
-        })
-        .unwrap_or(raw_domain.len());
-    let domain = &raw_domain[..end];
-    // Strip a trailing dot (fully-qualified form) and any angle-bracket
-    // or route residue.
+/// The author domain of a From header value, read as an RFC 5322
+/// mailbox-list (`mailbox *("," mailbox)`, each mailbox either
+/// `addr-spec` or `[display-name] <addr-spec>`).
+///
+/// Comments (`(...)`, nestable) are removed and quoted strings are
+/// opaque, so an `@` inside either can never pick the domain — the
+/// domain is the one a mail client displays. Every mailbox in the list
+/// must yield a plausible domain (`Unparseable` otherwise), and a list
+/// whose mailboxes name more than one domain is `Multiple`: RFC 7489
+/// Section 6.6.1 lets the receiver reject rather than pick one author.
+fn from_domain_of(value: &[u8]) -> FromHeader {
+    // Pass 1: drop comments, blank out quoted-string contents.
+    let mut clean: Vec<u8> = Vec::with_capacity(value.len());
+    let (mut depth, mut in_quote, mut escaped) = (0usize, false, false);
+    for &b in value {
+        if escaped {
+            escaped = false;
+            if in_quote {
+                clean.push(b'x');
+            }
+            continue;
+        }
+        match b {
+            b'\\' if in_quote || depth > 0 => escaped = true,
+            b'"' if depth == 0 => {
+                in_quote = !in_quote;
+                clean.push(b'"');
+            }
+            _ if in_quote => clean.push(b'x'),
+            b'(' => depth += 1,
+            b')' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    clean.push(b' ');
+                }
+            }
+            _ if depth > 0 => {}
+            _ => clean.push(b),
+        }
+    }
+    if depth > 0 || in_quote || escaped {
+        return FromHeader::Unparseable;
+    }
+
+    // Pass 2: split into mailboxes at top-level commas (commas inside
+    // `<...>` belong to an obsolete route).
+    let mut mailboxes: Vec<&[u8]> = Vec::new();
+    let (mut angle, mut start) = (0usize, 0usize);
+    for (i, &b) in clean.iter().enumerate() {
+        match b {
+            b'<' => angle += 1,
+            b'>' => angle = angle.saturating_sub(1),
+            b',' if angle == 0 => {
+                mailboxes.push(&clean[start..i]);
+                start = i + 1;
+            }
+            // From is a mailbox-list: group syntax is not allowed.
+            b':' | b';' if angle == 0 => return FromHeader::Unparseable,
+            _ => {}
+        }
+    }
+    mailboxes.push(&clean[start..]);
+
+    let mut domain: Option<String> = None;
+    for mailbox in mailboxes {
+        let mailbox = trim_header_fws(mailbox);
+        if mailbox.is_empty() {
+            continue; // obs-mbox-list permits empty elements
+        }
+        let Some(found) = mailbox_domain(mailbox) else {
+            return FromHeader::Unparseable;
+        };
+        match &domain {
+            Some(d) if *d != found => return FromHeader::Multiple,
+            _ => domain = Some(found),
+        }
+    }
+    match domain {
+        Some(d) => FromHeader::Parsed(d),
+        None => FromHeader::Unparseable,
+    }
+}
+
+/// The domain of one cleaned mailbox (comments removed, quoted strings
+/// blanked): the addr-spec inside `<...>` when present, otherwise the
+/// whole mailbox. Returns `None` unless it is a plausible domain.
+fn mailbox_domain(mailbox: &[u8]) -> Option<String> {
+    let addr = match mailbox.iter().position(|&b| b == b'<') {
+        Some(open) => {
+            let rest = &mailbox[open + 1..];
+            let close = rest.iter().position(|&b| b == b'>')?;
+            if !trim_header_fws(&rest[close + 1..]).is_empty() {
+                return None; // trailing junk after the angle-addr
+            }
+            let inner = &rest[..close];
+            // Obsolete route (`@a,@b:addr`): the address follows the ':'.
+            match inner.iter().rposition(|&b| b == b':') {
+                Some(c) => &inner[c + 1..],
+                None => inner,
+            }
+        }
+        None => mailbox,
+    };
+    let addr = trim_header_fws(addr);
+    let at = addr.iter().rposition(|&b| b == b'@')?;
+    if at == 0 {
+        return None; // empty local-part
+    }
+    let domain = trim_header_fws(&addr[at + 1..]);
+    // Strip a trailing dot (fully-qualified form).
     let domain = domain.strip_suffix(b".").unwrap_or(domain);
     if domain.is_empty()
         || !domain
@@ -795,7 +958,15 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::reject(UserSession::MULTI_MAIL);
         }
 
-        let addr = clean_path(path).to_string();
+        let Some((addr, params)) = clean_path(path) else {
+            return smtp::Control::reject(BAD_ADDRESS);
+        };
+        // RFC 1870: a declared size over the advertised limit is refused
+        // up front, before any data is transferred.
+        if size_param(params).is_some_and(|size| size > self.max_data as u64) {
+            return smtp::Control::reject(MESSAGE_TOO_BIG);
+        }
+        let addr = addr.to_string();
 
         // RFC 7208 Section 2.4: the SPF identity is the MAIL FROM
         // address; the null sender falls back to the HELO identity
@@ -873,9 +1044,12 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::tempfail(b"452 4.5.3 Too many recipients\r\n");
         }
 
-        let addr = clean_path(path).to_string();
+        let Some((addr, _params)) = clean_path(path) else {
+            return smtp::Control::reject(BAD_RCPT);
+        };
+        let addr = addr.to_string();
         let Some(domain) = path_domain(&addr).map(str::to_ascii_lowercase) else {
-            return smtp::Control::reject(BAD_ADDRESS);
+            return smtp::Control::reject(BAD_RCPT);
         };
 
         // C1 (security report): the local-part becomes a filesystem path
@@ -889,7 +1063,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         // RFC's full atext set.
         if let Some(reason) = unsafe_local_part(&addr) {
             info!(rcpt = %addr, reason, "unsafe mailbox local-part refused");
-            return smtp::Control::reject(BAD_ADDRESS);
+            return smtp::Control::reject(BAD_RCPT);
         }
 
         // Relay access is closed and policy-owned by the authority: it
@@ -1657,12 +1831,135 @@ mod tests {
 
     #[test]
     fn clean_path_strips_brackets_and_space() {
-        assert_eq!(clean_path("<sender@example.org>"), "sender@example.org");
-        assert_eq!(clean_path(" <sender@example.org> "), "sender@example.org");
-        assert_eq!(clean_path("sender@example.org"), "sender@example.org");
+        let addr = |raw| clean_path(raw).map(|(a, _)| a);
+        assert_eq!(addr("<sender@example.org>"), Some("sender@example.org"));
+        assert_eq!(addr(" <sender@example.org> "), Some("sender@example.org"));
+        assert_eq!(addr("sender@example.org"), Some("sender@example.org"));
         // Null sender.
-        assert_eq!(clean_path("<>"), "");
-        assert_eq!(clean_path(""), "");
+        assert_eq!(addr("<>"), Some(""));
+        assert_eq!(addr(""), Some(""));
+    }
+
+    /// H3 (security report): ESMTP parameters after the path are split
+    /// off — they used to end up inside the address (SPF evaluated a
+    /// bogus `domain> SIZE=…` and bounces with `SIZE=` were refused).
+    #[test]
+    fn clean_path_splits_esmtp_parameters() {
+        assert_eq!(
+            clean_path("<ceo@bank.example> SIZE=1234 BODY=8BITMIME"),
+            Some(("ceo@bank.example", "SIZE=1234 BODY=8BITMIME"))
+        );
+        assert_eq!(clean_path("<> SIZE=1000"), Some(("", "SIZE=1000")));
+        assert_eq!(
+            clean_path("user@example.org SIZE=10"),
+            Some(("user@example.org", "SIZE=10"))
+        );
+        // Unterminated path, and a bare CR inside the address.
+        assert_eq!(clean_path("<user@example.org SIZE=10"), None);
+        assert_eq!(clean_path("<a\rX-Injected: yes@b.example>"), None);
+
+        assert_eq!(size_param("SIZE=1234 BODY=8BITMIME"), Some(1234));
+        assert_eq!(size_param("body=7bit size=99"), Some(99));
+        assert_eq!(size_param("BODY=8BITMIME"), None);
+        assert_eq!(size_param(""), None);
+    }
+
+    /// N4 (security report): ordinary RFC 5321 local-parts are accepted;
+    /// anything with path meaning is not.
+    #[test]
+    fn local_part_policy() {
+        for ok in [
+            "o'brien@x.test",
+            "info&sales@x.test",
+            "a+b=c@x.test",
+            "first.last@x.test",
+        ] {
+            assert_eq!(unsafe_local_part(ok), None, "{ok} must be accepted");
+        }
+        for bad in [
+            "../x@x.test",
+            "/abs@x.test",
+            "a/b@x.test",
+            ".hidden@x.test",
+            "a..b@x.test",
+            "a\\b@x.test",
+            "\"quoted\"@x.test",
+        ] {
+            assert!(unsafe_local_part(bad).is_some(), "{bad} must be refused");
+        }
+    }
+
+    /// N2/N3 (security report): the From scanner reads an RFC 5322
+    /// mailbox-list. Folded values are unfolded, comments and quoted
+    /// strings never contribute an `@`, the obsolete `From :` spelling
+    /// counts as a From header, and several author domains are refused.
+    #[test]
+    fn from_header_scanner() {
+        let scan = |headers: &str| from_header_domain(format!("{headers}\r\nbody\r\n").as_bytes());
+        let parsed = |d: &str| FromHeader::Parsed(d.to_string());
+
+        // Simple and display-name forms.
+        assert_eq!(scan("From: a@Example.ORG\r\n"), parsed("example.org"));
+        assert_eq!(
+            scan("From: \"Doe, John\" <j@example.org>\r\n"),
+            parsed("example.org")
+        );
+        // N2: a folded From keeps its continuation lines.
+        assert_eq!(
+            scan("From: \"A Rather Long Display Name\"\r\n <news@example.net>\r\nSubject: x\r\n"),
+            parsed("example.net")
+        );
+        // 8-bit display name (not UTF-8) is fine.
+        assert_eq!(
+            from_header_domain(b"From: \xe9t\xe9 <a@example.org>\r\n\r\nbody\r\n"),
+            parsed("example.org")
+        );
+        // Quoted local-part containing '@'.
+        assert_eq!(scan("From: \"a@b\"@example.org\r\n"), parsed("example.org"));
+
+        // N3: an '@' inside a comment or quoted string never picks the domain.
+        assert_eq!(
+            scan("From: ceo@paypal.com (@attacker.example )\r\n"),
+            parsed("paypal.com")
+        );
+        assert_eq!(
+            scan("From: \"x@attacker.example\" <ceo@paypal.com>\r\n"),
+            parsed("paypal.com")
+        );
+        // N3: several author domains are refused; one domain twice is fine.
+        assert_eq!(
+            scan("From: ceo@paypal.com, x@attacker.example\r\n"),
+            FromHeader::Multiple
+        );
+        assert_eq!(
+            scan("From: a@example.org, b@example.org\r\n"),
+            parsed("example.org")
+        );
+        // N3: `From :` (obsolete spacing) is a From header too.
+        assert_eq!(
+            scan("From : ceo@paypal.com\r\nFrom: x@attacker.example\r\n"),
+            FromHeader::Multiple
+        );
+        // C4 outcomes.
+        assert_eq!(scan("Subject: none\r\n"), FromHeader::None);
+        assert_eq!(
+            scan("From: a@example.org\r\nfrom: b@example.org\r\n"),
+            FromHeader::Multiple
+        );
+        assert_eq!(scan("From: no-address-here\r\n"), FromHeader::Unparseable);
+        assert_eq!(
+            scan("From: a@example.org (unclosed\r\n"),
+            FromHeader::Unparseable
+        );
+        assert_eq!(
+            scan("From: group: a@example.org;\r\n"),
+            FromHeader::Unparseable
+        );
+        // A From line in the body is not a header.
+        assert_eq!(
+            from_header_domain(b"Subject: x\r\n\r\nFrom: a@example.org\r\n"),
+            FromHeader::None
+        );
     }
 
     #[test]
@@ -2161,7 +2458,7 @@ mod tests {
         client.write_all(b"RCPT TO:<no-at-sign>\r\n").await.unwrap();
         assert_eq!(
             read_reply(&mut client).await[0],
-            "501 5.1.7 Bad sender address syntax\r\n"
+            "553 5.1.3 Bad recipient address syntax\r\n"
         );
         client.write_all(b"QUIT\r\n").await.unwrap();
     }
@@ -2516,7 +2813,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 read_reply(&mut client).await[0],
-                "501 5.1.7 Bad sender address syntax\r\n",
+                "553 5.1.3 Bad recipient address syntax\r\n",
                 "rcpt {rcpt:?} must be refused"
             );
         }
@@ -2564,13 +2861,90 @@ mod tests {
         client.write_all(b"QUIT\r\n").await.unwrap();
     }
 
+    /// A local DNS-over-TLS resolver for hermetic DMARC tests: every
+    /// `_dmarc.*` TXT query is answered `v=DMARC1; p=reject`, everything
+    /// else with an empty NOERROR answer. Returns a client wired to it.
+    async fn spawn_mock_dmarc_resolver() -> Arc<dns::DnsClient> {
+        use dns::proto::{DnsMessage, DnsResourceRecord, QType};
+        use tokio::io::AsyncReadExt as _;
+        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    while let Ok(len) = tls.read_u16().await {
+                        let mut buf = vec![0; usize::from(len)];
+                        if tls.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let Ok((_, query)) = DnsMessage::from_bytes(&buf) else {
+                            return;
+                        };
+                        let mut resp =
+                            DnsMessage::new(query.header.transaction_id, query.questions.clone());
+                        resp.header.qr = 1;
+                        if let Some(q) = query.questions.first() {
+                            if String::from(&q.name).starts_with("_dmarc.") && q.record_type == 16 {
+                                resp.answers.push(DnsResourceRecord {
+                                    name: q.name.clone(),
+                                    record_type: 16,
+                                    record_class: 1,
+                                    ttl: 60,
+                                    rdlength: 0,
+                                    rdata: QType::TXT("v=DMARC1; p=reject".to_string()),
+                                });
+                            }
+                        }
+                        let bytes = resp.to_vec().unwrap();
+                        if tls.write_u16(bytes.len() as u16).await.is_err()
+                            || tls.write_all(&bytes).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = Arc::new(
+            tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        Arc::new(dns::DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            client_config,
+            Duration::from_secs(5),
+            Some(format!("127.0.0.1:{port}")),
+        ))
+    }
+
     /// C3 (security report): DKIM verdicts must not leak across messages
     /// on one connection. A verified signature from an earlier message
     /// used to satisfy DMARC alignment for a later unsigned spoof of the
     /// same domain. Here a fake verified facebook.com verdict is left in
     /// the session, and an unsigned message `From: someone@facebook.com`
-    /// (a domain that publishes `p=reject`) must still be REJECTED —
+    /// (a domain whose DMARC record is `p=reject`) must still be REJECTED —
     /// the DMARC evaluation consumes only this message's results.
+    ///
+    /// N6 (security report): hermetic — DMARC records come from a local
+    /// mock DNS-over-TLS resolver, never the live internet.
     #[tokio::test]
     async fn dkim_verdicts_do_not_leak_across_messages() {
         let cfg = SessionConfig {
@@ -2580,7 +2954,7 @@ mod tests {
             authority: Arc::new(authority::StaticAuthority::new(vec![
                 "mail.test".to_string()
             ])),
-            dns: Arc::new(dns::DnsClient::new("1.1.1.1".parse().unwrap())),
+            dns: spawn_mock_dmarc_resolver().await,
             spool: None,
             sink: None,
         };

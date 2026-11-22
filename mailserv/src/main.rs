@@ -641,6 +641,63 @@ fn mail_from_reply(result: &SpfResult) -> smtp::Control {
     }
 }
 
+/// Log why an SPF evaluation ended in an error (the error is otherwise
+/// only visible as the TempError/PermError it maps to). An exceeded
+/// evaluation deadline is a `warn`: it means slow or unresponsive DNS for
+/// the sender's records, which operators should see.
+fn log_spf_error(identity: &str, domain: &str, error: &spf::SpfError) {
+    match error {
+        spf::SpfError::Deadline(limit) => warn!(
+            identity,
+            domain,
+            limit_ms = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            "spf evaluation exceeded its time limit; temperror"
+        ),
+        other => info!(identity, domain, error = %other, "spf evaluation error"),
+    }
+}
+
+/// How often the DNS client's metrics are logged.
+const DNS_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Log the DNS client's metrics once per [`DNS_STATS_INTERVAL`] while it
+/// is being used (DESIGN §6.1: the baseline for sizing the pool and for
+/// measuring pipelining). Counters are cumulative; the peaks cover the
+/// interval just ended. Quiet intervals (no new queries) are skipped.
+async fn report_dns_stats(dns: Arc<dns::DnsClient>) {
+    let mut ticker = tokio::time::interval(DNS_STATS_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick fires immediately
+    let mut last_queries = 0;
+    loop {
+        ticker.tick().await;
+        let s = dns.stats();
+        dns.reset_peaks();
+        if s.queries == last_queries {
+            continue;
+        }
+        last_queries = s.queries;
+        let misses = s.queries - s.cache_hits;
+        info!(
+            queries = s.queries,
+            cache_hits = s.cache_hits,
+            connects = s.connects,
+            connect_failures = s.connect_failures,
+            exchanges_ok = s.exchanges_ok,
+            exchange_errors = s.exchange_errors,
+            timeouts = s.timeouts,
+            waits = s.waits,
+            wait_mean_us = s.wait_total_us.checked_div(misses).unwrap_or(0),
+            wait_max_us = s.wait_max_us,
+            waiting = s.waiting,
+            in_flight = s.in_flight,
+            peak_in_flight = s.peak_in_flight,
+            pool_size = dns::POOL_SIZE,
+            "dns stats"
+        );
+    }
+}
+
 /// One DMARC verification outcome, summarized for structured logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct DmarcSummary {
@@ -811,9 +868,14 @@ impl smtp::SmtpSession for UserSession<'_> {
             {
                 Ok(result) => Some(result),
                 // Map evaluation errors to their results: transient DNS
-                // failures are TempError, unusable records and exhausted
-                // lookup budgets are PermError.
-                Err(e) => Some(e.to_result()),
+                // failures and an exceeded evaluation deadline are
+                // TempError, unusable records and exhausted lookup
+                // budgets are PermError. The reason is logged — it is
+                // otherwise lost in the mapping.
+                Err(e) => {
+                    log_spf_error("helo", h, &e);
+                    Some(e.to_result())
+                }
             }
         };
 
@@ -1011,9 +1073,13 @@ impl smtp::SmtpSession for UserSession<'_> {
                 {
                     Ok(result) => result,
                     // Map evaluation errors to their results: transient
-                    // DNS failures are TempError (retryable), unusable
-                    // records and exhausted lookup budgets are PermError.
-                    Err(e) => e.to_result(),
+                    // DNS failures and an exceeded evaluation deadline are
+                    // TempError (retryable), unusable records and
+                    // exhausted lookup budgets are PermError.
+                    Err(e) => {
+                        log_spf_error("mail_from", &domain, &e);
+                        e.to_result()
+                    }
                 }
             }
             // No SPF-checkable identity: nothing to assert.
@@ -1561,8 +1627,11 @@ async fn main() -> Result<()> {
     let dns_client = Arc::new(dns::DnsClient::new(config.resolver));
     info!(
         resolver = %config.resolver,
-        "DNS-over-TLS client ready (pooled connection, TTL cache)"
+        pool_size = dns::POOL_SIZE,
+        spf_deadline_ms = u64::try_from(spf::EVALUATION_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+        "DNS-over-TLS client ready (connection pool, TTL cache)"
     );
+    tokio::spawn(report_dns_stats(dns_client.clone()));
 
     // Connection caps (Phase 10): a server-wide semaphore plus per-IP
     // concurrency and connection-rate budgets, enforced in the accept

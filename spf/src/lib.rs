@@ -62,13 +62,17 @@ pub enum SpfError {
     /// The RFC 7208 §4.6.4 2-void-lookup budget was exceeded.
     #[error("SPF void lookup limit of {0} exceeded")]
     VoidLimit(usize),
+    /// The whole evaluation ran past its elapsed-time limit
+    /// ([`EVALUATION_DEADLINE`]); RFC 7208 §4.6.4 makes this a TempError.
+    #[error("SPF evaluation exceeded its {0:?} time limit")]
+    Deadline(Duration),
 }
 
 impl SpfError {
     /// The SPF result this error produces.
     pub fn to_result(&self) -> SpfResult {
         match self {
-            SpfError::Temp => SpfResult::TempError,
+            SpfError::Temp | SpfError::Deadline(_) => SpfResult::TempError,
             SpfError::Perm | SpfError::LookupLimit(_) | SpfError::VoidLimit(_) => {
                 SpfResult::PermError
             }
@@ -268,14 +272,27 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
     Ok(found)
 }
 
+/// The elapsed-time limit for one whole `check_host()` evaluation,
+/// across every DNS lookup it makes (DESIGN §6.1).
+///
+/// RFC 7208 §4.6.4: implementations SHOULD limit the total time spent
+/// evaluating `check_host()`, the limit SHOULD allow at least 20 seconds,
+/// and exceeding it SHOULD give `temperror`. Without it, a hostile record
+/// tree whose authoritative servers never answer could take the full
+/// lookup budget times the per-query DNS timeout (10 × 5 s, plus the
+/// include TXT lookups), holding the SMTP session and DNS connections for
+/// all of it.
+pub const EVALUATION_DEADLINE: Duration = Duration::from_secs(20);
+
 /// Evaluate `check_host()` for an identity (RFC 7208 Section 4). Each call
-/// gets a fresh lookup budget.
+/// gets a fresh lookup budget and the [`EVALUATION_DEADLINE`] time limit.
 ///
 /// Returns `Ok(SpfResult)` for every well-formed evaluation — including
 /// `None` (no record published), `SoftFail`, `TempError`, and
 /// `PermError`, which are *results*, not errors — so `Err` never escapes
 /// for record-level problems. The caller (SMTP policy) maps the result
-/// to a reply code.
+/// to a reply code. An evaluation that runs out of time returns
+/// `Err(SpfError::Deadline)`, which maps to `TempError`.
 pub async fn check_host<R>(
     resolver: &R,
     peer: IpAddr,
@@ -286,8 +303,28 @@ pub async fn check_host<R>(
 where
     R: SpfResolver + Sync,
 {
+    check_host_within(resolver, peer, sender, domain, helo, EVALUATION_DEADLINE).await
+}
+
+/// [`check_host`] with an explicit time limit (tests use a short one).
+pub async fn check_host_within<R>(
+    resolver: &R,
+    peer: IpAddr,
+    sender: &String,
+    domain: String,
+    helo: &Option<String>,
+    deadline: Duration,
+) -> std::result::Result<SpfResult, SpfError>
+where
+    R: SpfResolver + Sync,
+{
     let mut budget = Budget::default();
-    check_host_limited(resolver, peer, sender, domain, helo, &mut budget).await
+    tokio::time::timeout(
+        deadline,
+        check_host_limited(resolver, peer, sender, domain, helo, &mut budget),
+    )
+    .await
+    .unwrap_or(Err(SpfError::Deadline(deadline)))
 }
 
 /// The recursive `check_host()` core, carrying the RFC 7208
@@ -667,6 +704,79 @@ mod tests {
             &Some(domain.to_string()),
         )
         .await
+    }
+
+    /// A resolver whose every lookup takes `delay` (an authoritative
+    /// server that answers slowly, or never within the DNS timeout).
+    struct SlowResolver {
+        inner: MockResolver,
+        delay: std::time::Duration,
+    }
+
+    impl SpfResolver for SlowResolver {
+        async fn txt(&self, domain: &str) -> Result<Vec<String>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.txt(domain).await
+        }
+        async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.a(domain).await
+        }
+        async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.mx(domain).await
+        }
+        async fn ptr(&self, domain: &str) -> Result<Vec<String>> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.ptr(domain).await
+        }
+    }
+
+    /// DESIGN §6.1 / RFC 7208 §4.6.4: the whole evaluation has an
+    /// elapsed-time limit. A chain of includes whose lookups are each
+    /// slow stops at the limit with TempError instead of running for
+    /// lookups × per-query timeout; a fast evaluation is unaffected.
+    #[tokio::test]
+    async fn evaluation_deadline_gives_temperror() {
+        let mut inner = MockResolver::default();
+        for i in 0..8 {
+            inner.txt.insert(
+                format!("hop{i}.test"),
+                vec![format!("v=spf1 include:hop{}.test -all", i + 1)],
+            );
+        }
+        inner
+            .txt
+            .insert("hop8.test".into(), vec!["v=spf1 +all".into()]);
+        let slow = SlowResolver {
+            inner: inner.clone(),
+            delay: std::time::Duration::from_millis(100),
+        };
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let sender = "a@hop0.test".to_string();
+
+        // 9 slow TXT lookups (~900 ms) against a 300 ms limit.
+        let started = std::time::Instant::now();
+        let result = check_host_within(
+            &slow,
+            peer,
+            &sender,
+            "hop0.test".into(),
+            &None,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SpfError::Deadline(_))),
+            "got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().to_result(), SpfResult::TempError);
+        assert!(started.elapsed() < std::time::Duration::from_millis(600));
+
+        // The same tree on a fast resolver finishes inside the default
+        // limit and reaches the final +all.
+        let result = check_host(&inner, peer, &sender, "hop0.test".into(), &None).await;
+        assert_eq!(result, Ok(SpfResult::Pass));
     }
 
     /// Reddit's real recorded SPF record: the listed IP passes through

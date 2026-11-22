@@ -11,8 +11,10 @@ use anyhow::{anyhow, Context, Result};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rustls_pki_types::ServerName;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -236,6 +238,82 @@ fn cache_ttl(resp: &DnsMessage) -> Option<Duration> {
     Some(Duration::from_secs(ttl.min(MAX_CACHE_TTL)))
 }
 
+/// Live counters and gauges for a [`DnsClient`] (DESIGN §6.1: the
+/// baseline for sizing the connection pool and measuring pipelining).
+///
+/// Everything is a lock-free atomic. The gauges (`waiting`, `in_flight`)
+/// are maintained by drop guards, so a query whose future is cancelled
+/// mid-wait or mid-exchange still decrements them.
+#[derive(Debug, Default)]
+struct DnsStats {
+    queries: AtomicU64,
+    cache_hits: AtomicU64,
+    connects: AtomicU64,
+    connect_failures: AtomicU64,
+    exchanges_ok: AtomicU64,
+    exchange_errors: AtomicU64,
+    timeouts: AtomicU64,
+    waits: AtomicU64,
+    wait_total_us: AtomicU64,
+    wait_max_us: AtomicU64,
+    waiting: AtomicU64,
+    in_flight: AtomicU64,
+    peak_in_flight: AtomicU64,
+}
+
+/// A point-in-time copy of a [`DnsClient`]'s metrics, from
+/// [`DnsClient::stats`]. Counters are cumulative since the client was
+/// created; `wait_max_us` and `peak_in_flight` are peaks since the last
+/// [`DnsClient::reset_peaks`] (or creation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DnsStatsSnapshot {
+    /// Calls to [`DnsClient::query`].
+    pub queries: u64,
+    /// Queries answered from the TTL cache (no network).
+    pub cache_hits: u64,
+    /// Connection attempts (TCP + TLS) started.
+    pub connects: u64,
+    /// Connection attempts that failed or timed out.
+    pub connect_failures: u64,
+    /// Exchanges that returned a validated response.
+    pub exchanges_ok: u64,
+    /// Exchanges that failed at the connection or protocol level (the
+    /// connection was discarded).
+    pub exchange_errors: u64,
+    /// Exchanges (or connects) that hit the per-exchange timeout.
+    pub timeouts: u64,
+    /// Cache misses that found every pooled connection busy and had to
+    /// wait for one.
+    pub waits: u64,
+    /// Total time cache misses spent waiting for a connection, in
+    /// microseconds (divide by `queries - cache_hits` for the mean).
+    pub wait_total_us: u64,
+    /// Longest single wait for a connection, in microseconds.
+    pub wait_max_us: u64,
+    /// Queries waiting for a connection right now.
+    pub waiting: u64,
+    /// Queries holding a connection right now.
+    pub in_flight: u64,
+    /// Highest `in_flight` value observed.
+    pub peak_in_flight: u64,
+}
+
+/// Increments a gauge on creation and decrements it on drop.
+struct GaugeGuard<'a>(&'a AtomicU64);
+
+impl<'a> GaugeGuard<'a> {
+    fn new(gauge: &'a AtomicU64) -> Self {
+        gauge.fetch_add(1, Ordering::Relaxed);
+        GaugeGuard(gauge)
+    }
+}
+
+impl Drop for GaugeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A shared DNS-over-TLS client: a small pool of lazily-established TLS
 /// connections reused across queries (previously every query paid a
 /// full TCP+TLS handshake and a fresh rustls configuration), plus a
@@ -268,6 +346,8 @@ pub struct DnsClient {
     conns: Vec<AsyncMutex<Option<DotStream>>>,
     /// Round-robin cursor for waiting on a slot when all are busy.
     next_slot: std::sync::atomic::AtomicUsize,
+    /// Metrics (see [`DnsClient::stats`]).
+    stats: DnsStats,
 }
 
 /// Concurrent DNS-over-TLS connections per [`DnsClient`] (H6, security
@@ -309,7 +389,39 @@ impl DnsClient {
             cache: Mutex::new(DnsCache::default()),
             conns: (0..POOL_SIZE).map(|_| AsyncMutex::new(None)).collect(),
             next_slot: std::sync::atomic::AtomicUsize::new(0),
+            stats: DnsStats::default(),
         }
+    }
+
+    /// A snapshot of this client's metrics.
+    pub fn stats(&self) -> DnsStatsSnapshot {
+        let s = &self.stats;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        DnsStatsSnapshot {
+            queries: get(&s.queries),
+            cache_hits: get(&s.cache_hits),
+            connects: get(&s.connects),
+            connect_failures: get(&s.connect_failures),
+            exchanges_ok: get(&s.exchanges_ok),
+            exchange_errors: get(&s.exchange_errors),
+            timeouts: get(&s.timeouts),
+            waits: get(&s.waits),
+            wait_total_us: get(&s.wait_total_us),
+            wait_max_us: get(&s.wait_max_us),
+            waiting: get(&s.waiting),
+            in_flight: get(&s.in_flight),
+            peak_in_flight: get(&s.peak_in_flight),
+        }
+    }
+
+    /// Reset the peak values (`wait_max_us`, `peak_in_flight`) so the
+    /// next [`DnsClient::stats`] reports peaks for the new interval. The
+    /// peak in-flight count restarts from the current in-flight count.
+    pub fn reset_peaks(&self) {
+        let s = &self.stats;
+        s.wait_max_us.store(0, Ordering::Relaxed);
+        s.peak_in_flight
+            .store(s.in_flight.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Query one name over DNS-over-TLS.
@@ -330,6 +442,8 @@ impl DnsClient {
     /// (connect failure after the retry, I/O error, protocol
     /// violation, or the per-exchange timeout elapsing).
     pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
+        let stats = &self.stats;
+        stats.queries.fetch_add(1, Ordering::Relaxed);
         let key = (domain.trim().to_ascii_lowercase(), qtype);
         if let Some(hit) = self
             .cache
@@ -337,6 +451,7 @@ impl DnsClient {
             .expect("DNS cache poisoned")
             .get(&key, Instant::now())
         {
+            stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
 
@@ -347,13 +462,24 @@ impl DnsClient {
         let mut conn = match self.conns.iter().find_map(|slot| slot.try_lock().ok()) {
             Some(guard) => guard,
             None => {
+                stats.waits.fetch_add(1, Ordering::Relaxed);
+                let _waiting = GaugeGuard::new(&stats.waiting);
+                let started = Instant::now();
                 let i = self
                     .next_slot
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     % self.conns.len();
-                self.conns[i].lock().await
+                let guard = self.conns[i].lock().await;
+                let waited = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                stats.wait_total_us.fetch_add(waited, Ordering::Relaxed);
+                stats.wait_max_us.fetch_max(waited, Ordering::Relaxed);
+                guard
             }
         };
+        let _in_flight = GaugeGuard::new(&stats.in_flight);
+        stats
+            .peak_in_flight
+            .fetch_max(stats.in_flight.load(Ordering::Relaxed), Ordering::Relaxed);
         for attempt in 0..2 {
             let mut stream = match conn.take() {
                 Some(stream) => stream,
@@ -363,6 +489,7 @@ impl DnsClient {
                 // connection mutex for the kernel's connect timeout
                 // (~2 min), stalling every lookup in every session.
                 None => {
+                    stats.connects.fetch_add(1, Ordering::Relaxed);
                     match tokio::time::timeout(
                         self.timeout,
                         connect(&self.endpoint_str(), &self.config),
@@ -370,13 +497,21 @@ impl DnsClient {
                     .await
                     {
                         Ok(Ok(stream)) => stream,
-                        Ok(Err(e)) => return Err(e.context("DNS query failed")),
-                        Err(_) => return Err(anyhow!("DNS connect timed out")),
+                        Ok(Err(e)) => {
+                            stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+                            return Err(e.context("DNS query failed"));
+                        }
+                        Err(_) => {
+                            stats.connect_failures.fetch_add(1, Ordering::Relaxed);
+                            stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                            return Err(anyhow!("DNS connect timed out"));
+                        }
                     }
                 }
             };
             match tokio::time::timeout(self.timeout, exchange(&mut stream, domain, qtype)).await {
                 Ok(Ok(resp)) => {
+                    stats.exchanges_ok.fetch_add(1, Ordering::Relaxed);
                     *conn = Some(stream);
                     self.cache.lock().expect("DNS cache poisoned").insert(
                         key,
@@ -389,6 +524,7 @@ impl DnsClient {
                 // suspect (idle-closed, torn, or the peer misbehaved).
                 // Poison it and retry once on a fresh connection.
                 Ok(Err(e)) => {
+                    stats.exchange_errors.fetch_add(1, Ordering::Relaxed);
                     drop(stream);
                     if attempt == 0 {
                         continue;
@@ -398,6 +534,7 @@ impl DnsClient {
                 // A timed-out exchange leaves the stream with unknown
                 // pending state: it must never be reused.
                 Err(_) => {
+                    stats.timeouts.fetch_add(1, Ordering::Relaxed);
                     drop(stream);
                     return Err(anyhow!("DNS query timed out"));
                 }
@@ -750,6 +887,29 @@ mod tests {
         client.query("d.test", 1).await.unwrap();
         assert_eq!(conns.load(Ordering::SeqCst), 2);
         assert_eq!(queries.load(Ordering::SeqCst), 4);
+
+        // Metrics mirror what happened: 5 queries, 1 cache hit, 2
+        // connections, 4 answered exchanges, 1 discarded stale
+        // connection (c.test's first attempt), nothing left in flight.
+        let stats = client.stats();
+        assert_eq!(
+            stats,
+            DnsStatsSnapshot {
+                queries: 5,
+                cache_hits: 1,
+                connects: 2,
+                connect_failures: 0,
+                exchanges_ok: 4,
+                exchange_errors: 1,
+                timeouts: 0,
+                waits: 0,
+                wait_total_us: 0,
+                wait_max_us: 0,
+                waiting: 0,
+                in_flight: 0,
+                peak_in_flight: 1,
+            }
+        );
     }
 
     /// H6 (security report): a slow lookup (e.g. an attacker-published
@@ -838,5 +998,27 @@ mod tests {
             started.elapsed()
         );
         slow.await.unwrap().unwrap();
+
+        // Both queries were in flight at once; nothing is left over.
+        let stats = client.stats();
+        assert_eq!(stats.peak_in_flight, 2);
+        assert_eq!(stats.in_flight, 0);
+        assert_eq!(stats.waiting, 0);
+        assert_eq!(stats.waits, 0, "a free slot existed, so nobody waited");
+        client.reset_peaks();
+        assert_eq!(client.stats().peak_in_flight, 0);
+
+        // Cancellation: a query whose future is dropped mid-exchange must
+        // not leave the in-flight gauge raised (the gauges use drop
+        // guards).
+        let cancelled = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.query("slow2.test", 1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.stats().in_flight, 1);
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(client.stats().in_flight, 0);
     }
 }

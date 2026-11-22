@@ -10,7 +10,7 @@
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; overlays = [ (import rust-overlay) ]; };
+        pkgs = import nixpkgs { inherit system; config.allowUnfree = true; overlays = [ (import rust-overlay) ]; };
       in
       {
         devShell = pkgs.mkShell {
@@ -19,6 +19,7 @@
             pkgs.rust-analyzer
             pkgs.jq
             pkgs.pi-coding-agent
+            pkgs.claude-code
           ];
         };
       });

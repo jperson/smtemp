@@ -17,11 +17,10 @@
 //!   `DKIM-Signature` header with the `b=` value emptied
 //!   ([`signed_header_data`])
 //!
-//! Not yet implemented (next steps): public key retrieval
-//! (`{s}._domainkey.{d}` TXT) and cryptographic verification of the `b=`
-//! signature (RSA/Ed25519), plus `x=`/`t=` expiry enforcement. Note that key
-//! retrieval depends on multi-string TXT support in the `dns` crate, which
-//! currently truncates TXT records longer than 255 bytes.
+//! - retrieval of the DKIM public key record over the shared DNS
+//!   client ([`fetch_public_key`]), and cryptographic verification of
+//!   the `b=` signature (RSA + Ed25519)
+//! - `x=`/`t=` expiry enforcement
 
 use base64::prelude::*;
 use rsa::pkcs1::DecodeRsaPublicKey as _;

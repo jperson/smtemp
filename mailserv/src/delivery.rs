@@ -105,11 +105,39 @@ impl DeliverySink for MaildirSink {
 
 /// Split an address into (local-part, domain), both lowercased. Returns
 /// `Err` for addresses without an `@`.
+/// Split an address into (local-part, domain), both lowercased, and
+/// validate both as filesystem-safe path components (C1, security
+/// report).
+///
+/// The components become maildir directory names under the sink root,
+/// so each must be a single safe component: no `/` or `\` (a `/` in an
+/// RFC-atext local-part used to allow relative traversal, and
+/// `Path::join` with an absolute path used to discard the root
+/// entirely), no `..` runs, no leading dot, no control characters, and
+/// within reasonable length. Returns `Err` for anything that could
+/// escape the maildir root — the caller treats that as a failed
+/// delivery (the message stays queued), never as a path to honor.
 fn split_recipient(recipient: &str) -> Result<(String, String)> {
     let (local, domain) = recipient
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("no '@' in recipient {recipient:?}"))?;
-    Ok((local.to_ascii_lowercase(), domain.to_ascii_lowercase()))
+    let local = local.to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
+    for component in [&local, &domain] {
+        if component.is_empty()
+            || component.len() > 128
+            || component.starts_with('.')
+            || component.contains("..")
+            || !component
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'=' | b'-'))
+        {
+            return Err(anyhow::anyhow!(
+                "unsafe mailbox path component in {recipient:?}"
+            ));
+        }
+    }
+    Ok((local, domain))
 }
 
 /// Filesystem-safe recipient tag for maildir filenames: alphanumerics,

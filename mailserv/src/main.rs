@@ -287,6 +287,181 @@ fn path_domain(addr: &str) -> Option<&str> {
     addr.rsplit_once('@').map(|(_, domain)| domain)
 }
 
+/// The local-part safety check for mailbox delivery (C1, security
+/// report). The local-part names a maildir directory, so it must never
+/// carry path semantics.
+///
+/// Returns `Some(reason)` when the address must be refused: the
+/// local-part is empty, longer than RFC 5321's 64-octet limit, contains
+/// anything outside the mailbox-safe set (ASCII alphanumerics plus
+/// `.`, `_`, `+`, `=`, `-`), or has path-oddities like a leading dot or
+/// a `..` run.
+fn unsafe_local_part(addr: &str) -> Option<&'static str> {
+    let local = addr.rsplit_once('@')?.0;
+    if local.is_empty() {
+        return Some("empty local-part");
+    }
+    if local.len() > 64 {
+        return Some("local-part exceeds 64 octets");
+    }
+    if local.starts_with('.') || local.contains("..") {
+        return Some("dot-run in local-part");
+    }
+    if !local
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'=' | b'-'))
+    {
+        return Some("character outside the mailbox-safe set");
+    }
+    None
+}
+
+/// The outcome of scanning a raw message for its `From:` header (C4:
+/// this scan must be tolerant of bytes and headers the strict parser
+/// rejects, because a parse failure used to skip DMARC entirely).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FromHeader {
+    /// Exactly one `From:` header, with its domain extracted.
+    Parsed(String),
+    /// No `From:` header at all.
+    None,
+    /// More than one `From:` header (RFC 7489 Section 6.6.1: reject).
+    Multiple,
+    /// A `From:` header exists but no domain could be extracted.
+    Unparseable,
+}
+
+/// Extract the From-domain from the raw header bytes.
+///
+/// Works on bytes, not UTF-8 (real 8-bit mail exists), and never fails:
+/// every outcome is one of the [`FromHeader`] variants. Only the header
+/// block is scanned (up to the first empty line), `From:` is matched
+/// case-insensitively on the header name, folded continuation lines are
+/// folded into the value, and the domain is everything after the last
+/// `@` up to the first character that cannot appear in a domain
+/// (whitespace, `,`, `;`, `>`, `<`, `"`, or a control character).
+fn from_header_domain(raw: &[u8]) -> FromHeader {
+    // The header block ends at the first empty line.
+    let end = header_block_end(raw);
+    let header_block = &raw[..end];
+
+    let mut from_values: Vec<Vec<u8>> = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    for line in split_header_lines(header_block) {
+        if line.starts_with(b" ") || line.starts_with(b"\t") {
+            // Folded continuation of the previous header.
+            if let Some(value) = current.as_mut() {
+                value.extend_from_slice(trim_header_fws(line));
+            }
+            continue;
+        }
+        current = None;
+        if is_from_header(line) {
+            let value = trim_header_fws(&line[b"From:".len()..]);
+            current = Some(value.to_vec());
+            from_values.push(value.to_vec());
+        }
+    }
+
+    match from_values.len() {
+        0 => FromHeader::None,
+        1 => match from_domain_of(&from_values[0]) {
+            Some(domain) => FromHeader::Parsed(domain),
+            None => FromHeader::Unparseable,
+        },
+        _ => FromHeader::Multiple,
+    }
+}
+
+/// The offset of the first empty line in the raw message (the header
+/// block's end), or `raw.len()` when there is none.
+fn header_block_end(raw: &[u8]) -> usize {
+    let mut i = 0;
+    while i < raw.len() {
+        let line_end = raw[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(raw.len(), |p| i + p);
+        let content_len = if line_end > i && raw[line_end - 1] == b'\r' {
+            line_end - 1 - i
+        } else {
+            line_end - i
+        };
+        if content_len == 0 {
+            return i; // empty line: headers are over
+        }
+        i = line_end + 1;
+    }
+    raw.len()
+}
+
+/// Is this header line a `From:` header (case-insensitive name)?
+fn is_from_header(line: &[u8]) -> bool {
+    line.len() > b"From:".len() && line[..b"From:".len()].eq_ignore_ascii_case(b"From:")
+}
+
+/// Split a header block into lines, tolerating CRLF and bare LF (the
+/// raw bytes come straight off the wire; bare LF was already ruled out
+/// as a DATA terminator but tolerance here costs nothing).
+fn split_header_lines(block: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut rest = block;
+    while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+        let (line, next) = rest.split_at(pos);
+        lines.push(if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        });
+        rest = &next[1..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
+/// Trim folding whitespace (WSP/CR/LF) from both ends of a header value.
+fn trim_header_fws(value: &[u8]) -> &[u8] {
+    let is_fws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let start = value.iter().position(|b| !is_fws(b)).unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|b| !is_fws(b))
+        .map_or(start, |p| p + 1);
+    &value[start..end]
+}
+
+/// The domain of a From header value: everything after the last `@` up
+/// to the first character that cannot appear in a domain or route.
+/// Returns `None` when there is no `@` or the result is not a plausible
+/// domain (non-empty, printable ASCII, no path/control characters).
+fn from_domain_of(value: &[u8]) -> Option<String> {
+    let at = value.iter().rposition(|&b| b == b'@')?;
+    let raw_domain = &value[at + 1..];
+    let end = raw_domain
+        .iter()
+        .position(|b| {
+            matches!(
+                b,
+                b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'>' | b'<' | b'"' | 0x00..=0x1f
+            )
+        })
+        .unwrap_or(raw_domain.len());
+    let domain = &raw_domain[..end];
+    // Strip a trailing dot (fully-qualified form) and any angle-bracket
+    // or route residue.
+    let domain = domain.strip_suffix(b".").unwrap_or(domain);
+    if domain.is_empty()
+        || !domain
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(String::from_utf8_lossy(domain).to_ascii_lowercase())
+}
+
 /// The MAIL FROM verdict for an SPF evaluation of the sender identity
 /// (RFC 7208 Section 8): Pass/Neutral/SoftFail/None are accepted (the
 /// result is logged for downstream policy), Fail and PermError are
@@ -703,6 +878,20 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::reject(BAD_ADDRESS);
         };
 
+        // C1 (security report): the local-part becomes a filesystem path
+        // in maildir delivery. RFC 5321 atext technically allows `/`, but
+        // the delivery sink must never place client input into a path —
+        // a local-part with `/`, `..`, or an absolute path used to write
+        // files anywhere the service user could write. Reject anything
+        // outside the mailbox-safe character set up front (501) so the
+        // client learns immediately; the sink re-validates as defense in
+        // depth. This is a documented server policy, stricter than the
+        // RFC's full atext set.
+        if let Some(reason) = unsafe_local_part(&addr) {
+            info!(rcpt = %addr, reason, "unsafe mailbox local-part refused");
+            return smtp::Control::reject(BAD_ADDRESS);
+        }
+
         // Relay access is closed and policy-owned by the authority: it
         // decides whether the domain is hosted, whether this address can
         // receive mail under the domain's policy mode, and where the
@@ -847,11 +1036,27 @@ impl smtp::SmtpSession for UserSession<'_> {
         // already passed local authentication; their mail is logged but
         // trusted (an MSA that rejects its own users' mail on DMARC would
         // reject legitimate submissions from networks no SPF record covers).
-        let from_domain = mailparse::parse_message(&raw).ok().and_then(|m| {
-            m.typed
-                .from
-                .and_then(|from| from.first().map(|mb| mb.domain.to_string()))
-        });
+        //
+        // C4 (security report): the From domain is extracted from the raw
+        // header bytes, never from the typed parser — a duplicate `From:`,
+        // an 8-bit byte in any header, or a grammar failure used to make
+        // the whole parse fail, which skipped DMARC and accepted the
+        // message. RFC 7489 Section 6.6.1: a message with no `From:` or
+        // with multiple `From:` headers is rejected, never let through.
+        let from_domain = match from_header_domain(&raw) {
+            FromHeader::Parsed(domain) => Some(domain),
+            problem => {
+                warn!(
+                    problem = ?problem,
+                    "message has no unambiguous From header; rejecting (RFC 7489 Section 6.6.1)"
+                );
+                self.clear_envelope();
+                self.message_count += 1;
+                return smtp::Control::reject(
+                    b"550 5.7.1 Message rejected: missing or malformed From header\r\n",
+                );
+            }
+        };
         let mut dmarc_summary: Option<DmarcSummary> = None;
 
         if let Some(from_domain) = from_domain {
@@ -868,8 +1073,12 @@ impl smtp::SmtpSession for UserSession<'_> {
             if let Some(record) = record {
                 let spf_passed = matches!(self.spf_result, Some(SpfResult::Pass));
                 let spf_domain = self.mail_from.as_deref().and_then(path_domain);
-                let dkim: Vec<(String, bool)> = self
-                    .dkim
+                // C3 (security report): DMARC consumes ONLY this
+                // message's DKIM results. `self.dkim` accumulates across
+                // the connection for the session log; reusing it here let
+                // a replayed genuine signature from an earlier message
+                // make a later unsigned spoof pass DMARC.
+                let dkim: Vec<(String, bool)> = dkim_summaries
                     .iter()
                     .map(|d| (d.domain.clone(), d.verified))
                     .collect();
@@ -1190,6 +1399,13 @@ async fn main() -> Result<()> {
         Duration::from_secs(60),
     ));
     let global_capacity = Arc::new(tokio::sync::Semaphore::new(config.max_connections as usize));
+    // H5 (security report): refusals must never run inline in the accept
+    // loop — each one used to stall every subsequent accept for up to
+    // ~2.5 s (the courtesy write + drain), so an attacker holding the
+    // connection budgets could starve all legitimate senders almost for
+    // free. Refusals run in spawned tasks, capped by this small permit
+    // pool; when it is exhausted the socket is simply closed.
+    let refuse_capacity = Arc::new(tokio::sync::Semaphore::new(32));
 
     info!(
         host = %config.host,
@@ -1223,9 +1439,10 @@ async fn main() -> Result<()> {
             Ok(permit) => permit,
             Err(_) => {
                 warn!(peer = %peer, "connection refused: server at capacity");
-                refuse(
+                refuse_async(
                     stream,
                     b"421 4.7.0 Service not available, try again later\r\n",
+                    &refuse_capacity,
                 )
                 .await;
                 continue;
@@ -1235,7 +1452,7 @@ async fn main() -> Result<()> {
         // Per-IP concurrency and connection-rate budgets.
         if let Err(reason) = limiter.admit(ip).await {
             warn!(peer = %peer, "connection refused: per-IP limit reached");
-            refuse(stream, reason.reply()).await;
+            refuse_async(stream, reason.reply(), &refuse_capacity).await;
             drop(permit);
             continue;
         }
@@ -1274,13 +1491,32 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Hand a refused connection to a spawned task (H5, security report):
+/// returns immediately, so a burst of refusals never stalls the accept
+/// loop. Bounded by the refusal permit pool; when it is saturated the
+/// socket is closed without the courtesy reply.
+async fn refuse_async(stream: TcpStream, reply: &[u8], capacity: &Arc<tokio::sync::Semaphore>) {
+    match Arc::clone(capacity).try_acquire_owned() {
+        Ok(permit) => {
+            let reply = reply.to_vec();
+            tokio::spawn(async move {
+                refuse(stream, &reply).await;
+                drop(permit);
+            });
+        }
+        // Refusal capacity is saturated (an active flood): the fastest
+        // possible close is the only remaining courtesy.
+        Err(_) => drop(stream),
+    }
+}
+
 /// Answer a refused connection with an SMTP error and close it. The
-/// write is capped so a client that never reads cannot stall the accept
-/// loop; afterwards the socket is drained briefly so the client can
-/// read the reply before close — dropping a socket with unread inbound
-/// data makes Linux send RST, which discards the client's pending
-/// receive buffer (it would never see the 421). Failures are ignored —
-/// the connection is being dropped anyway.
+/// write is capped so a client that never reads cannot stall; afterwards
+/// the socket is drained briefly so the client can read the reply before
+/// close — dropping a socket with unread inbound data makes Linux send
+/// RST, which discards the client's pending receive buffer (it would
+/// never see the 421). Failures are ignored — the connection is being
+/// dropped anyway. Runs only in spawned tasks (see [`refuse_async`]).
 async fn refuse(stream: TcpStream, reply: &[u8]) {
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         let mut stream = stream;
@@ -1700,7 +1936,7 @@ mod tests {
             "354 End data with <CR>.<CR><LF>\r\n"
         );
         client
-            .write_all(b"Subject: over TLS\r\n\r\nsecure body.\r\n.\r\n")
+            .write_all(b"Subject: over TLS\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nsecure body.\r\n.\r\n")
             .await
             .unwrap();
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
@@ -1995,7 +2231,7 @@ mod tests {
             "354 End data with <CR>.<CR><LF>\r\n"
         );
         client
-            .write_all(b"Subject: spool test\r\n\r\nbody line\r\n.\r\n")
+            .write_all(b"Subject: spool test\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nbody line\r\n.\r\n")
             .await
             .unwrap();
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
@@ -2017,7 +2253,10 @@ mod tests {
 
         // Payload is exactly the (unstuffed) DATA bytes.
         let payload = tokio::fs::read(new.join(&names[0])).await.unwrap();
-        assert_eq!(payload, b"Subject: spool test\r\n\r\nbody line\r\n");
+        assert_eq!(
+            payload,
+            b"Subject: spool test\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nbody line\r\n"
+        );
 
         // Metadata is complete and consistent.
         let meta: serde_json::Value =
@@ -2109,7 +2348,9 @@ mod tests {
         client.write_all(b"DATA\r\n").await.unwrap();
         read_reply(&mut client).await;
         client
-            .write_all(b"Subject: to alice\r\n\r\nhi\r\n.\r\n")
+            .write_all(
+                b"Subject: to alice\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nhi\r\n.\r\n",
+            )
             .await
             .unwrap();
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
@@ -2220,7 +2461,9 @@ mod tests {
         client.write_all(b"DATA\r\n").await.unwrap();
         read_reply(&mut client).await;
         client
-            .write_all(b"Subject: caught\r\n\r\nhi\r\n.\r\n")
+            .write_all(
+                b"Subject: caught\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nhi\r\n.\r\n",
+            )
             .await
             .unwrap();
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
@@ -2238,6 +2481,135 @@ mod tests {
         let copy = std::fs::read(inbox.join(&names[0])).unwrap();
         let text = String::from_utf8(copy).unwrap();
         assert!(text.contains("for <whatever-alias@example.org>"));
+    }
+
+    // -- Security-report regressions ------------------------------------
+
+    /// C1 (security report): local-parts with path semantics must be
+    /// refused at RCPT time — `/` in an RFC-atext local-part used to be
+    /// copied into maildir paths (relative traversal via `..`, absolute
+    /// paths via `Path::join`).
+    #[tokio::test]
+    async fn path_traversal_local_parts_are_refused() {
+        let addr = spawn_server(None, None, None, None, None, None).await;
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<a@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+
+        for rcpt in [
+            "../../escape@example.org",
+            "/tmp/absolute-path@example.org",
+            "a..b@example.org",
+            ".hidden@example.org",
+            "a/b@example.org",
+        ] {
+            client
+                .write_all(format!("RCPT TO:<{rcpt}>\r\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(
+                read_reply(&mut client).await[0],
+                "501 5.1.7 Bad sender address syntax\r\n",
+                "rcpt {rcpt:?} must be refused"
+            );
+        }
+
+        // A normal local-part is unaffected.
+        client
+            .write_all(b"RCPT TO:<normal.user+tag@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }
+
+    /// C4 (security report): a message with no `From:` header is
+    /// rejected (RFC 7489 Section 6.6.1) — it used to skip DMARC and be
+    /// accepted.
+    #[tokio::test]
+    async fn message_without_from_is_rejected() {
+        let addr = spawn_server(None, None, None, None, None, None).await;
+        let tcp = TestTcpStream::connect(addr).await.unwrap();
+        let mut client = BufReader::new(tcp);
+        read_reply(&mut client).await;
+        client.write_all(b"HELO client.test\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"MAIL FROM:<a@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"RCPT TO:<user@example.org>\r\n")
+            .await
+            .unwrap();
+        read_reply(&mut client).await;
+        client.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"Subject: no from\r\n\r\nbody\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "550 5.7.1 Message rejected: missing or malformed From header\r\n"
+        );
+        client.write_all(b"QUIT\r\n").await.unwrap();
+    }
+
+    /// C3 (security report): DKIM verdicts must not leak across messages
+    /// on one connection. A verified signature from an earlier message
+    /// used to satisfy DMARC alignment for a later unsigned spoof of the
+    /// same domain. Here a fake verified facebook.com verdict is left in
+    /// the session, and an unsigned message `From: someone@facebook.com`
+    /// (a domain that publishes `p=reject`) must still be REJECTED —
+    /// the DMARC evaluation consumes only this message's results.
+    #[tokio::test]
+    async fn dkim_verdicts_do_not_leak_across_messages() {
+        let cfg = SessionConfig {
+            domain: "mail.test".to_string(),
+            max_data: 1024 * 1024,
+            auth_users: None,
+            authority: Arc::new(authority::StaticAuthority::new(vec![
+                "mail.test".to_string()
+            ])),
+            dns: Arc::new(dns::DnsClient::new("1.1.1.1".parse().unwrap())),
+            spool: None,
+            sink: None,
+        };
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+        // Simulate message 1 on this connection: a genuinely verified
+        // facebook.com signature (e.g. a replayed newsletter).
+        session.dkim.push(DkimSummary {
+            domain: "facebook.com".to_string(),
+            selector: "replay".to_string(),
+            body_hash_ok: true,
+            signature_ok: true,
+            verified: true,
+            error: None,
+        });
+
+        // Message 2: an unsigned spoof of the same domain.
+        session.data = b"From: someone@facebook.com\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
+        let control = session.end_data().await;
+
+        assert!(
+            matches!(control, smtp::Control::Reject(_)),
+            "an unsigned spoof must be rejected even after a verified facebook.com\n             signature on the same connection: {control:?}"
+        );
+        assert_eq!(
+            session.dmarc.as_ref().map(|d| d.dkim_aligned),
+            Some(false),
+            "the stale verified verdict must not count for alignment"
+        );
     }
 
     /// Grace mode: an address expired within the grace window still

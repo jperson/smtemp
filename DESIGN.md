@@ -31,7 +31,7 @@ Design goals, in order:
 3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
    canonicalization inputs are preserved exactly where security checks
    depend on them.
-4. **Deterministic tests.** The suite (145 tests) runs offline; live
+4. **Deterministic tests.** The suite (185 tests) runs offline; live
    network behavior is behind `#[ignore]` opt-ins and fixture mocks
    (the `mailserv` integration tests exercise the real resolver path —
    see README, Testing).
@@ -138,12 +138,18 @@ results, DMARC verdict, authenticated identity, TLS state.
   lines get `500`/`552`, are drained (under the read timeout), and the
   session continues — a data-mode overflow aborts into a `Discard` state
   that swallows until the terminator.
-- DATA: the terminator is content-`.` with CRLF **or** bare LF;
-  dot-unstuffing (RFC 5321 §4.5.2) happens in the protocol layer before
-  the policy sees a line. `recv_data` receives the *unstuffed* line with
-  its original line ending, as raw bytes (8-bit safe — invalid UTF-8 in
-  DATA never drops the session).
-- `RSET`/`QUIT` are honored from any state, including mid-DATA.
+- DATA: the terminator is **exactly `<CRLF>.<CRLF>`**. In `Data` and
+  `Discard` states every line is message data — `RSET`, `QUIT`, and all
+  other verbs are content, never commands (the SMTP-smuggling class,
+  CVE-2023-51764/51765/51766), and a bare-LF `.` is an empty data line,
+  never a terminator. Dot-unstuffing (RFC 5321 §4.5.2) happens in the
+  protocol layer before the policy sees a line. `recv_data` receives the
+  *unstuffed* line with its original line ending, as raw bytes (8-bit
+  safe — invalid UTF-8 in DATA never drops the session).
+- `RSET` clears the envelope but keeps the session greeted (the next
+  `MAIL` needs no new EHLO, RFC 5321 §4.1.1.5). Unknown verbs are
+  refused with `500` and the state is preserved. `RSET`/`QUIT` are only
+  verbs outside DATA.
 
 ### 4.2 The end-of-data pipeline
 
@@ -270,7 +276,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-181 tests, four layers:
+185 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).

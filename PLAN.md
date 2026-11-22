@@ -8,10 +8,11 @@
 > binding, wired into the live pipeline, and validated against real-world
 > clients (`openssl s_client -starttls smtp`, spoofed `p=reject` DMARC
 > rejection). The DNS resolver is configurable (`--resolver` / config
-> file, default 1.1.1.1). Phase 7 has begun: accepted messages are
-> **durably spooled to disk** (the `250` is only sent after the write)
-> with a queue ID in the logs; local delivery is the next open item.
-> Workspace state: **181 tests, 0 failures,
+> file, default 1.1.1.1); accepted messages are **durably spooled and
+> delivered to local maildirs**. The external security review
+> (REPORT.md) is triaged in §6: all four critical findings are fixed
+> and regression-tested; the remaining highs/medias are tracked there.
+> Workspace state: **185 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -155,7 +156,7 @@ The server verifies mail and drops it. This phase makes it an MTA.
       renamed last (its presence in `new/` is the commit point). Payload
       is byte-exact raw DATA, ready for Phase 12's user-held encryption
       at this boundary.
-- [x] **Queue identity**: maildir-style queue ID (`<hex-millis>.<uuid>`,
+- [x] **Queue identity**: maildir-style queue ID (`<hex-seconds>.<uuid>`,
       sortable, unique); logged on spool and stored in the metadata
       (Phase 8 will put it in the `Received:` header).
 - [x] **Local delivery**: accepted messages are delivered through a
@@ -477,10 +478,10 @@ lookups with dynamic ones.
    (already flagged in Phase 8) is doubly wrong here: credentials must
    come from the authority (hashed), and submission accounts are created
    in the console, not in server config.
-7. **MX-scale economics.** At real MX volume, the per-query DoT
-   connection in `DotResolver` (one fresh TLS connection + rustls config
-   per SPF/DKIM/DMARC query) is the dominant cost — the Phase 10 DNS
-   caching/reuse item becomes a prerequisite, not an optimization.
+7. **MX-scale economics.** The per-query DoT connection was fixed by
+   the Phase 10 `DnsClient` (pooled connection + TTL cache); the
+   remaining MX-scale item is rate limiting / RCPT-probe caps (Phase
+   10): catch-all
    Rate limiting / RCPT-probing caps (Phase 10) likewise: catch-all
    domains make every probe a valid recipient, which is precisely what
    dictionary attackers want.
@@ -519,23 +520,130 @@ work is additive rather than a rewrite.
 
 ---
 
-## 6. Quick-reference: current priority list
+## 6. Security report (REPORT.md, 2026-11-21) — findings ledger
 
-1. **Phase 7 — Delivery** (spool, maildir, `Received:`/`Return-Path`,
-   queue ID). The security stack is complete; delivery is the finish line.
-   *For the receive-only V1 this is the critical path; the `DeliverySink`
-   seam should anticipate the Phase 12 hosted backend.*
-2. **Phase 10 — Ops** (DNS caching — a prerequisite at MX scale, not an
-   optimization; rate limiting/RCPT-probe caps — catch-all domains make
-   every probe a valid recipient; graceful shutdown; IPv6
-   resolver/listener support). CI, `RUST_LOG`, the config file, the accept
-   loop, and resolver configuration are done.
-3. **Phase 12 — Hosted address service (receive-only V1)**: recipient
-   authority seam, dynamic domain catalog, multi-domain identity (Phase
-   11 item), verdict policy profiles.
+An external security review (commit `6b0a655`) reported **4 critical,
+8 high, 17 medium, and 12 low** findings, several verified against the
+running binary. Fixed in this pass:
+
+| # | Sev | Finding | Verdict |
+|---|---|---|---|
+| C1 | **Critical** | Path traversal in maildir delivery: any RCPT local-part could write files anywhere the service user could write (`/` and `..` in local-parts; `Path::join` with an absolute path discards the root) | **FIXED** — RCPT-time local-part validation (mailbox-safe set: alnum + `. _ + = -`, no leading dot, no `..`, ≤64 octets, else `501`) plus sink-side component validation as defense in depth; traversal/unusual-local-part regression tests |
+| C2 | **Critical** | SMTP smuggling: `RSET` (and any verb) inside DATA ran as commands; bare-LF `.` terminated DATA (CVE-2023-51764/51765/51766 class) — a relay passing such a body would inject a spoofed message from its own trusted IP | **FIXED** — `Data`/`Discard` are pure framing modes: every line is data, the ONLY exit is `<CRLF>.<CRLF>`; a bare-LF `.` is an empty data line. Full CVE-scenario regression test; DESIGN §4.1 updated |
+| C3 | **Critical** | DKIM verdicts accumulated across messages on one connection, so a replayed genuine signature made a later unsigned spoof pass DMARC | **FIXED** — DMARC consumes only the current message's results; regression test (fake verified facebook.com verdict + unsigned spoof of the same domain must still be rejected; live DNS) |
+| C4 | **Critical** | DMARC was skipped whenever the header parser failed (duplicate `From:`, any 8-bit header byte, grammar failure) — an attacker could dodge `p=reject` with one bad byte | **FIXED** — From domain extracted from raw bytes with a tolerant byte-level scan (folding handled, `From:`-in-body ignored); no `From:` / multiple `From:` / unparseable From are hard `550 5.7.1` rejects per RFC 7489 §6.6.1; extractor unit tests + integration test |
+| H1 | High | SPF `a`/`mx`/`ptr`/`exists` queried type 22 (NSAP-PTR) instead of type 1 (A) — those mechanisms never matched, legitimate senders got `550`, void budgets tripped | **FIXED** — type 1; wire-level regression test runs `DotResolver` against a mock DoT server and asserts the qtype byte. *Open: AAAA for IPv6 senders* |
+| H4 | High | Message body lines starting with `QUIT`/`RSET` ended the session mid-DATA (undeliverable mail) | **FIXED** — same framing change as C2 |
+| H5 | High | Each refused connection ran inline in the accept loop (up to ~2.5 s), so an attacker holding the connection budgets stalled ALL accepts — the limiter as amplifier | **FIXED** — refusals spawn into a bounded permit pool (32); when saturated, sockets close without the courtesy reply |
+| H8 | High | Grace-mode domains refused every *permanent* mailbox (`is_some_and` treated `expires: null` as expired) | **FIXED** — `is_none_or`; `grace-days` capped at 366 (bounded arithmetic); permanent + future-expiry regression tests |
+| M15 | Medium | Authority hot-reload: one bad publish made every RCPT `451` until fixed, and re-parsed the broken file per RCPT | **FIXED** — last-good snapshot serves through a bad publish; failed change token memoized (no per-RCPT re-parse); change token is (mtime, size); next good publish applies |
+| H6 | High | One serialized DNS connection shared process-wide; connect had NO timeout — a black-holed resolver held the mutex ~2 min, and an attacker-chosen slow record stalled every session's lookups | **PARTIALLY FIXED** — connect is now bounded by the per-exchange timeout (mutex hold ≤ 2×timeout). *Open: true pooling/pipelining for concurrency; see also L2 (cache eviction)* |
+
+**Open findings** (see REPORT.md for full detail; roughly priority order):
+
+- **H2 (high)**: SPF macro expansion is broken — every letter after the
+  first `%` is replaced, corrupting domain-specs of large senders
+  (Salesforce, Mimecast…). Real fix: an RFC 7208 §7 macro parser.
+  Interim mitigation option: PermError for any record containing macros
+  (safe, honest) instead of guessing.
+- **H3 (high)**: ESMTP parameters (`SIZE=`, `BODY=`) end up inside the
+  address: SPF bypass (bogus domain → NXDOMAIN → `None`) and every
+  null-sender bounce carrying `SIZE=` is refused. Fix: parse
+  `Reverse-path [SP parameters]` per RFC 5321 §4.1.2 and enforce
+  `SIZE=` against the advertised limit. (Overlaps Phase 9.)
+- **H7 (high)**: unlimited DKIM signatures per message, on the async
+  executor (CPU + DNS amplification; >10k signature headers in 1 MiB).
+  Fix: cap evaluated signatures (5–10), dedupe body-hash work, move
+  verification to `spawn_blocking` under a deadline.
+- **M1**: SPF parser stops silently at the first unrecognized term and
+  the lexer is case-sensitive (`-ALL` dropped → Neutral instead of
+  Fail; `v=spf10` matches). Fix: PermError on any unparseable term,
+  case-insensitive lexing.
+- **M2**: SPF budget over-counts MX-host and PTR-name A lookups
+  (spurious PermError → 550 on large legitimate records).
+- **M3**: DMARC organisational domain = last two labels — ccTLD
+  second-level registries (`co.uk`, `com.au`…) are unprotected. Needs
+  the Public Suffix List.
+- **M4**: DMARC `sp=` never applied (`policy_for(from, from)`);
+  `fetch_policy` must return the domain the record was found at.
+- **M5**: relaxed alignment is suffix-of, not same-organisational-domain
+  — sibling subdomains fail DMARC and get rejected.
+- **M6**: DMARC fails open on DNS error (compounded by H6); `quarantine`
+  is computed then ignored.
+- **M7**: no `Authentication-Results:` header added; forged inbound ones
+  are not stripped (RFC 8601).
+- **M8**: trace-header injection — HELO/MAIL FROM free text (incl. bare
+  CR) is copied verbatim into `Received:`/`Return-Path:`. Validate HELO
+  as domain/literal and reject control characters.
+- **M9**: catch-all deliveries collapse into one copy (idempotency key
+  must include the envelope address — the temp-mail use case depends on
+  knowing which address received the mail); lossy `sanitize()`
+  collisions; MUA `new/`→`cur/` moves defeat `exists()`.
+- **M10**: state-machine sequencing (partially fixed this pass — RSET
+  keeps greeting, unknown verbs keep state): MAIL/RCPT/DATA before EHLO
+  reply `500` instead of `503`; EHLO does not reset an in-flight
+  transaction (RFC 5321 §4.1.4); 512-octet cap truncates long AUTH
+  PLAIN initial responses (RFC 4954 allows 12,288).
+- **M11**: the 30 s whole-connection cap covers DATA/DNS/fsync and can
+  fire between spool-commit and the `250` (client retries → duplicate
+  delivery). Per-phase timeouts; never cancel between commit and reply.
+- **M12**: limiter sweep is O(n) per close under one mutex; a panicking
+  session leaks the per-IP active count (use an RAII guard); IPv6 /64
+  bypasses per-IP caps entirely.
+- **M13**: `DiskSpool::list()` loads every queued payload per drain
+  pass (backlog = RAM). Stream entries; load payloads on demand.
+- **M14**: storage hygiene — 0644 files (use 0600/0700), no maildir
+  directory fsync after rename, fast-path delivery bypasses the
+  encryption boundary, 5-minute dead-letter timer with no alerting,
+  `tmp/` debris never cleaned.
+- **M16**: AUTH hardening (post-V1 but live when `--auth-users` set): no
+  failed-attempt limit, `*`-abort leaves LOGIN state (stale-username
+  confusion), case-sensitive mechanism names, non-constant-time
+  compare, plaintext credentials (Phase 8).
+- **M17**: DKIM verifier gaps — no minimum RSA size (RFC 8301), `l=`
+  honoured (unsigned trailing content verifies), `h=` not required to
+  include From, duplicate tags allowed, key `k=` not checked against
+  signature `a=`.
+- **L1–L12**: see REPORT.md §Low — DNS label encoding validation,
+  cache eviction policy, resolver privacy/DNSSEC, EHLO-per-connection
+  SPF cost, `redirect=` to no-record, per-DATA-line log spans, session
+  summary logging fields, ignored write errors, cache-key trimming
+  mismatch, TLS reload/SNI, config footguns, dnsq per-call configs.
+- **Design observations** (from the report, worth acting on): wrap
+  per-message verdict state in a `Transaction` struct created at MAIL
+  and dropped at end-of-data/RSET (the structural root of C3); make
+  every policy input total — unknown means fail or tempfail, never
+  accept; **disable AUTH in V1 builds** (a receive-only service with
+  MSA exemptions is an unrestricted spoofing channel for credential
+  holders — at minimum never advertise AUTH on port 25); consider
+  requiring `--authority` outside development (the StaticAuthority
+  fallback accepts every local-part and is C1's reachable path); settle
+  idempotency-key and commit/reply ordering before the S3/console
+  backends build on them.
+
+**Test-coverage gaps** the report mapped to findings — the regression
+tests added this pass close C1, C2, C3, C4, H1, and H8; the others
+should be written alongside their fixes.
+
+---
+
+## 7. Quick-reference: current priority list
+
+1. **Security-report open findings** (§6): H3 (ESMTP parameter parsing —
+   SPF bypass), H2 (SPF macros — PermError interim), H7 (DKIM caps),
+   then the M-tier, highest-value first (M9 idempotency, M11
+   commit/reply, M6/M4/M5 DMARC correctness, M12 limiter RAII,
+   M14 storage hygiene).
+2. **Phase 10 — Ops** (rate limiting/RCPT-probe caps — catch-all
+   domains make every probe a valid recipient; graceful shutdown;
+   IPv6 resolver/listener support). DNS caching/reuse (`DnsClient`),
+   EDNS0, the accept loop, and resolver configuration are done.
+3. **Phase 12 — Hosted address service (receive-only V1)**: authority
+   seam is done (file-backed); remaining: console-backed authority,
+   multi-domain identity (Phase 11 item), verdict policy profiles.
 4. **Phase 9 — Extensions** (the inbound-relevant parts: 8BITMIME/
-   SMTPUTF8/PIPELINING advertisement; SIZE parameter enforcement), then
-   **Phase 11** remainders as needed.
+   SMTPUTF8/PIPELINING advertisement), then **Phase 11** remainders as
+   needed.
 5. **Phase 8 — Submission semantics (sending)** — **post-V1, low
    priority**. Kept documented so the receive-only design continues to
    preserve its hooks.

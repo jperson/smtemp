@@ -10,10 +10,10 @@ Status and architecture are documented in
 [PLAN.md](PLAN.md) (work backlog) and
 [DESIGN.md](DESIGN.md) (architecture).
 
-> **Note:** accepted mail is verified, logged, and **durably spooled to
-> disk** (the `250` is only sent after the write), but not yet delivered
-> to mailboxes — local delivery is the next phase (see PLAN.md,
-> Phase 7).
+> **Note:** accepted mail is verified, **durably spooled** (the `250`
+> is only sent after the write), and **delivered to local maildirs**
+> (retried from the queue until it succeeds); hosted per-user mailboxes
+> arrive with the platform (PLAN.md, Phase 12).
 >
 > **V1 scope: receive-only.** mailserv is being built as a hosted
 > receive-only email service: point a domain's MX records at it and
@@ -255,7 +255,7 @@ cargo doc --workspace --no-deps  # rustdoc (missing_docs is warn-by-default)
 cargo test --workspace
 ```
 
-This runs ~145 tests across the workspace in four layers (see DESIGN.md
+This runs ~185 tests across the workspace in four layers (see DESIGN.md
 §9 for the rationale):
 
 1. **Unit** — pure logic per crate (DKIM canonicalization, DMARC
@@ -349,6 +349,10 @@ anything that needs the live internet.
 | `dmarc` | RFC 7489 record parsing, alignment, policy application |
 | `dkim` | RFC 6376/8463 verification |
 | `mailparse` | RFC 5322/2045 header parsing (raw + typed views) |
-| `dns` | DNS wire codec + DNS-over-TLS/TCP/UDP transports |
+| `dns` | DNS wire codec + DNS-over-TLS/TCP transports, shared pooled client |
 | `dnsq` | CLI DNS query tool (uses the `dns` crate) |
 | `smtp-client` | CLI test client |
+
+
+claude --resume 17773ca4-9b93-48ce-ae74-1003d060ce37
+pi --session 01a1ff3a-6548-7504-98a3-a0e1f5d36b8e

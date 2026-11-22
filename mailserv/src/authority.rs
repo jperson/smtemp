@@ -245,10 +245,14 @@ impl AuthorityData {
                         reason: RefusalReason::NoSuchMailbox,
                     });
                 };
-                // Still live, or inside the grace window: accept.
+                // H8 (security report): a permanent mailbox (expires:
+                // null) must always accept — the old `is_some_and` logic
+                // treated it as expired and refused every permanent user
+                // on a grace domain. Only addresses WITH an expiry can
+                // age out, and only past expiry + grace.
                 let in_grace = mb
                     .expires
-                    .is_some_and(|exp| now.as_second() < exp.as_second() + days * 86_400);
+                    .is_none_or(|exp| now.as_second() < exp.as_second() + *days * 86_400);
                 if in_grace {
                     Ok(Resolution::Accept(Self::recipient(entry, &addr)))
                 } else {
@@ -345,6 +349,12 @@ impl AuthorityFile {
                     if days == 0 {
                         anyhow::bail!("domain {name}: grace-days must be at least 1");
                     }
+                    // H8 (security report): cap the window — bounded
+                    // arithmetic in the expiry comparison, no absurd
+                    // configurations.
+                    if days > 366 {
+                        anyhow::bail!("domain {name}: grace-days must be at most 366");
+                    }
                     DomainPolicy::Grace { days: days as i64 }
                 }
             };
@@ -385,11 +395,22 @@ pub struct FileAuthority {
     state: RwLock<Arc<Loaded>>,
 }
 
-/// The loaded snapshot plus the mtime it was loaded from.
+/// The loaded snapshot plus the change token it was loaded from (mtime
+/// and file size — M15, security report: mtime alone misses a second
+/// publish within one mtime tick).
 #[derive(Debug)]
 struct Loaded {
-    mtime: Option<SystemTime>,
+    stamp: Option<(SystemTime, u64)>,
     data: AuthorityData,
+}
+
+/// The (mtime, size) change token of the file, or `None` when it cannot
+/// be stat'ed.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    std::fs::metadata(path).ok().and_then(|m| {
+        let mtime = m.modified().ok()?;
+        Some((mtime, m.len()))
+    })
 }
 
 impl FileAuthority {
@@ -400,11 +421,11 @@ impl FileAuthority {
     /// start rather than guess at recipient policy.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let mtime = file_mtime(&path);
+        let stamp = file_stamp(&path);
         let data = Self::load(&path)?;
         Ok(FileAuthority {
             path,
-            state: RwLock::new(Arc::new(Loaded { mtime, data })),
+            state: RwLock::new(Arc::new(Loaded { stamp, data })),
         })
     }
 
@@ -418,32 +439,45 @@ impl FileAuthority {
         file.into_data()
     }
 
-    /// The current snapshot, reloading first if the file's mtime moved.
-    /// A failed reload is returned as an error without disturbing the
-    /// running policy.
+    /// The current snapshot, reloading first if the file changed.
+    ///
+    /// M15 (security report): a failed reload (console publishing
+    /// non-atomically, a typo'd policy) keeps serving the **last good
+    /// snapshot** — a broken publish used to turn every RCPT for every
+    /// hosted domain into a `451` until the file was fixed, and the
+    /// failed file was re-parsed on every RCPT. The last attempted
+    /// change token is memoized, so a persistently bad file is read
+    /// once per change, not once per lookup.
     fn current(&self) -> Result<Arc<Loaded>, AuthorityUnavailable> {
-        let mtime = file_mtime(&self.path);
+        let stamp = file_stamp(&self.path);
         {
             let snapshot = self.state.read().expect("authority lock poisoned");
-            if snapshot.mtime == mtime {
+            if snapshot.stamp == stamp {
                 return Ok(Arc::clone(&snapshot));
             }
         }
         let mut snapshot = self.state.write().expect("authority lock poisoned");
         // Re-check: another thread may have reloaded while we waited.
-        if snapshot.mtime == mtime {
+        if snapshot.stamp == stamp {
             return Ok(Arc::clone(&snapshot));
         }
-        let data = Self::load(&self.path).map_err(|e| AuthorityUnavailable(e.to_string()))?;
-        *snapshot = Arc::new(Loaded { mtime, data });
+        match Self::load(&self.path) {
+            Ok(data) => {
+                *snapshot = Arc::new(Loaded { stamp, data });
+            }
+            Err(_) => {
+                // Serve the last good snapshot; memoize this change
+                // token so the broken file is not re-parsed per lookup.
+                // It will load successfully on the next content change.
+                let last_good = Arc::clone(&snapshot);
+                *snapshot = Arc::new(Loaded {
+                    stamp,
+                    data: last_good.data.clone(),
+                });
+            }
+        }
         Ok(Arc::clone(&snapshot))
     }
-}
-
-/// The file's mtime, or `None` if it cannot be stat'ed (which makes the
-/// next `current()` treat the snapshot as stale and attempt a reload).
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 impl RecipientResolver for FileAuthority {
@@ -610,11 +644,14 @@ mod tests {
                     "domains": {{ "example.org": {{ "mode": "grace", "grace-days": 7 }} }},
                     "mailboxes": {{
                         "recent@example.org": {{ "user": "u", "expires": "{}" }},
-                        "stale@example.org": {{ "user": "u", "expires": "{}" }}
+                        "stale@example.org": {{ "user": "u", "expires": "{}" }},
+                        "permanent@example.org": {{ "user": "u", "expires": null }},
+                        "future@example.org": {{ "user": "u", "expires": "{}" }}
                     }}
                 }}"#,
                 ts(now - 86_400),      // expired 1 day ago
                 ts(now - 30 * 86_400), // expired 30 days ago
+                ts(now + 30 * 86_400), // expires 30 days from now
             ),
         )
         .unwrap();
@@ -638,6 +675,19 @@ mod tests {
                 reason: RefusalReason::NoSuchMailbox,
             }
         );
+
+        // H8 (security report): permanent mailboxes (expires: null) and
+        // not-yet-expired ones must always accept on a grace domain —
+        // the old `is_some_and` logic treated every permanent mailbox as
+        // expired and refused them all.
+        assert!(matches!(
+            authority.resolve("permanent@example.org").unwrap(),
+            Resolution::Accept(_)
+        ));
+        assert!(matches!(
+            authority.resolve("future@example.org").unwrap(),
+            Resolution::Accept(_)
+        ));
     }
 
     /// Editing the file changes answers without a restart (mtime
@@ -669,11 +719,28 @@ mod tests {
             }
         );
 
-        // A malformed rewrite: resolution fails (fail-closed) but the
-        // authority object stays usable.
+        // M15 (security report): a malformed rewrite (the console
+        // publishing non-atomically) must NOT turn every RCPT into a
+        // `451` — the last good snapshot keeps serving, the broken file
+        // is not re-parsed per lookup, and the next good publish
+        // applies.
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&path, "not json at all").unwrap();
-        assert!(authority.resolve("alice@example.org").is_err());
+        assert_eq!(
+            authority.resolve("alice@example.org").unwrap(),
+            Resolution::Refuse {
+                mode: PolicyMode::Reject,
+                reason: RefusalReason::NoSuchMailbox,
+            }
+        );
+
+        // The next good publish applies.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, DOC).unwrap();
+        assert!(matches!(
+            authority.resolve("alice@example.org").unwrap(),
+            Resolution::Accept(_)
+        ));
     }
 
     /// The strict file contract: malformed documents are startup

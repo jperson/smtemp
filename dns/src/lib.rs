@@ -277,10 +277,12 @@ impl DnsClient {
         DnsClient::with_config(server, default_client_config(), timeout, None)
     }
 
-    /// A client with an explicit TLS configuration and connect endpoint
-    /// (the latter is a test seam: the mock DoT server runs on an
-    /// ephemeral port).
-    fn with_config(
+    /// A client with an explicit TLS configuration and connect endpoint.
+    ///
+    /// Test seam: a mock DoT server runs on an ephemeral port with a
+    /// private trust root, so tests inject both. Production code should
+    /// use [`DnsClient::new`]/[`DnsClient::with_timeout`].
+    pub fn with_config(
         server: Ipv4Addr,
         config: Arc<ClientConfig>,
         timeout: Duration,
@@ -330,7 +332,23 @@ impl DnsClient {
         for attempt in 0..2 {
             let mut stream = match conn.take() {
                 Some(stream) => stream,
-                None => connect(&self.endpoint_str(), &self.config).await?,
+                // H6 (security report): the connect (TCP + TLS
+                // handshake) MUST be bounded like the exchange — a
+                // black-holed resolver used to hold the shared
+                // connection mutex for the kernel's connect timeout
+                // (~2 min), stalling every lookup in every session.
+                None => {
+                    match tokio::time::timeout(
+                        self.timeout,
+                        connect(&self.endpoint_str(), &self.config),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(e)) => return Err(e.context("DNS query failed")),
+                        Err(_) => return Err(anyhow!("DNS connect timed out")),
+                    }
+                }
             };
             match tokio::time::timeout(self.timeout, exchange(&mut stream, domain, qtype)).await {
                 Ok(Ok(resp)) => {

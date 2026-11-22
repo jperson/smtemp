@@ -16,4 +16,7 @@ thiserror = { workspace = true }
 tokio = { version = "1.39.2", features = ["rt", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1.39.2", features = ["rt", "time", "macros", "net"] }
+tokio = { version = "1.39.2", features = ["rt", "time", "macros", "net", "io-util"] }
+tokio-rustls = "0.26.0"
+rustls-pki-types = "1.8.0"
+rcgen = "0.13"

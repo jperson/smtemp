@@ -504,9 +504,14 @@ pub trait SmtpSession {
     /// the next state. Every command produces a reply — there is no silent
     /// error path. `msg` includes the line ending as received.
     ///
-    /// DATA transparency handled here (RFC 5321 Section 4.5.2): a data
-    /// line whose content is exactly "." terminates the transfer (CRLF or
-    /// bare-LF ending), and any other line beginning with "." has that
+    /// DATA framing (RFC 5321 Section 4.1.1.4 / 4.5.2): in `Data` and
+    /// `Discard` states every line is message data — `RSET`, `QUIT`, and
+    /// every other verb are content, never commands, so message text can
+    /// never inject SMTP commands (the SMTP-smuggling class,
+    /// CVE-2023-51764/51765/51766). The only exit from DATA is a line
+    /// whose content is exactly `.` **with a CRLF ending** (the
+    /// terminator is `<CRLF>.<CRLF>`); a bare-LF `.` is message data,
+    /// never a terminator. Any other line beginning with `.` has that
     /// first dot removed before the line is handed to `recv_data`.
     fn handler(
         &mut self,
@@ -527,44 +532,51 @@ pub trait SmtpSession {
                 None => (msg, &b""[..]),
             };
 
+            // DATA framing first: in Data and Discard states the line is
+            // message content, full stop. Verbs are only verbs outside
+            // DATA.
+            if matches!(state, SmtpState::Data | SmtpState::Discard) {
+                // The one exit: <CRLF>.<CRLF>. A bare-LF `.` is data.
+                if content == b"." && ending == b"\r\n" {
+                    return match state {
+                        SmtpState::Data => (self.end_data().await.into_reply(), SmtpState::Ready),
+                        _ => (Vec::new(), SmtpState::Ready),
+                    };
+                }
+                if matches!(state, SmtpState::Data) {
+                    // Dot-unstuffing: a data line starting with '.' has
+                    // that first dot removed.
+                    let unstuffed = content.strip_prefix(b".").unwrap_or(content);
+                    let mut line = Vec::with_capacity(unstuffed.len() + ending.len());
+                    line.extend_from_slice(unstuffed);
+                    line.extend_from_slice(ending);
+                    return match self.recv_data(&line).await {
+                        DataControl::Continue => (Vec::new(), SmtpState::Data),
+                        DataControl::Abort(reply) => (reply, SmtpState::Discard),
+                    };
+                }
+                // Discard: swallow everything until the terminator.
+                return (Vec::new(), SmtpState::Discard);
+            }
+
             let (verb, arg) = split_verb(content);
 
             match (state, verb) {
-                // RSET and QUIT are honored in any state. Mid-DATA they are
-                // technically client protocol violations, but honoring
-                // them is safer than treating them as message lines.
+                // RSET aborts the current transaction but the session stays
+                // greeted (RFC 5321 Section 4.1.1.5): the next MAIL needs no
+                // new EHLO. Unreachable in Data/Discard (handled above —
+                // mid-DATA, RSET is message data).
                 (_, v) if eq_ignore_ascii_case(v, b"rset") => {
-                    (self.reset().await.into_reply(), SmtpState::Idle)
+                    let next = match state {
+                        SmtpState::Idle => SmtpState::Idle,
+                        SmtpState::Auth(return_to) => (**return_to).clone(),
+                        _ => SmtpState::Ready,
+                    };
+                    (self.reset().await.into_reply(), next)
                 }
                 (_, v) if eq_ignore_ascii_case(v, b"quit") => {
                     (Self::QUIT.to_vec(), SmtpState::Quit)
                 }
-
-                (&SmtpState::Data, _) => {
-                    if content == b"." {
-                        (self.end_data().await.into_reply(), SmtpState::Ready)
-                    } else {
-                        // Dot-unstuffing: a data line starting with '.' has
-                        // that first dot removed.
-                        let unstuffed = content.strip_prefix(b".").unwrap_or(content);
-                        let mut line = Vec::with_capacity(unstuffed.len() + ending.len());
-                        line.extend_from_slice(unstuffed);
-                        line.extend_from_slice(ending);
-                        match self.recv_data(&line).await {
-                            DataControl::Continue => (Vec::new(), SmtpState::Data),
-                            DataControl::Abort(reply) => (reply, SmtpState::Discard),
-                        }
-                    }
-                }
-
-                (&SmtpState::Discard, _) => (
-                    Vec::new(),
-                    if content == b"." {
-                        SmtpState::Ready
-                    } else {
-                        SmtpState::Discard
-                    },
-                ),
 
                 (&SmtpState::Idle | &SmtpState::Ready, v)
                     if eq_ignore_ascii_case(v, b"helo") || eq_ignore_ascii_case(v, b"ehlo") =>
@@ -675,7 +687,11 @@ pub trait SmtpSession {
                     (Self::OK.to_vec(), SmtpState::Ready)
                 }
 
-                _ => (Self::UNKNOWN.to_vec(), SmtpState::Idle),
+                // An unknown or out-of-state verb is refused but the
+                // session keeps its state: dropping to Idle would silently
+                // discard the envelope (a later MAIL would then see the
+                // stale sender) and de-greet the session.
+                _ => (Self::UNKNOWN.to_vec(), state.clone()),
             }
         }
     }
@@ -1392,14 +1408,22 @@ mod tests {
         );
     }
 
-    /// The terminator is "." with either CRLF or a bare LF.
+    /// The terminator is exactly <CRLF>.<CRLF>. A bare-LF `.` is message
+    /// data (an empty line), never a terminator — this closes the
+    /// SMTP-smuggling parser differential (CVE-2023-51764 class).
     #[tokio::test]
-    async fn lf_dot_terminates_data() {
+    async fn lf_dot_is_message_data_not_a_terminator() {
         let mut s = TestSession::default();
+        // Bare-LF dot: an empty line of data, still in DATA.
+        expect(&mut s, SmtpState::Data, b".\n", b"", SmtpState::Data).await;
+        assert_eq!(s.data_lines, vec![b"\n".to_vec()]);
+        assert_eq!(s.end_data_calls, 0);
+
+        // Only CRLF.CRLF terminates.
         expect(
             &mut s,
             SmtpState::Data,
-            b".\n",
+            b".\r\n",
             b"250 accepted\r\n",
             SmtpState::Ready,
         )
@@ -1446,9 +1470,9 @@ mod tests {
         .await;
 
         // Remaining body lines are swallowed without being recorded or
-        // mistaken for commands. QUIT still ends the session: it is matched
-        // before the discard arm, which is the safe response for a client
-        // that aborts and then hangs up.
+        // mistaken for commands — including QUIT (message content, not a
+        // command — the SMTP-smuggling class). The only exit is the
+        // CRLF dot terminator.
         expect(
             &mut s,
             SmtpState::Discard,
@@ -1461,10 +1485,11 @@ mod tests {
             &mut s,
             SmtpState::Discard,
             b"QUIT\r\n",
-            TestSession::QUIT,
-            SmtpState::Quit,
+            b"",
+            SmtpState::Discard,
         )
         .await;
+        expect(&mut s, SmtpState::Discard, b".\r\n", b"", SmtpState::Ready).await;
     }
 
     #[tokio::test]
@@ -1528,8 +1553,11 @@ mod tests {
         assert_eq!(s.end_data_calls, 1);
     }
 
+    /// RSET aborts the transaction but the session stays greeted
+    /// (RFC 5321 Section 4.1.1.5): the next MAIL works without a new
+    /// EHLO.
     #[tokio::test]
-    async fn rset_clears_envelope_and_returns_to_idle() {
+    async fn rset_clears_envelope_and_keeps_the_session_greeted() {
         let mut s = TestSession::default();
         expect(
             &mut s,
@@ -1553,16 +1581,31 @@ mod tests {
             SmtpState::Ready,
             b"RSET\r\n",
             TestSession::OK,
-            SmtpState::Idle,
+            SmtpState::Ready,
         )
         .await;
         assert_eq!(s.reset_calls, 1);
         assert_eq!(s.mail_from, None, "RSET must clear the envelope");
         assert!(s.rcpt_to.is_empty());
+
+        // The session is still greeted: MAIL works without a new EHLO.
+        expect(
+            &mut s,
+            SmtpState::Ready,
+            b"MAIL FROM:<e@f>\r\n",
+            TestSession::OK,
+            SmtpState::Ready,
+        )
+        .await;
     }
 
+    /// SMTP smuggling (CVE-2023-51764 class): in DATA state, message
+    /// lines that look like commands — RSET, QUIT, MAIL, DATA, even a
+    /// bare-LF dot — are message content, never commands. The message
+    /// continues to its real CRLF.CRLF terminator and nothing inside the
+    /// body reaches the command parser.
     #[tokio::test]
-    async fn rset_and_quit_work_mid_data() {
+    async fn smtp_smuggling_is_prevented() {
         let mut s = TestSession::default();
         expect(
             &mut s,
@@ -1572,44 +1615,34 @@ mod tests {
             SmtpState::Data,
         )
         .await;
-        expect(
-            &mut s,
-            SmtpState::Data,
-            b"body line\r\n",
-            b"",
-            SmtpState::Data,
-        )
-        .await;
 
-        // RSET mid-DATA aborts the transfer and clears the envelope.
+        // Every one of these is message data.
+        for line in [
+            &b"RSET\r\n"[..],
+            b"QUIT\r\n".as_slice(),
+            b"MAIL FROM:<attacker@evil.example>\r\n".as_slice(),
+            b"RCPT TO:<victim@example.org>\r\n".as_slice(),
+            b"DATA\r\n".as_slice(),
+            b".\n".as_slice(),
+        ] {
+            expect(&mut s, SmtpState::Data, line, b"", SmtpState::Data).await;
+        }
+        assert_eq!(s.reset_calls, 0, "nothing mid-DATA may abort the message");
+        assert_eq!(s.end_data_calls, 0);
+        assert_eq!(s.data_lines.len(), 6);
+
+        // The real terminator ends the transaction; the body lines were
+        // never commands.
         expect(
             &mut s,
             SmtpState::Data,
-            b"RSET\r\n",
-            TestSession::OK,
-            SmtpState::Idle,
-        )
-        .await;
-        assert_eq!(s.reset_calls, 1);
-        assert!(s.data_lines.is_empty());
-
-        // QUIT mid-DATA ends the session (via a fresh DATA mode).
-        expect(
-            &mut s,
+            b".\r\n",
+            b"250 accepted\r\n",
             SmtpState::Ready,
-            b"DATA\r\n",
-            TestSession::SEND_DATA,
-            SmtpState::Data,
         )
         .await;
-        expect(
-            &mut s,
-            SmtpState::Data,
-            b"QUIT\r\n",
-            TestSession::QUIT,
-            SmtpState::Quit,
-        )
-        .await;
+        assert_eq!(s.end_data_calls, 1);
+        assert_eq!(s.mail_from, None, "no smuggled MAIL FROM may be recorded");
     }
 
     // -- AUTH (RFC 4954) -------------------------------------------------

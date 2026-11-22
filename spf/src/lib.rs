@@ -202,6 +202,11 @@ fn take_answers<T>(resp: DnsMessage, f: impl Fn(QType) -> Option<T>) -> Result<V
 
 impl SpfResolver for DotResolver {
     async fn txt(&self, domain: &str) -> Result<Vec<String>> {
+        // H1 (security report): the query types here were the last thing
+        // on the wire — `a` used to query type 22 (NSAP-PTR) instead of
+        // 1 (A), so `a`/`mx`/`ptr`/`exists` never matched and legitimate
+        // senders got 550. The wire-level regression test runs this impl
+        // against a mock DoT server and asserts the qtype byte.
         let resp = self.query(domain, 0x10).await?;
         take_answers(resp, |r| match r {
             QType::TXT(s) => Some(s),
@@ -210,7 +215,8 @@ impl SpfResolver for DotResolver {
     }
 
     async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
-        let resp = self.query(domain, 0x16).await?;
+        // 0x01 = A (H1: 0x16 was NSAP-PTR — an A record never came back).
+        let resp = self.query(domain, 0x01).await?;
         take_answers(resp, |r| match r {
             QType::A(ip) => Some(ip),
             _ => None,
@@ -1058,6 +1064,118 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the query must give up after the timeout, not hang"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire {
+    use super::*;
+    use dns::proto::{DnsResourceRecord, Label};
+    use dns::DnsClient;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    /// A minimal DNS-over-TLS test server (H1, security report): answers
+    /// every query with a single A record for 192.0.2.1 and records the
+    /// qtype of every query. Returns the bound address, the server cert
+    /// (the client's trust store must contain it), and the qtype counter.
+    async fn spawn_mock_dot() -> (
+        std::net::SocketAddr,
+        rustls_pki_types::CertificateDer<'static>,
+        Arc<AtomicU32>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = rustls_pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let qtypes = Arc::new(AtomicU32::new(0));
+        let qtypes_task = Arc::clone(&qtypes);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let Ok(mut tls) = acceptor.accept(sock).await else {
+                    continue;
+                };
+                loop {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let Ok(len) = tls.read_u16().await else {
+                        break;
+                    };
+                    if len == 0 {
+                        break;
+                    }
+                    let mut buf = vec![0; usize::from(len)];
+                    if tls.read_exact(&mut buf).await.is_err() {
+                        break;
+                    }
+                    let Ok((_, query)) = DnsMessage::from_bytes(&buf) else {
+                        break;
+                    };
+                    qtypes_task.fetch_add(
+                        u32::from(query.questions.first().map(|q| q.record_type).unwrap_or(0)),
+                        Ordering::SeqCst,
+                    );
+                    let mut resp =
+                        DnsMessage::new(query.header.transaction_id, query.questions.clone());
+                    resp.header.qr = 1;
+                    resp.answers.push(DnsResourceRecord {
+                        name: Label::new(String::new()),
+                        record_type: 1,
+                        record_class: 1,
+                        ttl: 60,
+                        rdlength: 4,
+                        rdata: QType::A("192.0.2.1".parse().unwrap()),
+                    });
+                    let bytes = resp.to_vec().unwrap();
+                    if tls.write_u16(bytes.len() as u16).await.is_err()
+                        || tls.write_all(&bytes).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        (addr, cert_der, qtypes)
+    }
+
+    /// H1 (security report): `DotResolver::a()` must query **type 1 (A)**.
+    /// It used to query type 22 (NSAP-PTR), so `a`/`mx`/`ptr`/`exists`
+    /// never matched anything and every empty lookup counted as a void
+    /// lookup — legitimate senders got 550. This test runs the resolver
+    /// against a real mock DoT server and asserts the qtype that went
+    /// over the wire, plus that the A answer actually comes back.
+    #[tokio::test]
+    async fn a_lookups_query_type_1_over_the_wire() {
+        let (addr, server_cert, qtypes) = spawn_mock_dot().await;
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(server_cert).unwrap();
+        let config = Arc::new(
+            tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let client = DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            config,
+            Duration::from_secs(5),
+            Some(format!("127.0.0.1:{}", addr.port())),
+        );
+        let resolver = DotResolver::shared(Arc::new(client));
+
+        let ips = resolver.a("example.test").await.unwrap();
+        assert_eq!(ips, vec!["192.0.2.1".parse::<Ipv4Addr>().unwrap()]);
+        assert_eq!(
+            qtypes.load(Ordering::SeqCst),
+            1,
+            "the wire query must carry qtype 1 (A)"
         );
     }
 }

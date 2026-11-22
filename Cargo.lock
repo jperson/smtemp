@@ -1631,9 +1631,12 @@ dependencies = [
  "jiff",
  "logos",
  "memchr",
+ "rcgen",
+ "rustls-pki-types",
  "serde",
  "thiserror 2.0.12",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

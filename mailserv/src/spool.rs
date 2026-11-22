@@ -216,9 +216,9 @@ impl DiskSpool {
         let root = root.into();
         let tmp = root.join("tmp");
         let new_dir = root.join("new");
-        std::fs::create_dir_all(&tmp)
+        crate::fsutil::create_private_dir_all(&tmp)
             .with_context(|| format!("cannot create spool dir {}", tmp.display()))?;
-        std::fs::create_dir_all(&new_dir)
+        crate::fsutil::create_private_dir_all(&new_dir)
             .with_context(|| format!("cannot create spool dir {}", new_dir.display()))?;
         Ok(DiskSpool {
             tmp,
@@ -330,7 +330,7 @@ impl DiskSpool {
             .parent()
             .unwrap_or(Path::new("."))
             .join("dead-letter");
-        std::fs::create_dir_all(&dead)
+        crate::fsutil::create_private_dir_all(&dead)
             .with_context(|| format!("cannot create dead-letter dir {}", dead.display()))?;
         // Metadata first again: a dead-lettered message is "complete"
         // only with its metadata present.
@@ -468,8 +468,8 @@ impl SpoolWriter for DiskSpool {
 /// message names the path, and the caller decides whether partial state
 /// at `path` needs cleanup.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+    let mut f = crate::fsutil::create_private_file(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("cannot write {}", path.display()))?;
     f.sync_all()

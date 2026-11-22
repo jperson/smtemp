@@ -894,6 +894,7 @@ dependencies = [
  "dmarc",
  "dns",
  "jiff",
+ "libc",
  "mailparse",
  "rcgen",
  "rustls-pemfile",

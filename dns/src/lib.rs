@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 //use rand::Rng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{CertificateDer, ServerName};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -23,12 +23,20 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
 /// The DNS protocol module: message/record codec and wire helpers.
 pub mod proto;
 use crate::proto::{DnsMessage, DnsQuestion, DnsResourceRecord, Label, QType};
+
+/// Whether `err` (from [`DnsClient::query`]) means the name itself is
+/// invalid ([`proto::InvalidName`]): nothing was sent, and retrying can't
+/// help. Callers treat it like a name that does not exist (RFC 7208 §4.3),
+/// not like a transient resolver failure.
+pub fn is_invalid_name(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<proto::InvalidName>().is_some()
+}
 
 /// Verify a response actually answers our query (RFC 5452 hardening
 /// against resolver confusion and spoofed datagrams): the transaction ID
@@ -67,7 +75,7 @@ pub async fn query_tls<'query>(
     let id: u16 = rng.gen();
 
     let question = DnsQuestion {
-        name: Label::new(domain.to_string()),
+        name: Label::new(proto::normalize_name(domain)?.to_string()),
         record_type,
         record_class,
     };
@@ -113,7 +121,7 @@ pub async fn query_tcp<'query>(
     let id: u16 = rng.gen();
 
     let question = DnsQuestion {
-        name: Label::new(domain.to_string()),
+        name: Label::new(proto::normalize_name(domain)?.to_string()),
         record_type,
         record_class,
     };
@@ -722,6 +730,27 @@ impl DnsClient {
         }
     }
 
+    /// Also trust `roots` when verifying the resolver's certificate, so a
+    /// local resolver with a private or self-signed certificate can be
+    /// used (`--resolver-ca`). Call before the first query.
+    ///
+    /// The roots are **added** to the public webpki roots, not substituted
+    /// for them, so public DoT resolvers keep working. They apply only to
+    /// this DNS client. The certificate is still checked against the
+    /// resolver's IP address, so it must carry that address as an IP
+    /// subject alternative name. This replaces any TLS configuration given
+    /// to [`DnsClient::with_config`].
+    ///
+    /// Returns `Err` if a certificate is not a usable trust anchor.
+    pub fn with_extra_roots(mut self, roots: &[CertificateDer<'static>]) -> Result<Self> {
+        self.config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store(roots)?)
+                .with_no_client_auth(),
+        );
+        Ok(self)
+    }
+
     /// Use `connections` pipelined connections (clamped to
     /// `1..=`[`MAX_CONNECTIONS`]). Call before the first query.
     pub fn with_connections(mut self, connections: usize) -> Self {
@@ -798,10 +827,20 @@ impl DnsClient {
     /// semantics — or `Err` when the resolver could not be consulted
     /// (connect failure, connection failure after the retry, protocol
     /// violation, or the per-query timeout elapsing).
+    ///
+    /// A name with no valid wire form (an empty label, a label over 63
+    /// octets, or a name over 253) is refused **before** anything is sent,
+    /// with an [`InvalidName`](crate::proto::InvalidName) error (see
+    /// [`is_invalid_name`]). Such names are attacker-reachable (SPF
+    /// records, DKIM `d=`/`s=`), and public resolvers silently drop the
+    /// malformed query, so each one used to cost the full timeout (D3 in
+    /// DEPLOYMENT.md). Surrounding whitespace and one trailing dot are
+    /// removed first, so the cache key and the name sent are identical.
     pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
+        let domain = proto::normalize_name(domain).map_err(anyhow::Error::new)?;
         let stats = &self.stats;
         stats.queries.fetch_add(1, Ordering::Relaxed);
-        let key = (domain.trim().to_ascii_lowercase(), qtype);
+        let key = (domain.to_ascii_lowercase(), qtype);
         if let Some(hit) = lock(&self.cache).get(&key, Instant::now()) {
             stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
@@ -937,13 +976,31 @@ impl DnsClient {
 /// query, which matters because loading the root store dominated the
 /// old per-query cost alongside the handshake itself.
 fn default_client_config() -> Arc<ClientConfig> {
-    let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let root_cert_store = root_store(&[]).expect("no extra roots to reject");
     Arc::new(
         ClientConfig::builder()
             .with_root_certificates(root_cert_store)
             .with_no_client_auth(),
     )
+}
+
+/// The resolver trust store: the public webpki roots **plus** `extra`.
+///
+/// The extra roots are added, never substituted, so a client configured
+/// with a private CA for a local resolver still verifies public DoT
+/// resolvers (1.1.1.1, 9.9.9.9, ...) exactly as before.
+///
+/// Returns `Err` if an extra certificate is not a usable trust anchor
+/// (for example, not DER-encoded X.509).
+fn root_store(extra: &[CertificateDer<'static>]) -> Result<RootCertStore> {
+    let mut store = RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for (i, cert) in extra.iter().enumerate() {
+        store
+            .add(cert.clone())
+            .with_context(|| format!("resolver CA certificate #{} is not a usable root", i + 1))?;
+    }
+    Ok(store)
 }
 
 /// Establish a DNS-over-TLS connection to `endpoint`.
@@ -1175,6 +1232,170 @@ mod tests {
         });
 
         (addr, cert_der, conns, queries)
+    }
+
+    /// `--resolver-ca` (D2, DEPLOYMENT.md): extra roots are added to the
+    /// public webpki set, never substituted for it, so public DoT
+    /// resolvers keep verifying when a private CA is configured.
+    #[test]
+    fn extra_roots_are_added_to_the_public_roots() {
+        let public = webpki_roots::TLS_SERVER_ROOTS.len();
+        assert_eq!(root_store(&[]).unwrap().len(), public);
+
+        let private = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .cert
+            .der()
+            .clone();
+        assert_eq!(root_store(&[private]).unwrap().len(), public + 1);
+
+        // Bytes that are not a certificate are refused, not ignored.
+        let garbage = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+        assert!(root_store(&[garbage]).is_err());
+    }
+
+    /// D3 / L1: names are checked against the RFC 1035 limits before they
+    /// can be encoded or sent.
+    #[test]
+    fn name_limits() {
+        use crate::proto::{check_name, normalize_name};
+        let label = |n: usize| "a".repeat(n);
+
+        assert!(check_name(&format!("{}.example.com", label(63))).is_ok());
+        assert!(check_name(&format!("{}.example.com", label(64))).is_err());
+        // 253 octets in text form is the longest valid name.
+        let long = |total: usize| {
+            let mut s = String::new();
+            while s.len() + 2 <= total {
+                s.push_str("a.");
+            }
+            s.push('a');
+            s.truncate(total);
+            s.trim_end_matches('.').to_string()
+        };
+        assert_eq!(long(253).len(), 253);
+        assert!(check_name(&long(253)).is_ok());
+        assert!(check_name(&format!("{}a.b", long(252))).is_err());
+        for bad in ["a..b", ".a", "a.", ".."] {
+            assert!(check_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        // The root name is encodable, but never queried.
+        assert!(check_name("").is_ok());
+        assert!(normalize_name("").is_err());
+        assert!(normalize_name(".").is_err());
+        // One trailing dot and surrounding whitespace are normalized away.
+        assert_eq!(normalize_name(" Example.COM. ").unwrap(), "Example.COM");
+        assert!(normalize_name("example.com..").is_err());
+        // The error message is bounded even for a huge name.
+        let err = check_name(&label(10_000)).unwrap_err().to_string();
+        assert!(err.len() < 200, "{err}");
+    }
+
+    /// L1: the encoder refuses a label it can't represent instead of
+    /// writing its length into the pointer/extended-label bits.
+    #[test]
+    fn encoder_refuses_oversized_labels() {
+        let ok = Label::new(format!("{}.example.com", "a".repeat(63)));
+        assert_eq!(ok.to_bytes().unwrap()[0], 63);
+        for bad in [
+            "a".repeat(64),
+            "a".repeat(200),
+            "a".repeat(300),
+            "a..b".into(),
+        ] {
+            assert!(Label::new(bad.clone()).to_bytes().is_err(), "{bad:?}");
+        }
+        let question = DnsMessage::new(
+            1,
+            vec![DnsQuestion {
+                name: Label::new("a".repeat(70)),
+                record_type: 1,
+                record_class: 1,
+            }],
+        );
+        assert!(question.to_vec().is_err());
+    }
+
+    /// D3: an invalid name is refused before anything touches the
+    /// network: no capacity, no connection, an `InvalidName` error.
+    #[tokio::test]
+    async fn invalid_names_are_refused_without_a_query() {
+        let client = DnsClient::with_timeout("127.0.0.1".parse().unwrap(), Duration::from_secs(30));
+        let started = Instant::now();
+        for bad in [
+            format!("{}.example.com", "s".repeat(70)),
+            "a..b.example".to_string(),
+            String::new(),
+        ] {
+            let err = client.query(&bad, 16).await.unwrap_err();
+            assert!(is_invalid_name(&err), "{err:#}");
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let stats = client.stats();
+        assert_eq!(stats.connects, 0, "nothing may be sent for an invalid name");
+        assert_eq!(stats.queries, 0);
+    }
+
+    /// The name is normalized once, so `a.test.` and `a.test` are one
+    /// cache entry (and the trailing-dot form is valid; it used to encode
+    /// as an empty label, i.e. a malformed query).
+    #[tokio::test]
+    async fn trailing_dot_names_share_the_cache_entry() {
+        use std::sync::atomic::Ordering;
+        let (addr, server_cert, _conns, queries) = spawn_mock_dot(None).await;
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(server_cert).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let client = DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            config,
+            Duration::from_secs(5),
+            Some(format!("127.0.0.1:{}", addr.port())),
+        );
+        client.query("a.test.", 1).await.unwrap();
+        client.query(" A.test ", 1).await.unwrap();
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(client.stats().cache_hits, 1);
+    }
+
+    /// D2: a resolver with a private (here self-signed) certificate is
+    /// refused by default and trusted once its CA is added.
+    #[tokio::test]
+    async fn extra_root_trusts_a_private_resolver() {
+        let (addr, server_cert, _conns, _queries) = spawn_mock_dot(None).await;
+        let endpoint = format!("127.0.0.1:{}", addr.port());
+        let client = |config| {
+            DnsClient::with_config(
+                "127.0.0.1".parse().unwrap(),
+                config,
+                Duration::from_secs(5),
+                Some(endpoint.clone()),
+            )
+        };
+
+        // Public roots only: the private certificate does not verify.
+        let err = client(default_client_config())
+            .query("a.test", 1)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("TLS handshake"),
+            "expected a TLS verification failure, got {err:#}"
+        );
+
+        // With the CA added, the same resolver is trusted.
+        let trusted = client(default_client_config())
+            .with_extra_roots(&[server_cert])
+            .unwrap();
+        let resp = trusted.query("a.test", 1).await.unwrap();
+        assert!(matches!(
+            resp.answers.first().map(|a| &a.rdata),
+            Some(QType::A(_))
+        ));
     }
 
     /// Reuse and caching against a real DoT endpoint: repeated

@@ -473,7 +473,15 @@ impl Label {
 
     /// Serialize the name as uncompressed wire labels plus the root
     /// terminator.
+    ///
+    /// Returns `Err` ([`InvalidName`]) for a name that has no valid wire
+    /// form (see [`check_name`]). Previously such names were written
+    /// anyway: a label's length was cast to one octet, so a 64-255 octet
+    /// label set the top bits that mark a compression pointer or an
+    /// extended label type, a longer one wrapped around, and an empty
+    /// label ended the name early (L1/D3 in REPORT.md and DEPLOYMENT.md).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        check_name(&self.0)?;
         let mut data: Vec<u8> = vec![];
 
         if !self.0.is_empty() {
@@ -486,6 +494,88 @@ impl Label {
         data.push(0x00);
         Ok(data)
     }
+}
+
+/// The longest label: 63 octets (RFC 1035 §2.3.4). The two top bits of
+/// the length octet are reserved for compression pointers (`0xC0`) and
+/// extended label types (`0x40`).
+pub const MAX_LABEL_OCTETS: usize = 63;
+
+/// The longest name in text form, without a trailing dot: 253 octets,
+/// which is 255 on the wire (a length octet per label plus the root
+/// terminator; RFC 1035 §2.3.4).
+pub const MAX_NAME_OCTETS: usize = 253;
+
+/// A name that can't be sent as a DNS query: an empty label (`a..b`,
+/// `.a`), a label over [`MAX_LABEL_OCTETS`], or a name over
+/// [`MAX_NAME_OCTETS`]. RFC 7208 §4.3 treats such a name like one that
+/// does not exist, which is how SPF handles this error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidName {
+    /// The offending name.
+    pub name: String,
+    /// What is wrong with it.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Bounded: the name may be attacker-supplied and arbitrarily long.
+        let shown: String = self.name.chars().take(80).collect();
+        let more = if self.name.chars().count() > 80 {
+            "..."
+        } else {
+            ""
+        };
+        write!(f, "invalid DNS name {shown:?}{more}: {}", self.reason)
+    }
+}
+
+impl std::error::Error for InvalidName {}
+
+/// Check that `name` (text form, no trailing dot) has a valid wire
+/// encoding. The empty string is the root name and is valid.
+///
+/// Returns `Err` describing the first problem found.
+pub fn check_name(name: &str) -> Result<(), InvalidName> {
+    let invalid = |reason| InvalidName {
+        name: name.to_string(),
+        reason,
+    };
+    if name.is_empty() {
+        return Ok(());
+    }
+    if name.len() > MAX_NAME_OCTETS {
+        return Err(invalid("name longer than 253 octets"));
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Err(invalid("empty label"));
+        }
+        if label.len() > MAX_LABEL_OCTETS {
+            return Err(invalid("label longer than 63 octets"));
+        }
+    }
+    Ok(())
+}
+
+/// Normalize a name for querying: trim surrounding whitespace, drop one
+/// trailing dot (`example.com.` is the same name as `example.com`), then
+/// [`check_name`]. The root name is refused here: nothing in the mail
+/// checks has a reason to query it.
+///
+/// Returns the normalized name (a sub-slice of `name`) or the error.
+pub fn normalize_name(name: &str) -> Result<&str, InvalidName> {
+    let trimmed = name.trim();
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        return Err(InvalidName {
+            name: name.to_string(),
+            reason: "empty name",
+        });
+    }
+    check_name(trimmed)?;
+    Ok(trimmed)
 }
 
 impl From<&Label> for String {

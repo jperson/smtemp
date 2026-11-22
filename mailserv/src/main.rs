@@ -24,7 +24,9 @@ use spf::SpfResult;
 
 mod authority;
 mod delivery;
+mod fsutil;
 mod limit;
+mod privdrop;
 mod spool;
 
 /// One DKIM verification outcome, summarized for structured logging.
@@ -101,6 +103,14 @@ struct Args {
     #[arg(long)]
     resolver: Option<Ipv4Addr>,
 
+    /// PEM file of extra CA certificates to trust for the resolver's
+    /// DNS-over-TLS certificate, so a local resolver with a private or
+    /// self-signed certificate can be used. Added to the public roots, not
+    /// substituted, so public resolvers keep working. The certificate must
+    /// name the --resolver address as an IP subject alternative name.
+    #[arg(long, value_name = "FILE")]
+    resolver_ca: Option<String>,
+
     /// Pipelined DNS-over-TLS connections to the resolver (1-16, default
     /// 2). Each carries up to 64 queries in flight.
     #[arg(long, value_name = "N")]
@@ -132,13 +142,29 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     authority: Option<String>,
 
+    /// Unprivileged user to switch to right after binding the port, when
+    /// started as root (required then: running as root without it is
+    /// refused). Name or numeric uid.
+    #[arg(long, value_name = "USER")]
+    user: Option<String>,
+
+    /// Group to switch to with --user (name or numeric gid; default: the
+    /// user's primary group).
+    #[arg(long, value_name = "GROUP")]
+    group: Option<String>,
+
+    /// On SIGTERM/SIGINT, how long sessions in progress may take to
+    /// finish before the process exits (milliseconds, default 60000).
+    #[arg(long, value_name = "MS")]
+    shutdown_grace_ms: Option<u64>,
+
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, resolver, dns-connections,
+    /// tls-cert, tls-key, auth-users, resolver, resolver-ca, dns-connections,
     /// spool-dir, maildir-dir,
     /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
-    /// max-dns-per-ip,
+    /// max-dns-per-ip, user, group, shutdown-grace-ms,
     /// local-domains, authority); every key
     /// optional.
     #[arg(long, value_name = "FILE")]
@@ -163,11 +189,15 @@ struct FileConfig {
     tls_key: Option<String>,
     auth_users: Option<String>,
     resolver: Option<Ipv4Addr>,
+    resolver_ca: Option<String>,
     dns_connections: Option<usize>,
     spool_dir: Option<String>,
     maildir_dir: Option<String>,
     local_domains: Option<String>,
     authority: Option<String>,
+    user: Option<String>,
+    group: Option<String>,
+    shutdown_grace_ms: Option<u64>,
 }
 
 /// Fully resolved server configuration (CLI > file > built-in defaults).
@@ -190,6 +220,9 @@ struct Config {
     auth_users: Option<String>,
     /// DNS-over-TLS resolver address; always resolved (default 1.1.1.1).
     resolver: Ipv4Addr,
+    /// Extra CA certificates (PEM file) trusted for the resolver, on top
+    /// of the public roots; None trusts the public roots only.
+    resolver_ca: Option<String>,
     /// Pipelined DoT connections to the resolver (default
     /// [`dns::DEFAULT_CONNECTIONS`]).
     dns_connections: usize,
@@ -201,6 +234,12 @@ struct Config {
     /// Recipient authority file; None uses the static fallback built
     /// from local-domains (pre-authority behavior).
     authority: Option<String>,
+    /// User to drop to after binding, when started as root.
+    user: Option<String>,
+    /// Group for `user` (default: the user's primary group).
+    group: Option<String>,
+    /// How long in-progress sessions may run after SIGTERM/SIGINT.
+    shutdown_grace_ms: u64,
 }
 
 /// How long a single authority lookup may take before the RCPT is
@@ -225,14 +264,59 @@ enum AuthorityAnswer {
 /// The default DNS-over-TLS resolver.
 const DEFAULT_RESOLVER: &str = "1.1.1.1";
 
+/// The default listening port: 25, the MX port (RFC 5321 §4.5.4.2).
+/// Binding it needs root or `CAP_NET_BIND_SERVICE`; as root, `--user` is
+/// required so privileges are dropped right after binding. Use
+/// `--port 2525` to test as an ordinary user.
+const DEFAULT_PORT: u16 = 25;
+
+/// The default per-message size limit: 10 MiB, in line with Postfix's
+/// 10,240,000-byte `message_size_limit` default. Large enough for typical
+/// attachments after base64 inflation; raise it (and size memory, see
+/// DEPLOYMENT.md D5) for more. Hosted domains can set a lower limit of
+/// their own (`max-message-bytes` in the authority file).
+const DEFAULT_MAX_DATA_BYTES: usize = 10 * 1024 * 1024;
+
+/// The default whole-connection time limit: 5 minutes. RFC 5321
+/// §4.5.3.2 recommends a 3-minute timeout per DATA block and 10 minutes
+/// for end-of-data, but this cap covers a whole session (TLS, envelope,
+/// DATA, the checks) and is the backstop against clients that keep a slot
+/// with slow, valid traffic. 5 minutes fits a 10 MiB message (about 84
+/// Mbit) over a link of about 350 kbit/s or faster, after the DNS checks
+/// (at most about 20 s each for HELO SPF, MAIL SPF and end-of-data);
+/// per-read idleness is limited separately by `max-read-duration-ms`.
+const DEFAULT_MAX_CONN_DURATION_MS: u64 = 5 * 60 * 1000;
+
+/// The default server-wide connection limit: 100, the same as Postfix's
+/// `default_process_limit`. Each session can buffer up to about twice
+/// `max-data-bytes` during DATA (DEPLOYMENT.md D5), so 100 × 2 × 10 MiB
+/// bounds message buffers at about 2 GiB in the worst case; real
+/// concurrency in DATA is far lower. Over the limit, connections get
+/// `421` and retry.
+const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+
+/// The default shutdown grace period: 60 s. After SIGTERM/SIGINT, idle
+/// sessions get `421` at once and sessions mid-message finish theirs;
+/// whatever is still running after this long is closed. Below systemd's
+/// default `TimeoutStopSec` (90 s), so mailserv exits on its own terms.
+const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 60 * 1000;
+
+/// The default spool directory. Absolute, so it never depends on the
+/// working directory (systemd's default is `/`).
+const DEFAULT_SPOOL_DIR: &str = "/var/lib/mailserv/spool";
+
+/// The default maildir root. Absolute for the same reason.
+const DEFAULT_MAILDIR_DIR: &str = "/var/lib/mailserv/maildir";
+
 /// Merge CLI arguments over config-file values over built-in defaults.
 fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
+    let cli_or_file_user_set = cli.user.is_some() || file.user.is_some();
     Ok(Config {
         host: cli
             .host
             .or(file.host)
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        port: cli.port.or(file.port).unwrap_or(2525),
+        port: cli.port.or(file.port).unwrap_or(DEFAULT_PORT),
         domain: cli
             .domain
             .or(file.domain)
@@ -240,16 +324,19 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         max_data_bytes: cli
             .max_data_bytes
             .or(file.max_data_bytes)
-            .unwrap_or(1024 * 1024),
+            .unwrap_or(DEFAULT_MAX_DATA_BYTES),
         max_conn_duration_ms: cli
             .max_conn_duration_ms
             .or(file.max_conn_duration_ms)
-            .unwrap_or(30 * 1000),
+            .unwrap_or(DEFAULT_MAX_CONN_DURATION_MS),
         max_read_duration_ms: cli
             .max_read_duration_ms
             .or(file.max_read_duration_ms)
             .unwrap_or(15 * 1000),
-        max_connections: cli.max_connections.or(file.max_connections).unwrap_or(500),
+        max_connections: cli
+            .max_connections
+            .or(file.max_connections)
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS),
         max_conn_per_ip: cli.max_conn_per_ip.or(file.max_conn_per_ip).unwrap_or(10),
         max_conn_rate_per_ip: cli
             .max_conn_rate_per_ip
@@ -268,6 +355,7 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
                 .parse()
                 .expect("DEFAULT_RESOLVER is a valid IPv4 address")
         }),
+        resolver_ca: cli.resolver_ca.or(file.resolver_ca),
         dns_connections: match cli.dns_connections.or(file.dns_connections) {
             None => dns::DEFAULT_CONNECTIONS,
             Some(n) if (1..=dns::MAX_CONNECTIONS).contains(&n) => n,
@@ -279,13 +367,22 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         spool_dir: cli
             .spool_dir
             .or(file.spool_dir)
-            .unwrap_or_else(|| "spool".to_string()),
+            .unwrap_or_else(|| DEFAULT_SPOOL_DIR.to_string()),
         maildir_dir: cli
             .maildir_dir
             .or(file.maildir_dir)
-            .unwrap_or_else(|| "maildir".to_string()),
+            .unwrap_or_else(|| DEFAULT_MAILDIR_DIR.to_string()),
         local_domains: cli.local_domains.or(file.local_domains),
         authority: cli.authority.or(file.authority),
+        user: cli.user.or(file.user),
+        group: match (cli.group.or(file.group), cli_or_file_user_set) {
+            (Some(_), false) => anyhow::bail!("--group requires --user"),
+            (group, _) => group,
+        },
+        shutdown_grace_ms: cli
+            .shutdown_grace_ms
+            .or(file.shutdown_grace_ms)
+            .unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
     })
 }
 
@@ -305,6 +402,19 @@ const BAD_RCPT: &[u8] = b"553 5.1.3 Bad recipient address syntax\r\n";
 /// whole wait ([`limit::DNS_LIMIT_WAIT`]); retryable.
 const DNS_BUSY: &[u8] =
     b"451 4.7.0 Too many concurrent DNS checks from your address, try again later\r\n";
+/// The end-of-data DNS work (DKIM key lookups plus the DMARC policy
+/// fetch) didn't finish within [`END_OF_DATA_DNS_DEADLINE`]; retryable.
+const EOD_DNS_TIMEOUT: &[u8] =
+    b"451 4.4.3 Message checks timed out waiting for DNS, try again later\r\n";
+/// The overall time limit for end-of-data DNS work: every DKIM key lookup
+/// and the DMARC policy fetch together (D3, DEPLOYMENT.md). Without it,
+/// up to 5 signatures (`dkim::MAX_SIGNATURES`) each waiting the 5 s
+/// per-query timeout, plus the DMARC fetch, could run past the connection
+/// cap, dropping the session with no reply. The same 20 s as
+/// `spf::EVALUATION_DEADLINE`; running out is a temporary failure, never a
+/// permanent rejection (skipping the checks would fail DMARC and reject
+/// legitimate mail).
+const END_OF_DATA_DNS_DEADLINE: Duration = Duration::from_secs(20);
 /// RFC 5321 Section 4.5.3.1.8: at least 100 recipients.
 const MAX_RCPT: usize = 100;
 /// RFC 5321 Section 3.3: DATA with no accepted recipients.
@@ -776,6 +886,18 @@ struct UserSession<'session> {
     #[serde(skip_serializing)]
     pub total_data: usize,
 
+    /// This transaction's size limit: `max_data`, lowered to the
+    /// accepted recipients' domain limit (`max-message-bytes`) when their
+    /// domain set one. Every recipient in one transaction shares the same
+    /// limit (see `rcpt_to`).
+    #[serde(skip_serializing)]
+    txn_limit: usize,
+
+    /// The size the client declared with `MAIL FROM ... SIZE=` (RFC 1870),
+    /// checked against each recipient's limit at RCPT time.
+    #[serde(skip_serializing)]
+    declared_size: Option<u64>,
+
     pub session_id: Uuid,
     domain: &'session str,
     /// Shared DNS client (pipelined DoT connections + TTL cache) for SPF,
@@ -832,6 +954,12 @@ struct UserSession<'session> {
     sink: Option<Arc<dyn delivery::DeliverySink>>,
     /// DMARC verdict of the last completed message, for the session log.
     dmarc: Option<DmarcSummary>,
+    /// Overall limit on end-of-data DNS work (DKIM + DMARC).
+    #[serde(skip_serializing)]
+    eod_dns_deadline: Duration,
+    /// Graceful-shutdown signal (see `SmtpSession::shutdown_signal`).
+    #[serde(skip_serializing)]
+    shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<'session> UserSession<'session> {
@@ -839,6 +967,8 @@ impl<'session> UserSession<'session> {
         UserSession {
             max_data: cfg.max_data,
             total_data: 0,
+            txn_limit: cfg.max_data,
+            declared_size: None,
             session_id: Uuid::new_v4(),
 
             domain: &cfg.domain,
@@ -865,6 +995,8 @@ impl<'session> UserSession<'session> {
             spool: cfg.spool.clone(),
             sink: cfg.sink.clone(),
             dmarc: None,
+            eod_dns_deadline: cfg.eod_dns_deadline,
+            shutdown: cfg.shutdown.clone(),
         }
     }
 
@@ -873,9 +1005,55 @@ impl<'session> UserSession<'session> {
     fn clear_envelope(&mut self) {
         self.mail_from = None;
         self.rcpt_to.clear();
-        self.data.clear();
+        // Release the buffer, not just its contents: an aborted 10 MiB
+        // transfer must not keep its allocation for the rest of the session.
+        self.data = Vec::new();
         self.total_data = 0;
+        self.txn_limit = self.max_data;
+        self.declared_size = None;
         self.spf_result = None;
+    }
+
+    /// The domains of this transaction's accepted recipients, for logs.
+    fn rcpt_domains(&self) -> Vec<String> {
+        let mut domains: Vec<String> = self
+            .rcpt_to
+            .iter()
+            .filter_map(|r| path_domain(&r.address).map(str::to_ascii_lowercase))
+            .collect();
+        domains.sort();
+        domains.dedup();
+        domains
+    }
+
+    /// Log a message refused for its size (`stage`: mail_from, rcpt_to,
+    /// data, or data_line). Envelope and sizes only, never content.
+    fn log_size_refusal(&self, stage: &str, size: Option<u64>, limit: usize, detail: &str) {
+        info!(
+            stage,
+            size,
+            limit,
+            server_limit = self.max_data,
+            mail_from = ?self.mail_from,
+            recipients = self.rcpt_to.len(),
+            rcpt_domains = ?self.rcpt_domains(),
+            detail,
+            "message refused: size limit"
+        );
+    }
+
+    /// End the transaction with a temporary failure because the
+    /// end-of-data DNS work ran past [`UserSession::eod_dns_deadline`]
+    /// (`stage`: dkim or dmarc). Logged at `warn`, like an SPF deadline.
+    fn eod_dns_timed_out(&mut self, stage: &str) -> smtp::Control {
+        warn!(
+            stage,
+            limit_ms = u64::try_from(self.eod_dns_deadline.as_millis()).unwrap_or(u64::MAX),
+            "end-of-data DNS checks exceeded their time limit; temporary failure"
+        );
+        self.clear_envelope();
+        self.message_count += 1;
+        smtp::Control::tempfail(EOD_DNS_TIMEOUT)
     }
 
     fn verify_credentials(
@@ -1096,7 +1274,14 @@ impl smtp::SmtpSession for UserSession<'_> {
         };
         // RFC 1870: a declared size over the advertised limit is refused
         // up front, before any data is transferred.
-        if size_param(params).is_some_and(|size| size > self.max_data as u64) {
+        let declared_size = size_param(params);
+        if let Some(size) = declared_size.filter(|&size| size > self.max_data as u64) {
+            self.log_size_refusal(
+                "mail_from",
+                Some(size),
+                self.max_data,
+                "declared SIZE over the server limit",
+            );
             return smtp::Control::reject(MESSAGE_TOO_BIG);
         }
         let addr = addr.to_string();
@@ -1128,6 +1313,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                 "authenticated mail from (spf skipped)"
             );
             self.mail_from = Some(addr);
+            self.declared_size = declared_size;
             return smtp::Control::accept(UserSession::OK);
         }
 
@@ -1172,6 +1358,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         // rejected MAIL FROM can be retried.
         if control.is_accept() {
             self.mail_from = Some(addr);
+            self.declared_size = declared_size;
         }
         control
     }
@@ -1246,6 +1433,42 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         match answer {
             AuthorityAnswer::Accept(recipient) => {
+                // The recipient's size limit: its domain's own
+                // `max-message-bytes`, which can only lower the server's.
+                let limit = recipient
+                    .max_message_bytes
+                    .map_or(self.max_data, |l| l.min(self.max_data));
+                // RFC 1870 §6.1: a declared SIZE over this recipient's
+                // limit is refused here, before any data is sent; the
+                // sender's MTA bounces (we never self-bounce).
+                if let Some(size) = self.declared_size.filter(|&s| s > limit as u64) {
+                    self.log_size_refusal(
+                        "rcpt_to",
+                        Some(size),
+                        limit,
+                        "declared SIZE over the recipient domain's limit",
+                    );
+                    return smtp::Control::reject(
+                        b"552 5.3.4 Message size exceeds the recipient's limit\r\n",
+                    );
+                }
+                // One transaction carries one size limit. A recipient whose
+                // limit differs from those already accepted is deferred to
+                // a separate transaction (RFC 5321 §4.5.3.1.10), so one
+                // tenant's lower limit can never cause mail to another
+                // tenant to be refused.
+                if !self.rcpt_to.is_empty() && limit != self.txn_limit {
+                    info!(
+                        rcpt = %addr,
+                        limit,
+                        transaction_limit = self.txn_limit,
+                        "recipient deferred: different message size limit"
+                    );
+                    return smtp::Control::tempfail(
+                        b"452 4.5.3 Recipient has a different size limit; send it in a separate transaction\r\n",
+                    );
+                }
+                self.txn_limit = limit;
                 self.rcpt_to.push(spool::SpoolRcpt {
                     address: addr,
                     mailbox: recipient.mailbox,
@@ -1305,17 +1528,49 @@ impl smtp::SmtpSession for UserSession<'_> {
         smtp::Control::accept(UserSession::SEND_DATA)
     }
 
-    #[instrument(skip(self, line), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
+    // TRACE, not the INFO default (D1, DEPLOYMENT.md): this runs once per
+    // line of message data, and the bunyan layer writes a START and an END
+    // record for every span it sees, so an INFO span made logs ~7x the size
+    // of the mail itself. At TRACE the default `RUST_LOG=info` skips it.
+    #[instrument(level = "trace", skip(self, line), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     async fn recv_data(&mut self, line: &[u8]) -> smtp::DataControl {
-        // Enforce the size limit across the whole message.
+        // Enforce the transaction's size limit (the server's, or the
+        // recipients' domain limit if lower) across the whole message.
         self.total_data += line.len();
-        if self.total_data > self.max_data {
+        if self.total_data > self.txn_limit {
             // The state machine replies 552 once and discards the rest of
-            // the transfer.
+            // the transfer; the terminator then resets the transaction.
+            self.log_size_refusal(
+                "data",
+                Some(self.total_data as u64),
+                self.txn_limit,
+                "message data over the size limit; rest of the transfer discarded",
+            );
             return smtp::DataControl::Abort(MESSAGE_TOO_BIG.to_vec());
         }
         self.data.extend_from_slice(line);
         smtp::DataControl::Continue
+    }
+
+    /// A message line exceeded the protocol's line cap: the transfer is
+    /// aborted like an oversized message, and logged the same way.
+    async fn data_line_too_long(&mut self) -> Vec<u8> {
+        self.log_size_refusal(
+            "data_line",
+            Some(self.total_data as u64),
+            Self::MAX_DATA_LINE,
+            "a message line exceeded the line-length limit; rest of the transfer discarded",
+        );
+        Self::DATA_LINE_TOO_LONG.to_vec()
+    }
+
+    /// Resolves when `main` starts a graceful shutdown. If the sender is
+    /// gone without ever signalling, it never resolves.
+    async fn shutdown_signal(&self) {
+        let mut shutdown = self.shutdown.clone();
+        if shutdown.wait_for(|&down| down).await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 
     #[instrument(skip(self), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
@@ -1334,7 +1589,13 @@ impl smtp::SmtpSession for UserSession<'_> {
             self.message_count += 1;
             return smtp::Control::tempfail(DNS_BUSY);
         };
-        let results = dkim::verify_dkim(&raw, &self.dns).await;
+        // One deadline covers all of this message's DNS work: the DKIM key
+        // lookups here and the DMARC policy fetch below (D3).
+        let dns_deadline = Instant::now() + self.eod_dns_deadline;
+        let results = match timeout_at(dns_deadline, dkim::verify_dkim(&raw, &self.dns)).await {
+            Ok(results) => results,
+            Err(_) => return self.eod_dns_timed_out("dkim"),
+        };
         let mut dkim_summaries: Vec<DkimSummary> = Vec::new();
 
         for result in &results {
@@ -1390,10 +1651,16 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         if let Some(from_domain) = from_domain {
             let resolver = spf::DotResolver::shared(self.dns.clone());
-            let record = match dmarc::fetch_policy(&resolver, &from_domain).await {
-                Ok(Some(record)) => Some(record),
-                Ok(None) => None,
-                Err(e) => {
+            let record = match timeout_at(
+                dns_deadline,
+                dmarc::fetch_policy(&resolver, &from_domain),
+            )
+            .await
+            {
+                Err(_) => return self.eod_dns_timed_out("dmarc"),
+                Ok(Ok(Some(record))) => Some(record),
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
                     info!(from_domain = %from_domain, error = %e, "dmarc lookup failed");
                     None
                 }
@@ -1589,6 +1856,10 @@ async fn main() -> Result<()> {
         .with(bunyan_formatting_layer);
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
+    // Anything created without an explicit mode is private to the service
+    // user (D4). The spool and maildirs also set 0600/0700 explicitly.
+    privdrop::restrict_umask();
+
     let args = Args::parse();
     let file_config = match &args.config {
         Some(path) => {
@@ -1614,6 +1885,28 @@ async fn main() -> Result<()> {
         }
     };
 
+    // One shared DNS client for the whole process (Phase 10): pipelined
+    // DNS-over-TLS connections and a TTL result cache serve SPF, DKIM, and
+    // DMARC alike. Built before the listener binds, so a bad --resolver-ca
+    // file stops startup instead of surfacing as DNS failures in sessions.
+    // The CA (D2, DEPLOYMENT.md) is added to the public roots, so public
+    // resolvers keep working with it set.
+    let dns_client = dns::DnsClient::new(config.resolver).with_connections(config.dns_connections);
+    let dns_client = Arc::new(match &config.resolver_ca {
+        Some(path) => {
+            let roots = load_resolver_ca(path).await?;
+            info!(
+                resolver_ca = %path,
+                certificates = roots.len(),
+                "resolver CA loaded (trusted in addition to the public roots)"
+            );
+            dns_client
+                .with_extra_roots(&roots)
+                .map_err(|e| anyhow::anyhow!("invalid resolver CA file {path}: {e:#}"))?
+        }
+        None => dns_client,
+    });
+
     let auth_users = match &config.auth_users {
         Some(spec) if !spec.is_empty() => {
             let mut map = HashMap::new();
@@ -1637,6 +1930,41 @@ async fn main() -> Result<()> {
         _ => HashSet::new(),
     };
     local_domains.insert(config.domain.to_ascii_lowercase());
+
+    // Privileges (D4). Decide before binding, so a misconfiguration (root
+    // without --user, an unknown user) stops startup without touching the
+    // port.
+    let target = match &config.user {
+        Some(user) => Some(privdrop::lookup(user, config.group.as_deref())?),
+        None => None,
+    };
+    let drop_to = privdrop::plan(privdrop::effective_uid(), target)?;
+
+    // Bind while still privileged: port 25 needs root or
+    // CAP_NET_BIND_SERVICE. The TLS key, resolver CA and config file were
+    // read above, also with the starting privileges.
+    let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on {}:{}: {e}", config.host, config.port))?;
+
+    if let Some(id) = &drop_to {
+        // The service user must own the storage it writes: root creates
+        // any missing spool/maildir directories owned by it, then drops.
+        for dir in [&config.spool_dir, &config.maildir_dir] {
+            fsutil::create_owned_dir_all(std::path::Path::new(dir), id.uid, id.gid)
+                .map_err(|e| anyhow::anyhow!("cannot create {dir} for user {}: {e}", id.user))?;
+        }
+        privdrop::drop_to(id)
+            .map_err(|e| anyhow::anyhow!("could not drop root privileges: {e:#}"))?;
+        info!(
+            user = %id.user,
+            uid = id.uid,
+            gid = id.gid,
+            "privileges dropped after binding the port"
+        );
+    }
+    // Everything from here on (authority, spool, maildirs, every
+    // connection) runs without root.
 
     // The recipient authority (Phase 12 gap 1): a JSON file when
     // configured — the console's publishing format, hot-reloaded —
@@ -1673,6 +2001,31 @@ async fn main() -> Result<()> {
     let sink: Arc<dyn delivery::DeliverySink> =
         Arc::new(delivery::MaildirSink::open(&config.maildir_dir)?);
     info!(backend = sink.name(), maildir_dir = %config.maildir_dir, "delivery ready");
+
+    // Storage paths (D4): say where mail really goes, and flag setups that
+    // would surprise an operator.
+    for (what, dir) in [
+        ("spool", &config.spool_dir),
+        ("maildir", &config.maildir_dir),
+    ] {
+        let resolved = std::path::absolute(dir).unwrap_or_else(|_| dir.into());
+        if std::path::Path::new(dir).is_relative() {
+            warn!(
+                what,
+                configured = %dir,
+                resolved = %resolved.display(),
+                "storage path is relative to the working directory; configure an absolute path"
+            );
+        }
+        if let Some(bits) = fsutil::shared_bits(&resolved) {
+            warn!(
+                what,
+                path = %resolved.display(),
+                open_bits = %format!("{bits:03o}"),
+                "storage directory is accessible to other users; consider chmod 700"
+            );
+        }
+    }
 
     // The drain is the retry engine: it delivers whatever the fast path
     // could not (crashes, sink failures), removes fully delivered
@@ -1711,15 +2064,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).await?;
-
-    // One shared DNS client for the whole process (Phase 10): the pooled
-    // DNS-over-TLS connection and the TTL result cache serve SPF, DKIM,
-    // and DMARC alike — previously every query paid a full TLS handshake.
-    let dns_client =
-        Arc::new(dns::DnsClient::new(config.resolver).with_connections(config.dns_connections));
     info!(
         resolver = %config.resolver,
+        resolver_ca = config.resolver_ca.as_deref().unwrap_or("(public roots only)"),
         connections = dns_client.connections(),
         max_in_flight = dns_client.max_in_flight(),
         spf_deadline_ms = u64::try_from(spf::EVALUATION_DEADLINE.as_millis()).unwrap_or(u64::MAX),
@@ -1763,10 +2110,20 @@ async fn main() -> Result<()> {
         "listening"
     );
 
-    loop {
+    // Graceful shutdown (D4): SIGTERM or SIGINT stops the accept loop;
+    // sessions are told through `shutdown_rx` (see `shutdown_signal`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut signals = ShutdownSignals::new()?;
+
+    let signal = loop {
         // A transient accept error (e.g. EMFILE under load) must not
         // terminate the server; back off briefly and keep going.
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            signal = signals.recv() => break signal,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(e) => {
                 error!(error = %e, "accept failed; backing off");
@@ -1811,6 +2168,8 @@ async fn main() -> Result<()> {
             authority: authority.clone(),
             dns: dns_client.clone(),
             dns_limit: dns_limit.clone(),
+            eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
+            shutdown: shutdown_rx.clone(),
             spool: Some(spool.clone()),
             sink: Some(sink.clone()),
         };
@@ -1833,6 +2192,69 @@ async fn main() -> Result<()> {
             drop(permit);
             limiter.release(ip).await;
         });
+    };
+
+    // Graceful shutdown (D4). Stop accepting: closing the listener makes
+    // the kernel refuse new connections, and other MXs or a later retry
+    // take the mail. Then tell every session: idle ones get 421 now, and
+    // sessions mid-message finish it, get their reply, then the 421.
+    drop(listener);
+    let _ = shutdown_tx.send(true);
+    let max = config.max_connections;
+    let active = |capacity: &tokio::sync::Semaphore| max as usize - capacity.available_permits();
+    info!(
+        signal,
+        active_sessions = active(&global_capacity),
+        grace_ms = config.shutdown_grace_ms,
+        "shutdown: stopped accepting; waiting for sessions to finish"
+    );
+    // Every session holds one permit of the global capacity, so having
+    // them all back means every session has ended. A second signal skips
+    // the wait.
+    let grace = Duration::from_millis(config.shutdown_grace_ms);
+    tokio::select! {
+        finished = tokio::time::timeout(grace, global_capacity.acquire_many(max)) => match finished {
+            Ok(_) => info!("shutdown complete: all sessions finished"),
+            Err(_) => warn!(
+                remaining_sessions = active(&global_capacity),
+                "shutdown grace period over; closing the remaining sessions"
+            ),
+        },
+        second = signals.recv() => warn!(
+            signal = second,
+            remaining_sessions = active(&global_capacity),
+            "second signal during shutdown; exiting now"
+        ),
+    }
+    // Returning drops the runtime, which still waits for blocking work
+    // already running (an fsync in a spool write or a delivery), so files
+    // are never left half-written.
+    Ok(())
+}
+
+/// SIGTERM and SIGINT: the requests for a graceful shutdown. Registered
+/// once, so a signal that arrives while the server is busy is not lost.
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    /// Install the handlers. Returns `Err` if the OS refuses.
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(ShutdownSignals {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait for the next SIGTERM or SIGINT; returns its name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
     }
 }
 
@@ -1897,6 +2319,13 @@ struct SessionConfig {
     dns: Arc<dns::DnsClient>,
     /// Per-source-IP limit on concurrent DNS-backed checks.
     dns_limit: Arc<limit::DnsLimiter>,
+    /// Overall time limit for the DNS work at end-of-data (DKIM key
+    /// lookups plus the DMARC policy fetch); [`END_OF_DATA_DNS_DEADLINE`]
+    /// in production.
+    eod_dns_deadline: Duration,
+    /// Becomes true when a graceful shutdown starts (sessions then end
+    /// with 421 between transactions).
+    shutdown: tokio::sync::watch::Receiver<bool>,
     /// Spool backend for accepted messages; None drops them (tests).
     spool: Option<Arc<dyn spool::SpoolWriter>>,
     /// Local delivery sink; None leaves messages queued (tests).
@@ -1984,6 +2413,30 @@ async fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAccept
     tls_acceptor_from_pem(&cert_pem, &key_pem)
 }
 
+/// Read the `--resolver-ca` PEM file (D2, DEPLOYMENT.md).
+///
+/// Returns every certificate in the file, in order. Returns `Err` if the
+/// file can't be read, isn't valid PEM, or holds no certificate at all —
+/// an empty or mistyped CA file must stop startup, not silently leave the
+/// local resolver untrusted.
+async fn load_resolver_ca(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let pem = tokio::fs::read(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot read resolver CA file {path}: {e}"))?;
+    resolver_ca_from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid resolver CA file {path}: {e}"))
+}
+
+/// Parse PEM certificates for [`load_resolver_ca`].
+fn resolver_ca_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+    let mut cursor = std::io::Cursor::new(pem);
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cursor).collect::<std::result::Result<_, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!("no PEM certificates found");
+    }
+    Ok(certs)
+}
+
 fn tls_acceptor_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
     let mut cert_cursor = std::io::Cursor::new(cert_pem);
     let certs: Vec<CertificateDer> =
@@ -2001,6 +2454,13 @@ fn tls_acceptor_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shutdown receiver that never signals: its sender is already
+    /// gone, so `shutdown_signal` stays pending (tests that aren't about
+    /// shutdown).
+    fn no_shutdown() -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
+    }
 
     #[test]
     fn clean_path_strips_brackets_and_space() {
@@ -2207,7 +2667,7 @@ mod tests {
         assert_eq!(resolved.port, 2526);
         assert_eq!(resolved.domain, "file.example");
         assert_eq!(resolved.max_data_bytes, 2048);
-        assert_eq!(resolved.max_conn_duration_ms, 30 * 1000);
+        assert_eq!(resolved.max_conn_duration_ms, DEFAULT_MAX_CONN_DURATION_MS);
         assert_eq!(resolved.tls_cert.as_deref(), Some("cert.pem"));
         // The resolver defaults to 1.1.1.1 when nothing is configured.
         assert_eq!(resolved.resolver, "1.1.1.1".parse::<Ipv4Addr>().unwrap());
@@ -2289,6 +2749,8 @@ mod tests {
                 Duration::from_millis(500),
             )),
             dns_limit: Arc::clone(&dns_limit),
+            eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
+            shutdown: no_shutdown(),
             spool: None,
             sink: None,
         };
@@ -2373,6 +2835,126 @@ mod tests {
         assert_eq!(resolved.resolver, "8.8.8.8".parse::<Ipv4Addr>().unwrap());
     }
 
+    /// D2 (DEPLOYMENT.md): `resolver-ca` resolves CLI > file > none; unset
+    /// means public roots only (the previous behavior).
+    #[test]
+    fn resolver_ca_resolution() {
+        use clap::Parser as _;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+
+        let resolved = resolve_config(args(&[]), FileConfig::default()).unwrap();
+        assert_eq!(resolved.resolver_ca, None);
+
+        let file: FileConfig = toml::from_str(r#"resolver-ca = "/etc/ca/file.pem""#).unwrap();
+        let resolved = resolve_config(args(&[]), file.clone()).unwrap();
+        assert_eq!(resolved.resolver_ca.as_deref(), Some("/etc/ca/file.pem"));
+
+        let resolved = resolve_config(args(&["--resolver-ca", "/etc/ca/cli.pem"]), file).unwrap();
+        assert_eq!(resolved.resolver_ca.as_deref(), Some("/etc/ca/cli.pem"));
+    }
+
+    /// D4 (DEPLOYMENT.md): production-safe defaults. Port 25 (2525 is
+    /// for unprivileged testing), absolute storage paths, a 10 MiB message
+    /// limit, a 5-minute connection cap, 100 connections, 60 s shutdown
+    /// grace, and no user switch unless configured.
+    #[test]
+    fn production_defaults() {
+        use clap::Parser as _;
+        let resolved = resolve_config(
+            Args::parse_from(["mailserv", "--domain", "d.example"]),
+            FileConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.port, 25);
+        assert_eq!(resolved.spool_dir, "/var/lib/mailserv/spool");
+        assert_eq!(resolved.maildir_dir, "/var/lib/mailserv/maildir");
+        assert!(std::path::Path::new(&resolved.spool_dir).is_absolute());
+        assert!(std::path::Path::new(&resolved.maildir_dir).is_absolute());
+        assert_eq!(resolved.max_data_bytes, 10 * 1024 * 1024);
+        assert_eq!(resolved.max_conn_duration_ms, 300_000);
+        assert_eq!(resolved.max_connections, 100);
+        assert_eq!(resolved.shutdown_grace_ms, 60_000);
+        assert_eq!(resolved.user, None);
+        assert_eq!(resolved.group, None);
+    }
+
+    /// D4: `user`, `group` and `shutdown-grace-ms` resolve CLI > file;
+    /// `group` without `user` is a configuration error.
+    #[test]
+    fn user_group_and_grace_resolution() {
+        use clap::Parser as _;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+        let file: FileConfig =
+            toml::from_str("user = \"mailserv\"\ngroup = \"mail\"\nshutdown-grace-ms = 5000")
+                .unwrap();
+        let resolved = resolve_config(args(&[]), file.clone()).unwrap();
+        assert_eq!(resolved.user.as_deref(), Some("mailserv"));
+        assert_eq!(resolved.group.as_deref(), Some("mail"));
+        assert_eq!(resolved.shutdown_grace_ms, 5000);
+
+        let resolved = resolve_config(
+            args(&["--user", "other", "--shutdown-grace-ms", "100"]),
+            file,
+        )
+        .unwrap();
+        assert_eq!(resolved.user.as_deref(), Some("other"));
+        assert_eq!(resolved.shutdown_grace_ms, 100);
+
+        let err = resolve_config(args(&["--group", "mail"]), FileConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("--group requires --user"), "{err}");
+    }
+
+    /// D2: the CA file loads every certificate it holds, and a missing,
+    /// empty, or non-certificate file is a startup error, never a silent
+    /// fallback to "local resolver untrusted".
+    #[tokio::test]
+    async fn resolver_ca_file_loading() {
+        let a = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let b = rcgen::generate_simple_self_signed(vec!["10.0.0.53".into()]).unwrap();
+        let pem = format!("{}{}", a.cert.pem(), b.cert.pem());
+
+        let certs = resolver_ca_from_pem(pem.as_bytes()).unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), a.cert.der().as_ref());
+
+        // The loaded roots are accepted by the DNS client (and public
+        // roots stay; see the dns crate's extra_roots tests).
+        dns::DnsClient::new("127.0.0.1".parse().unwrap())
+            .with_extra_roots(&certs)
+            .unwrap();
+
+        assert!(resolver_ca_from_pem(b"").is_err());
+        // A private key alone is not a CA file.
+        assert!(resolver_ca_from_pem(a.key_pair.serialize_pem().as_bytes()).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, &pem).unwrap();
+        assert_eq!(
+            load_resolver_ca(path.to_str().unwrap())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let missing = dir.path().join("missing.pem");
+        let err = load_resolver_ca(missing.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot read resolver CA file"),
+            "{err}"
+        );
+    }
+
     /// Spawn handle_connection on an ephemeral port, handling exactly
     /// one connection. When `authority` is None, the static fallback is
     /// built from `local_domains` (the pre-authority behavior: every
@@ -2421,6 +3003,8 @@ mod tests {
                             limit::DEFAULT_DNS_PER_IP,
                             limit::DNS_LIMIT_WAIT,
                         )),
+                        shutdown: no_shutdown(),
+                        eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
                         spool,
                         sink,
                     },
@@ -3231,6 +3815,269 @@ mod tests {
         ))
     }
 
+    /// A DNS-over-TLS resolver that accepts connections and reads queries
+    /// but never answers (an authoritative server that never responds, as
+    /// seen through the resolver). The client's own per-query timeout is
+    /// 30 s, so only the end-of-data deadline can end a check against it.
+    async fn spawn_silent_resolver() -> Arc<dns::DnsClient> {
+        use tokio::io::AsyncReadExt as _;
+        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(sock).await else {
+                        return;
+                    };
+                    // Swallow queries; never reply.
+                    let mut buf = [0u8; 4096];
+                    while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = Arc::new(
+            tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        Arc::new(dns::DnsClient::with_config(
+            "127.0.0.1".parse().unwrap(),
+            client_config,
+            Duration::from_secs(30),
+            Some(format!("127.0.0.1:{port}")),
+        ))
+    }
+
+    /// A session over a file authority with one size-limited domain
+    /// (`small.example`, 2 KiB) and one without a limit (`big.example`),
+    /// under a 1 MiB server limit. No DNS is used: SPF is skipped because
+    /// the tests set the envelope sender directly.
+    fn size_limit_session(dir: &std::path::Path) -> SessionConfig {
+        let path = dir.join("authority.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "domains": {
+                    "small.example": { "mode": "reject", "max-message-bytes": 2048 },
+                    "big.example": { "mode": "reject" }
+                },
+                "mailboxes": {
+                    "a@small.example": { "user": "a", "expires": null },
+                    "b@small.example": { "user": "b", "expires": null },
+                    "c@big.example": { "user": "c", "expires": null }
+                }
+            }"#,
+        )
+        .unwrap();
+        SessionConfig {
+            domain: "mail.test".to_string(),
+            max_data: 1024 * 1024,
+            auth_users: None,
+            authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
+            dns: Arc::new(dns::DnsClient::with_timeout(
+                "127.0.0.1".parse().unwrap(),
+                Duration::from_millis(200),
+            )),
+            dns_limit: Arc::new(limit::DnsLimiter::new(
+                limit::DEFAULT_DNS_PER_IP,
+                limit::DNS_LIMIT_WAIT,
+            )),
+            eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
+            shutdown: no_shutdown(),
+            spool: None,
+            sink: None,
+        }
+    }
+
+    /// A domain's `max-message-bytes` lowers the transaction's limit: data
+    /// past it is refused (552) for that domain's recipients, and the
+    /// discarded transfer's terminator clears the transaction.
+    #[tokio::test]
+    async fn domain_size_limit_applies_to_its_recipients() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = size_limit_session(dir.path());
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        let mut state = smtp::SmtpState::Ready;
+        session.mail_from = Some("x@sender.example".into());
+
+        assert!(session.rcpt_to("<a@small.example>").await.is_accept());
+        assert_eq!(session.txn_limit, 2048);
+
+        // 3 KiB of data crosses the 2 KiB domain limit.
+        let line = format!("{}\r\n", "y".repeat(1022));
+        let mut aborted = None;
+        for _ in 0..3 {
+            match session.recv_data(line.as_bytes()).await {
+                smtp::DataControl::Continue => {}
+                smtp::DataControl::Abort(reply) => {
+                    aborted = Some(reply);
+                    state = smtp::SmtpState::Discard;
+                    break;
+                }
+            }
+        }
+        assert_eq!(aborted.as_deref(), Some(MESSAGE_TOO_BIG));
+
+        // The terminator of the discarded transfer ends the transaction.
+        let (reply, next) = session.handler(&state, b".\r\n").await;
+        assert!(reply.is_empty());
+        assert_eq!(next, smtp::SmtpState::Ready);
+        assert_eq!(session.mail_from, None);
+        assert!(session.rcpt_to.is_empty());
+        assert!(session.data.is_empty());
+        assert_eq!(
+            session.txn_limit, cfg.max_data,
+            "limit back to the server's"
+        );
+
+        // A domain without its own limit keeps the server limit.
+        session.mail_from = Some("x@sender.example".into());
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+        assert_eq!(session.txn_limit, cfg.max_data);
+    }
+
+    /// Recipients with different limits never share a transaction: the
+    /// second gets 452 (send it separately), so a small-limit tenant can't
+    /// cause another tenant's mail to be refused. Same-limit recipients
+    /// share a transaction normally.
+    #[tokio::test]
+    async fn recipients_with_different_limits_are_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = size_limit_session(dir.path());
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        session.mail_from = Some("x@sender.example".into());
+
+        assert!(session.rcpt_to("<a@small.example>").await.is_accept());
+        assert!(session.rcpt_to("<b@small.example>").await.is_accept());
+        assert_eq!(
+            session.rcpt_to("<c@big.example>").await,
+            smtp::Control::tempfail(
+                b"452 4.5.3 Recipient has a different size limit; send it in a separate transaction\r\n"
+                    .to_vec()
+            )
+        );
+        assert_eq!(session.rcpt_to.len(), 2);
+        assert_eq!(session.txn_limit, 2048);
+
+        // The other order: the big domain first, then the small one.
+        session.clear_envelope();
+        session.mail_from = Some("x@sender.example".into());
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+        assert!(matches!(
+            session.rcpt_to("<a@small.example>").await,
+            smtp::Control::Tempfail(_)
+        ));
+        assert_eq!(session.txn_limit, cfg.max_data);
+    }
+
+    /// A SIZE declared at MAIL FROM is checked per recipient (RFC 1870
+    /// §6.1): over a domain's limit, that RCPT gets 552 before any data;
+    /// over the server limit, MAIL FROM itself does.
+    #[tokio::test]
+    async fn declared_size_is_checked_per_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = size_limit_session(dir.path());
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+        // Over the server limit: refused at MAIL FROM (no DNS involved).
+        assert_eq!(
+            session.mail_from("<x@sender.example> SIZE=2000000").await,
+            smtp::Control::reject(MESSAGE_TOO_BIG)
+        );
+
+        // Under the server limit but over small.example's.
+        session.mail_from = Some("x@sender.example".into());
+        session.declared_size = Some(4096);
+        assert_eq!(
+            session.rcpt_to("<a@small.example>").await,
+            smtp::Control::reject(
+                b"552 5.3.4 Message size exceeds the recipient's limit\r\n".to_vec()
+            )
+        );
+        assert!(session.rcpt_to.is_empty());
+        // The same message is fine for the domain without a limit.
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    }
+
+    /// D3 (DEPLOYMENT.md): end-of-data DNS work has one overall deadline.
+    /// Against a resolver that never answers, both the DKIM key lookup
+    /// and the DMARC policy fetch end at the deadline with a *temporary*
+    /// failure (never a permanent rejection), the transaction is cleared,
+    /// and the session can carry on.
+    #[tokio::test]
+    async fn end_of_data_dns_deadline_tempfails() {
+        let cfg = SessionConfig {
+            domain: "mail.test".to_string(),
+            max_data: 1024 * 1024,
+            auth_users: None,
+            authority: Arc::new(authority::StaticAuthority::new(vec![
+                "mail.test".to_string()
+            ])),
+            dns: spawn_silent_resolver().await,
+            dns_limit: Arc::new(limit::DnsLimiter::new(
+                limit::DEFAULT_DNS_PER_IP,
+                limit::DNS_LIMIT_WAIT,
+            )),
+            eod_dns_deadline: Duration::from_millis(300),
+            shutdown: no_shutdown(),
+            spool: None,
+            sink: None,
+        };
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+        // DKIM stage: the key lookup for the signature never answers.
+        session.mail_from = Some("a@example.org".to_string());
+        session.data =
+            b"DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=sel; h=From; bh=AAAA; b=AAAA\r\n\
+From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
+                .to_vec();
+        let started = std::time::Instant::now();
+        let control = session.end_data().await;
+        assert_eq!(control, smtp::Control::tempfail(EOD_DNS_TIMEOUT));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(session.mail_from, None, "the transaction is over");
+        assert!(session.data.is_empty());
+        assert_eq!(session.message_count, 1);
+        // It was the DKIM stage: one query (the key) was sent, and DKIM
+        // never produced a result (a finished verification records one).
+        assert_eq!(cfg.dns.stats().queries, 1);
+        assert!(session.dkim.is_empty());
+
+        // DMARC stage: no signature, so the policy fetch is what hangs.
+        session.mail_from = Some("a@example.org".to_string());
+        session.data = b"From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
+        let started = std::time::Instant::now();
+        let control = session.end_data().await;
+        assert_eq!(control, smtp::Control::tempfail(EOD_DNS_TIMEOUT));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(session.message_count, 2);
+        // It was the DMARC stage: exactly one more query (_dmarc.example.org).
+        assert_eq!(cfg.dns.stats().queries, 2);
+    }
+
     /// C3 (security report): DKIM verdicts must not leak across messages
     /// on one connection. A verified signature from an earlier message
     /// used to satisfy DMARC alignment for a later unsigned spoof of the
@@ -3255,6 +4102,8 @@ mod tests {
                 limit::DEFAULT_DNS_PER_IP,
                 limit::DNS_LIMIT_WAIT,
             )),
+            eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
+            shutdown: no_shutdown(),
             spool: None,
             sink: None,
         };

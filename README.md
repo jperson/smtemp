@@ -36,25 +36,41 @@ The binary is `target/release/mailserv`.
 
 ## Running
 
-A domain is the only required setting — everything else has a default:
+A domain is the only required setting; everything else has a
+production default. By default mailserv listens on **port 25** and stores
+mail under `/var/lib/mailserv`. Started as root it must be given `--user`,
+and it drops to that user right after binding the port. Running as root
+without `--user` is refused.
 
 ```sh
-mailserv --domain example.org
+sudo mailserv --domain mx1.example.org --user mailserv
 ```
 
-A typical production-ish invocation with STARTTLS and AUTH:
+To test as an ordinary user, use port 2525 and local directories:
+
+```sh
+mailserv --domain mail.test --port 2525 --spool-dir ./spool --maildir-dir ./maildir
+```
+
+A typical production invocation (receive-only: no `--auth-users`):
 
 ```sh
 mailserv \
-  --domain example.org \
-  --host 0.0.0.0 \
-  --port 25 \
-  --local-domains example.org,example.net \
-  --tls-cert /etc/mailserv/cert.pem \
-  --tls-key /etc/mailserv/key.pem \
-  --auth-users alice:secret,bob:hunter2 \
-  --resolver 1.1.1.1
+  --domain mx1.example.org \
+  --user mailserv \
+  --tls-cert /etc/mailserv/fullchain.pem \
+  --tls-key /etc/mailserv/privkey.pem \
+  --authority /etc/mailserv/authority.json \
+  --resolver 9.9.9.9
 ```
+
+SIGTERM or SIGINT starts a **graceful shutdown**:
+- new connections are refused;
+- idle sessions get `421` straight away;
+- a session in the middle of a message finishes it, gets its reply, then
+  gets `421`;
+- the process exits when every session has ended, or after
+  `--shutdown-grace-ms`. A second signal exits at once.
 
 Or via a config file (see below):
 
@@ -88,24 +104,28 @@ file — there is no default, and its absence is a hard error at startup.
 | CLI flag | Config key | Default | Description |
 |---|---|---|---|
 | `--host <ADDR>` | `host` | `"0.0.0.0"` | Address to listen on. |
-| `--port <PORT>` | `port` | `2525` | TCP port to listen on. |
+| `--port <PORT>` | `port` | `25` | TCP port to listen on. Binding 25 needs root (then `--user` is required) or `CAP_NET_BIND_SERVICE`; use `2525` for unprivileged testing. |
 | `--domain <DOMAIN>` | `domain` | *(required)* | The server's own domain: used in the `220` banner, `EHLO` replies, and as a local recipient domain when `--local-domains` is not given. |
-| `--max-data-bytes <N>` | `max-data-bytes` | `1048576` (1 MiB) | Per-message size limit; enforced across the whole DATA phase, advertised as `SIZE` in EHLO, overruns get `552`. |
-| `--max-conn-duration-ms <MS>` | `max-conn-duration-ms` | `30000` (30 s) | Hard wall-clock cap per connection, including STARTTLS and AUTH. |
+| `--max-data-bytes <N>` | `max-data-bytes` | `10485760` (10 MiB) | Server-wide limit; a hosted domain can set a **lower** one with `max-message-bytes` in the authority file. Enforced across the whole DATA phase, advertised as `SIZE` in EHLO, overruns get `552`. Every size refusal is logged (`message refused: size limit`). |
+| `--max-conn-duration-ms <MS>` | `max-conn-duration-ms` | `300000` (5 min) | Hard wall-clock cap per connection, including STARTTLS and AUTH. |
 | `--max-read-duration-ms <MS>` | `max-read-duration-ms` | `15000` (15 s) | Per-read timeout; a silent client is dropped. |
-| `--max-connections <N>` | `max-connections` | `500` | Server-wide cap on simultaneous connections; over-capacity connections are answered `421` and closed. |
+| `--max-connections <N>` | `max-connections` | `100` | Server-wide cap on simultaneous connections; over-capacity connections are answered `421` and closed. |
 | `--max-conn-per-ip <N>` | `max-conn-per-ip` | `10` | Maximum simultaneous connections from a single source IP. |
 | `--max-conn-rate-per-ip <N>` | `max-conn-rate-per-ip` | `60` | Maximum new connections per 60-second window from a single source IP (flood/churn budget). Both per-IP refusals answer `421 4.7.0` and close. |
 | `--max-dns-per-ip <N>` | `max-dns-per-ip` | `4` | Maximum concurrent DNS-backed checks (SPF for HELO and MAIL FROM, DKIM + DMARC at end-of-data) from a single source IP, so one client can't fill the shared resolver capacity with slow lookups. A check over the limit waits up to 10 s, then gets a temporary failure (`451 4.7.0`; HELO just records SPF `TempError`). Never a permanent rejection. 0 is a startup error. |
 | `--tls-cert <FILE>` | `tls-cert` | *(none)* | PEM certificate enabling STARTTLS (RFC 3207). Must be given together with `--tls-key`. When absent, STARTTLS is refused with `454` and never advertised. |
 | `--tls-key <FILE>` | `tls-key` | *(none)* | PEM private key for STARTTLS. |
 | `--auth-users <SPEC>` | `auth-users` | *(none)* | SASL credentials for AUTH PLAIN/LOGIN, as comma-separated `user:password` pairs (e.g. `alice:secret,bob:hunter2`). When set, `AUTH PLAIN LOGIN` is advertised **only over TLS** (RFC 8310); AUTH on a plaintext session is refused with `538`. ⚠️ Credentials are stored **in plaintext** in the process arguments/config file (shell history, `ps` output) — acceptable for testing only, not for production (see PLAN.md, Phase 8). |
-| `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. |
+| `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. | The resolver's certificate is verified against this IP address using the public web PKI roots, so public DoT services (`1.1.1.1`, `9.9.9.9`, `8.8.8.8`) work as-is; a local resolver needs `--resolver-ca`. |
+| `--resolver-ca <FILE>` | `resolver-ca` | *(none)* | PEM file of extra CA certificates (one or more; a self-signed resolver certificate also works) to trust for the resolver's DNS-over-TLS certificate, so a **local resolver** (unbound, knot-resolver, ...) with a private certificate can be used. The certificates are **added to** the public roots, never substituted, so public resolvers keep working with it set; they are trusted only for resolver connections. The resolver's certificate must carry the `--resolver` address as an IP subject alternative name (e.g. `IP:127.0.0.1`). A missing, empty or invalid file is a startup error. |
 | `--dns-connections <N>` | `dns-connections` | `2` | Pipelined DNS-over-TLS connections to the resolver (1–16; out of range is a startup error). Each carries up to 64 queries in flight, so slow lookups for one domain don't stall others. Size it from the periodic `dns stats` log line: sustained `waits` mean every connection is at its in-flight limit. |
-| `--spool-dir <DIR>` | `spool-dir` | `spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. Messages past the delivery retry budget land in `spool/dead-letter/`. |
-| `--maildir-dir <DIR>` | `maildir-dir` | `maildir` | Local delivery root: one maildir per recipient address (`{root}/{domain}/{local}/new`), written via the `DeliverySink` trait. Delivery happens immediately after acceptance and is retried from the queue until it succeeds; each delivered copy carries `Return-Path:` and a per-recipient `Received:` trace header. |
+| `--spool-dir <DIR>` | `spool-dir` | `/var/lib/mailserv/spool` | Queue directory where accepted messages are written before delivery. Spooling is part of the acceptance contract: the `250` reply is only sent after a durable write (a failed write replies `451 4.3.0`, inviting the client to retry). Layout is maildir-style (`tmp/` + `new/`); each message is a byte-exact `.eml` payload plus a `.json` metadata sidecar (queue ID, envelope, SPF/DKIM/DMARC verdicts). The queue sits behind a `SpoolWriter` trait with an optional `PayloadEncryptor` hook (payloads can be sealed before they reach storage — see PLAN.md, Phase 12), so alternate backends (e.g. S3-compatible) can be added without touching the SMTP path. Messages past the delivery retry budget land in `spool/dead-letter/`. |
+| `--maildir-dir <DIR>` | `maildir-dir` | `/var/lib/mailserv/maildir` | Local delivery root: one maildir per recipient address (`{root}/{domain}/{local}/new`), written via the `DeliverySink` trait. Delivery happens immediately after acceptance and is retried from the queue until it succeeds; each delivered copy carries `Return-Path:` and a per-recipient `Received:` trace header. |
 | `--local-domains <SPEC>` | `local-domains` | *(the `--domain` value)* | Comma-separated list of recipient domains we accept mail for. The value of `--domain` is always added implicitly. Relay access is closed regardless of authentication — mail for any other recipient domain is refused with `550 5.7.1`. Superseded by `--authority` when given. |
 | `--authority <FILE>` | `authority` | *(none)* | Recipient authority file (JSON): the hosted-domain list, per-domain policy modes, and the address→mailbox mapping. Hot-reloaded on change; supersedes `--local-domains`. See [the authority schema](#authority-file-schema). Without it, the pre-authority fallback applies: every local-part at a `--local-domains` domain is accepted and delivered to its own maildir. |
+| `--user <USER>` | `user` | *(none)* | Unprivileged user to switch to right after binding, when started as root (required then). Files are created `0600`, directories `0700`. |
+| `--group <GROUP>` | `group` | *(user's primary group)* | Group for `--user`. |
+| `--shutdown-grace-ms <MS>` | `shutdown-grace-ms` | `60000` | How long sessions may take to finish after SIGTERM/SIGINT. |
 | `--config <FILE>` | — | *(none)* | Path to a TOML config file (see below). |
 
 ### Config file example
@@ -119,24 +139,28 @@ host = "0.0.0.0"
 port = 25
 domain = "example.org"
 
-max-data-bytes = 1048576
-max-conn-duration-ms = 30000
+max-data-bytes = 10485760
+max-conn-duration-ms = 300000
 max-read-duration-ms = 15000
-max-connections = 500
+max-connections = 100
 max-conn-per-ip = 10
 max-conn-rate-per-ip = 60
 max-dns-per-ip = 4
 
 tls-cert = "/etc/mailserv/cert.pem"
 tls-key = "/etc/mailserv/key.pem"
-auth-users = "alice:secret,bob:hunter2"
+# auth-users: leave unset (receive-only V1; AUTH exempts senders from SPF/DMARC)
 
 resolver = "1.1.1.1"
+# resolver-ca = "/etc/mailserv/resolver-ca.pem"   # only for a local resolver (e.g. resolver = "127.0.0.1")
 dns-connections = 2
-spool-dir = "spool"
-maildir-dir = "maildir"
+spool-dir = "/var/lib/mailserv/spool"
+maildir-dir = "/var/lib/mailserv/maildir"
 local-domains = "example.org,example.net"
 authority = "/etc/mailserv/authority.json"
+user = "mailserv"                 # required when started as root
+# group = "mailserv"
+shutdown-grace-ms = 60000
 ```
 
 ### Environment variables
@@ -195,7 +219,7 @@ the management console publishes:
 ```json
 {
   "version": 1,
-  "domains": {
+    "legacy.example.net": { "mode": "grace", "grace-days": 7, "max-message-bytes": 5242880 }
     "example.org": { "mode": "reject" },
     "lists.example.org": { "mode": "catch-all", "catch-all-mailbox": "admin@example.org" },
     "legacy.example.net": { "mode": "grace", "grace-days": 7 }
@@ -215,6 +239,14 @@ the management console publishes:
   accept; `catch-all`: unknown addresses route to
   `catch-all-mailbox` (expired addresses still refuse); `grace`:
   expired addresses keep accepting for `grace-days` days, then refuse.
+- **`domains[].max-message-bytes`** (optional) — the domain's own message
+  size limit in bytes, at least 1024. It can only lower the server's
+  `max-data-bytes`. A recipient whose domain limit differs from the
+  recipients already accepted in a transaction gets `452 4.5.3`, which
+  tells the sending server to deliver it separately, so one domain's limit
+  never causes another domain's mail to be refused. A declared `SIZE=`
+  over the limit gets `552` at RCPT; data over it gets `552` at DATA.
+  Every refusal is logged as `message refused: size limit`.
 - **`mailboxes[].expires`** — RFC 3339 timestamp or `null`
   (permanent). **`public-key`/`key-generation`** — reserved for the
   user-held payload encryption (PLAN.md, Phase 12); carried through to
@@ -259,7 +291,7 @@ cargo doc --workspace --no-deps  # rustdoc (missing_docs is warn-by-default)
 cargo test --workspace
 ```
 
-This runs ~207 tests across the workspace in four layers (see DESIGN.md
+This runs ~229 tests across the workspace in four layers (see DESIGN.md
 §9 for the rationale):
 
 1. **Unit** — pure logic per crate (DKIM canonicalization, DMARC

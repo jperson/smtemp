@@ -181,18 +181,32 @@ impl DotResolver {
         Arc::clone(&self.client)
     }
 
-    /// One DNS query through the shared client (pooled connection,
-    /// TTL cache). Errors are already mapped: the client's timeout and
-    /// connection failures surface as `Err`, which `check_host` maps to
-    /// the transient/perm results per RFC 7208 Section 4.6.
-    async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
-        self.client.query(domain, qtype).await
+    /// One DNS query through the shared client (pipelined connections,
+    /// TTL cache). The client's timeout and connection failures surface as
+    /// `Err`, which `check_host` maps to the transient/perm results per
+    /// RFC 7208 Section 4.6.
+    ///
+    /// Returns `Ok(None)` when the name has no valid wire form (an empty
+    /// label, a label over 63 octets, or a name over 253): nothing is sent,
+    /// and RFC 7208 §4.3 says a malformed domain is treated like one that
+    /// does not exist. As a transient error it would have given TempError
+    /// (`451`) and an endless retry for a name that can never resolve (D3
+    /// in DEPLOYMENT.md).
+    async fn query(&self, domain: &str, qtype: u16) -> Result<Option<DnsMessage>> {
+        match self.client.query(domain, qtype).await {
+            Ok(resp) => Ok(Some(resp)),
+            Err(e) if dns::is_invalid_name(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
-/// Collect mapped answers, treating NXDOMAIN as an empty result and any
-/// other rcode as a transient failure.
-fn take_answers<T>(resp: DnsMessage, f: impl Fn(QType) -> Option<T>) -> Result<Vec<T>> {
+/// Collect mapped answers, treating NXDOMAIN (and an invalid name, `None`)
+/// as an empty result and any other rcode as a transient failure.
+fn take_answers<T>(resp: Option<DnsMessage>, f: impl Fn(QType) -> Option<T>) -> Result<Vec<T>> {
+    let Some(resp) = resp else {
+        return Ok(Vec::new());
+    };
     match resp.header.rcode {
         0x00 => Ok(resp
             .answers
@@ -1253,6 +1267,42 @@ mod wire {
             }
         });
         (addr, cert_der, qtypes)
+    }
+
+    /// D3 (DEPLOYMENT.md): a name with no valid wire form is answered as
+    /// "no records" without any network traffic (RFC 7208 §4.3: a
+    /// malformed domain is treated like one that doesn't exist), rather
+    /// than a transient error (TempError, 451, retried forever) or a
+    /// 5 s timeout. The client points at a closed local port, so any
+    /// attempt to send would fail the test.
+    #[tokio::test]
+    async fn invalid_names_are_empty_answers_not_temperrors() {
+        let client = Arc::new(DnsClient::with_timeout(
+            "127.0.0.1".parse().unwrap(),
+            Duration::from_secs(30),
+        ));
+        let resolver = DotResolver::shared(Arc::clone(&client));
+        let long = format!("{}.example.com", "x".repeat(64));
+
+        let started = std::time::Instant::now();
+        assert_eq!(resolver.txt(&long).await.unwrap(), Vec::<String>::new());
+        assert_eq!(
+            resolver.a("a..b.example").await.unwrap(),
+            Vec::<Ipv4Addr>::new()
+        );
+        assert_eq!(
+            resolver.mx(&long).await.unwrap(),
+            Vec::<(u16, String)>::new()
+        );
+        assert_eq!(resolver.ptr(&long).await.unwrap(), Vec::<String>::new());
+
+        // A MAIL FROM domain with an over-long label: SPF None, at once.
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let result = check_host(&resolver, peer, &format!("a@{long}"), long.clone(), &None).await;
+        assert_eq!(result, Ok(SpfResult::None));
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(client.stats().connects, 0, "nothing may be sent");
     }
 
     /// H1 (security report): `DotResolver::a()` must query **type 1 (A)**.

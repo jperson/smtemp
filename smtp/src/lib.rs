@@ -337,6 +337,9 @@ pub trait SmtpSession {
     /// of the transfer is discarded.
     const DATA_LINE_TOO_LONG: &'static [u8] =
         b"552 5.3.4 Line exceeds fixed maximum message line size\r\n";
+    /// `421` sent when the server shuts down between transactions (RFC
+    /// 5321 §3.8): the client must retry later.
+    const SHUTTING_DOWN: &'static [u8] = b"421 4.3.2 Service shutting down, try again later\r\n";
 
     /// Command lines are capped at 512 octets including CRLF (RFC 5321
     /// Section 4.5.3.1.4). An over-long command is answered with
@@ -412,6 +415,29 @@ pub trait SmtpSession {
     /// [`SmtpState::Auth`].
     fn auth_line(&mut self, line: &[u8]) -> impl Future<Output = Control> + Send;
 
+    /// A message-data line exceeded [`SmtpSession::MAX_DATA_LINE`], so the
+    /// transfer is being aborted (the rest is discarded until the
+    /// terminator). Returns the reply to send, by default
+    /// [`SmtpSession::DATA_LINE_TOO_LONG`]. The line never reaches
+    /// [`SmtpSession::recv_data`], so this is the policy's only chance to
+    /// record the dropped message (e.g. log it).
+    fn data_line_too_long(&mut self) -> impl Future<Output = Vec<u8>> + Send {
+        async { Self::DATA_LINE_TOO_LONG.to_vec() }
+    }
+
+    /// Resolves once the server has started a graceful shutdown. By
+    /// default it never resolves.
+    ///
+    /// The read loop only waits on this **between transactions** (Idle or
+    /// Ready): it then sends [`SmtpSession::SHUTTING_DOWN`] (`421`, RFC 5321
+    /// §3.8) and ends the session, so the client retries later. A message
+    /// transfer (Data/Discard) or an AUTH exchange in progress is never
+    /// interrupted: the session finishes it, sends its reply, and gets the
+    /// `421` at its next command.
+    fn shutdown_signal(&self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+
     /// Serve one connection: read bounded lines, run them through
     /// `handler`, write replies, until QUIT, EOF, an error, a read
     /// timeout, or a STARTTLS pause.
@@ -460,12 +486,29 @@ pub trait SmtpSession {
                     Self::MAX_CMD_LINE
                 };
 
-                let line = match timeout(
+                let read = timeout(
                     Duration::from_millis(*max_read_duration_ms),
                     read_line_capped(stream, cap),
-                )
-                .await
-                {
+                );
+                // Between transactions, a graceful shutdown ends the session
+                // with a 421 (see `shutdown_signal`). Checked first
+                // (`biased`), so a client that keeps sending commands can't
+                // hold the session open through a shutdown. Mid-transfer
+                // and mid-AUTH, the read is never raced: those finish first.
+                let read = if matches!(session_state.state, SmtpState::Idle | SmtpState::Ready) {
+                    tokio::select! {
+                        biased;
+                        () = self.shutdown_signal() => None,
+                        read = read => Some(read),
+                    }
+                } else {
+                    Some(read.await)
+                };
+                let Some(read) = read else {
+                    let _ = stream.write_all(Self::SHUTTING_DOWN).await;
+                    return Ok(EndReason::Closed);
+                };
+                let line = match read {
                     // EOF (empty line) ends the session; a final
                     // unterminated line is still delivered.
                     Ok(Ok(line)) if line.is_complete_and_empty() => return Ok(EndReason::Closed),
@@ -524,7 +567,8 @@ pub trait SmtpSession {
                                 // The line never reached the policy; abort
                                 // the transfer the same way a policy size
                                 // abort would.
-                                let _ = stream.write_all(Self::DATA_LINE_TOO_LONG).await;
+                                let reply = self.data_line_too_long().await;
+                                let _ = stream.write_all(&reply).await;
                                 session_state.state = SmtpState::Discard;
                             }
                             // Already discarding: keep draining silently.
@@ -580,7 +624,15 @@ pub trait SmtpSession {
                 if content == b"." && ending == b"\r\n" {
                     return match state {
                         SmtpState::Data => (self.end_data().await.into_reply(), SmtpState::Ready),
-                        _ => (Vec::new(), SmtpState::Ready),
+                        // An aborted transfer has ended: the transaction is
+                        // over, so the policy must clear its envelope and
+                        // any buffered data, exactly as for RSET (RFC 5321
+                        // §4.1.1.4). The abort reply was already sent, so
+                        // the reset's own reply is not.
+                        _ => {
+                            let _ = self.reset().await;
+                            (Vec::new(), SmtpState::Ready)
+                        }
                     };
                 }
                 if matches!(state, SmtpState::Data) {
@@ -803,6 +855,8 @@ mod tests {
         auth_login_user: Option<String>,
         /// The mechanism of the in-progress continuation.
         auth_pending: Option<&'static str>,
+        /// Graceful-shutdown signal (None: never shuts down).
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     }
 
     impl TestSession {
@@ -956,6 +1010,15 @@ mod tests {
     impl SmtpSession for TestSession {
         async fn server_greet(&self) -> Vec<u8> {
             b"220 test ready\r\n".to_vec()
+        }
+
+        async fn shutdown_signal(&self) {
+            if let Some(mut rx) = self.shutdown.clone() {
+                if rx.wait_for(|&down| down).await.is_ok() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await
         }
 
         async fn helo(&mut self, ehlo: bool, arg: &str) -> Control {
@@ -1529,7 +1592,15 @@ mod tests {
             SmtpState::Discard,
         )
         .await;
+        s.mail_from = Some("a@b".into());
+        assert_eq!(s.reset_calls, 0);
         expect(&mut s, SmtpState::Discard, b".\r\n", b"", SmtpState::Ready).await;
+        // The aborted transaction is over: the policy was told (reset), so
+        // its envelope and buffered data are gone and the next MAIL works.
+        assert_eq!(s.reset_calls, 1);
+        assert_eq!(s.mail_from, None);
+        assert!(s.data_lines.is_empty());
+        assert_eq!(s.end_data_calls, 0, "an aborted message is never delivered");
     }
 
     #[tokio::test]
@@ -2243,6 +2314,94 @@ mod tests {
         );
         assert_eq!(session.end_data_calls, 1);
         assert_eq!(session.helo.as_deref(), Some("client.example"));
+    }
+
+    /// Start `run` over a duplex with a TestSession wired to a shutdown
+    /// signal; returns the client side, the shutdown sender, and the task.
+    #[allow(clippy::type_complexity)]
+    fn spawn_with_shutdown() -> (
+        BufReader<tokio::io::DuplexStream>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<(TestSession, Result<EndReason>)>,
+    ) {
+        let (client, server) = duplex(4096);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let task = tokio::spawn(async move {
+            let mut session = TestSession {
+                shutdown: Some(rx),
+                ..Default::default()
+            };
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &5000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+        (BufReader::new(client), tx, task)
+    }
+
+    /// Graceful shutdown between transactions: an idle session is told
+    /// `421` (RFC 5321 §3.8) and closed at once, without waiting for the
+    /// client's next command or the read timeout.
+    #[tokio::test]
+    async fn shutdown_ends_an_idle_session_with_421() {
+        let (mut client, shutdown, task) = spawn_with_shutdown();
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        client.write_all(b"HELO client.example\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 hello\r\n");
+
+        shutdown.send(true).unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "421 4.3.2 Service shutting down, try again later\r\n"
+        );
+        let (_, result) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("session ends promptly")
+            .unwrap();
+        assert_eq!(result.unwrap(), EndReason::Closed);
+    }
+
+    /// Graceful shutdown during a transfer: the message in progress is
+    /// finished and answered normally; the `421` comes after its reply.
+    #[tokio::test]
+    async fn shutdown_lets_a_transfer_in_progress_finish() {
+        let (mut client, shutdown, task) = spawn_with_shutdown();
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        for (cmd, reply) in [
+            (&b"HELO client.example\r\n"[..], "250 hello\r\n"),
+            (b"MAIL FROM:<a@b>\r\n", "250 Ok\r\n"),
+            (b"RCPT TO:<c@d>\r\n", "250 Ok\r\n"),
+            (b"DATA\r\n", "354 End data with <CR>.<CR><LF>\r\n"),
+        ] {
+            client.write_all(cmd).await.unwrap();
+            assert_eq!(read_reply(&mut client).await, reply);
+        }
+        client.write_all(b"first line\r\n").await.unwrap();
+        // Let the session read that line, then start shutting down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.send(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(b"second line\r\n.\r\n").await.unwrap();
+
+        assert_eq!(read_reply(&mut client).await, "250 accepted\r\n");
+        assert_eq!(
+            read_reply(&mut client).await,
+            "421 4.3.2 Service shutting down, try again later\r\n"
+        );
+        let (session, result) = task.await.unwrap();
+        assert_eq!(result.unwrap(), EndReason::Closed);
+        assert_eq!(session.end_data_calls, 1, "the message was completed");
+        assert_eq!(session.data_lines.len(), 2);
     }
 
     /// SMTP smuggling, `<LF>.<CRLF>` variant (CVE-2023-51764): a `.` line

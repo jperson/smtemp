@@ -13,7 +13,7 @@
 > (REPORT.md) is triaged in §6: all critical and high findings (and the
 > round-2 findings N1–N7) are fixed and regression-tested; the medium
 > and low findings are tracked there.
-> Workspace state: **207 tests, 0 failures,
+> Workspace state: **229 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -68,7 +68,7 @@ fix. Kept as a permanent record; nothing here is open.
 |---|---|
 | SMTP core (state machine, framing, DATA transparency) | **DONE** — enforced `Control` verdicts, bounded reads, dot-unstuffing, raw-byte data, 22+ in-process protocol/framing tests |
 | STARTTLS (RFC 3207) | **DONE** — `Control::Upgrade` pause/resume, rustls handshake in the driver, protocol reset per §4.2, repeated-STARTTLS `503`, EHLO advertisement, cert/key CLI, 10s handshake timeout; validated against `openssl s_client`. *Open: implicit TLS (465), TLS-required policy, client-side TLS* |
-| AUTH (RFC 4954/4616/8310) | **DONE** — PLAIN + LOGIN with challenge continuation (`Control::Challenge`, `SmtpState::Auth(return_to)`, `*` abort); TLS-only accept + advertisement; `--auth-users`; SPF/DMARC exemptions for authenticated senders. *Open: OAUTHBEARER* |
+| AUTH (RFC 4954/4616/8310) | **DONE** — PLAIN + LOGIN with challenge continuation (`Control::Challenge`, `SmtpState::Auth(return_to)`, `*` abort); TLS-only accept + advertisement; `--auth-users`; SPF/DMARC exemptions for authenticated senders. ⚠️ **Unsafe to enable until `From:` validation lands (Phase 8): the exemptions are unconditional, so AUTH is a receive-side spoofing channel.** *Open: OAUTHBEARER* |
 | SPF (RFC 7208) | **DONE** — correct identities, full mechanism set, lookup budget, typed Temp/Perm errors, resolver trait with offline fixtures. *Open: macro expansion completeness, DNS caching* |
 | DKIM verify (RFC 6376/8463) | **DONE** — RSA + Ed25519, openssl-anchored fixture corpus, wired into `end_data`. *Open: DKIM signing (Phase 8)* |
 | DMARC (RFC 7489) | **DONE** — `dmarc` crate: record parsing, relaxed/strict alignment, org-domain fallback, `p=reject` → `550 5.7.1` at end-of-data; live-verified against facebook.com. *Open: rua/ruf reporting, pct sampling, PSL* |
@@ -192,10 +192,23 @@ plan because the receive-only design deliberately preserves its hooks
 authenticated senders; DKIM's canonicalization core is shared with the
 future signer). Do not invest here until after V1 ships.
 
+> **Exception — `From:` validation is a security prerequisite, not a
+> sending feature.** AUTH is already shipped and usable via
+> `--auth-users`, and an authenticated session unconditionally skips SPF
+> and is exempt from DMARC rejection (`mailserv/src/main.rs`). The control
+> that makes that trust decision safe — constraining the authenticated
+> user's `MAIL FROM`/`From:` to domains they own — is the `From:`
+> validation item below. Until it lands, **AUTH must not be enabled on any
+> deployment** (never advertise it on port 25). If AUTH is to remain
+> available in the V1 binary, this item is V1 scope, not post-V1.
+
 - [ ] **DKIM signing** for authenticated submissions (sign with the
       authenticated domain's key; the `dkim` crate gains a signer).
 - [ ] **`From:` validation** for authenticated submissions (user's domain
       or configured aliases; refuse spoofed From headers at MAIL time).
+      **Required before AUTH is enabled anywhere** (see the exception note
+      above): without it, an authenticated session bypasses SPF and DMARC
+      rejection and can inject spoofed `From:` mail into hosted mailboxes.
 - [ ] **Production-grade credential storage.** `--auth-users` currently
       takes plaintext `user:password` pairs on the CLI or in the config
       file — the credentials land in shell history, `ps` output, and
@@ -224,8 +237,19 @@ future signer). Do not invest here until after V1 ships.
 
 - [x] CI workflow (fmt/clippy/test; tests are offline-deterministic).
 - [x] `RUST_LOG` support.
-- [x] Accept-loop resilience + task result logging. (Graceful shutdown
-      (SIGTERM → stop accepting, drain in-flight) **still open**.)
+- [x] Accept-loop resilience + task result logging.
+- [x] Graceful shutdown (D4 in DEPLOYMENT.md): SIGTERM/SIGINT closes the
+      listener, idle sessions get `421`, sessions mid-message finish first;
+      exit when all sessions end, after `shutdown-grace-ms` (60 s), or on
+      a second signal.
+- [x] Privilege dropping (D4): root binds port 25, then switches to
+      `--user`/`--group` before opening storage or serving; root without
+      `--user` is refused. Storage is created `0600`/`0700`, `umask 077`.
+- [x] Production defaults (D4): port 25, `/var/lib/mailserv` storage,
+      10 MiB messages, 5-minute connection cap, 100 connections.
+- [x] Per-domain message size limits (`max-message-bytes` in the
+      authority file); mixed-limit recipients split with `452`; every
+      size refusal logged. An aborted transfer now clears its transaction.
 - [x] Config file (`--config`, TOML, CLI-over-file precedence).
 - [x] DNS result caching + connection reuse: `dns::DnsClient` — one
       shared client per process holds pipelined DNS-over-TLS connections
@@ -249,6 +273,12 @@ future signer). Do not invest here until after V1 ships.
       `UserSession`, and logged at startup. IPv6 resolver destinations
       and IPv6 listener validation **still open** (`--resolver` and
       `DotResolver` take `Ipv4Addr`).
+- [x] Local resolver support: `--resolver-ca <PEM>` / `resolver-ca` adds CA
+      certificates to the public webpki roots for the resolver's DoT
+      certificate (D2 in DEPLOYMENT.md), so a local validating resolver
+      with a private or self-signed certificate can be used. Additive, so
+      public resolvers keep working; scoped to resolver connections; bad
+      file = startup error. The certificate must name the resolver IP.
 - [x] Rate limiting / connection caps per source IP: per-IP concurrent
       cap and fixed-window connection-rate budget
       (`--max-conn-per-ip` 10, `--max-conn-rate-per-ip` 60/min) plus a
@@ -627,7 +657,7 @@ should be written alongside their fixes.
    commit/reply, M6/M4/M5 DMARC correctness, M12 limiter RAII,
    M14 storage hygiene).
 2. **Phase 10 — Ops** (rate limiting/RCPT-probe caps — catch-all
-   domains make every probe a valid recipient; graceful shutdown;
+   domains make every probe a valid recipient;
    IPv6 resolver/listener support). DNS caching/reuse (`DnsClient`),
    EDNS0, the accept loop, and resolver configuration are done.
 3. **Phase 12 — Hosted address service (receive-only V1)**: authority

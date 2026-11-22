@@ -126,6 +126,10 @@ pub struct Recipient {
     pub public_key: Option<String>,
     /// Key-rotation generation for [`Recipient::public_key`].
     pub key_generation: Option<u32>,
+    /// The hosted domain's own message size limit, in bytes
+    /// (`max-message-bytes`), if it set one. The session enforces the
+    /// lower of this and the server-wide `max-data-bytes`.
+    pub max_message_bytes: Option<usize>,
 }
 
 /// What the authority answered for one candidate recipient.
@@ -187,11 +191,27 @@ enum DomainPolicy {
 #[derive(Debug, Clone)]
 struct AuthorityData {
     domains: HashMap<String, DomainPolicy>,
+    /// Per-domain message size limits (`max-message-bytes`), for domains
+    /// that set one.
+    domain_limits: HashMap<String, usize>,
     mailboxes: HashMap<String, Mailbox>,
 }
 
 impl AuthorityData {
+    /// Resolve one address: the domain's policy decides acceptance and
+    /// routing, and an accepted recipient carries the domain's size limit.
     fn resolve(&self, address: &str) -> Result<Resolution, AuthorityUnavailable> {
+        let mut resolution = self.resolve_policy(address)?;
+        if let Resolution::Accept(recipient) = &mut resolution {
+            let addr = address.trim().to_ascii_lowercase();
+            recipient.max_message_bytes = addr
+                .rsplit_once('@')
+                .and_then(|(_, domain)| self.domain_limits.get(domain).copied());
+        }
+        Ok(resolution)
+    }
+
+    fn resolve_policy(&self, address: &str) -> Result<Resolution, AuthorityUnavailable> {
         let addr = address.trim().to_ascii_lowercase();
         let Some((_, domain)) = addr.rsplit_once('@') else {
             return Err(AuthorityUnavailable(format!(
@@ -234,6 +254,7 @@ impl AuthorityData {
                             mailbox: mailbox.clone(),
                             public_key: owner.and_then(|o| o.public_key.clone()),
                             key_generation: owner.and_then(|o| o.key_generation),
+                            max_message_bytes: None,
                         }))
                     }
                 }
@@ -290,6 +311,7 @@ impl AuthorityData {
             mailbox: addr.to_string(),
             public_key: mb.public_key.clone(),
             key_generation: mb.key_generation,
+            max_message_bytes: None,
         }
     }
 }
@@ -313,7 +335,15 @@ struct DomainFile {
     mode: PolicyMode,
     catch_all_mailbox: Option<String>,
     grace_days: Option<u64>,
+    /// The domain's own message size limit in bytes (optional). Only a
+    /// *lower* limit than the server's `max-data-bytes` has an effect.
+    max_message_bytes: Option<u64>,
 }
+
+/// The smallest accepted `max-message-bytes`: 1 KiB. Anything smaller
+/// can't hold real headers, so it is almost certainly a unit mistake
+/// (e.g. `10` meaning 10 MB) that would silently refuse all mail.
+const MIN_DOMAIN_MESSAGE_BYTES: u64 = 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -331,7 +361,19 @@ impl AuthorityFile {
             anyhow::bail!("unsupported authority file version {}", self.version);
         }
         let mut domains = HashMap::new();
+        let mut domain_limits = HashMap::new();
         for (name, domain) in self.domains {
+            if let Some(limit) = domain.max_message_bytes {
+                if limit < MIN_DOMAIN_MESSAGE_BYTES {
+                    anyhow::bail!(
+                        "domain {name}: max-message-bytes must be at least {MIN_DOMAIN_MESSAGE_BYTES}, got {limit}"
+                    );
+                }
+                domain_limits.insert(
+                    name.to_ascii_lowercase(),
+                    usize::try_from(limit).unwrap_or(usize::MAX),
+                );
+            }
             let policy = match domain.mode {
                 PolicyMode::Reject => DomainPolicy::Reject,
                 PolicyMode::CatchAll => {
@@ -380,7 +422,11 @@ impl AuthorityFile {
                 },
             );
         }
-        Ok(AuthorityData { domains, mailboxes })
+        Ok(AuthorityData {
+            domains,
+            domain_limits,
+            mailboxes,
+        })
     }
 }
 
@@ -542,6 +588,7 @@ impl RecipientResolver for StaticAuthority {
                 mailbox: addr,
                 public_key: None,
                 key_generation: None,
+                max_message_bytes: None,
             }))
         } else {
             Ok(Resolution::NotHosted)
@@ -596,6 +643,7 @@ mod tests {
                 mailbox: "alice@example.org".into(),
                 public_key: Some("pk-alice".into()),
                 key_generation: Some(2),
+                max_message_bytes: None,
             })
         );
 
@@ -636,6 +684,7 @@ mod tests {
                 mailbox: "admin@example.org".into(),
                 public_key: None,
                 key_generation: None,
+                max_message_bytes: None,
             })
         );
     }
@@ -752,6 +801,50 @@ mod tests {
             authority.resolve("alice@example.org").unwrap(),
             Resolution::Accept(_)
         ));
+    }
+
+    /// `max-message-bytes`: carried on every accepted recipient of the
+    /// domain (including catch-all routing), absent elsewhere, and a value
+    /// under 1 KiB (almost certainly a unit mistake) is a load error.
+    #[test]
+    fn domain_size_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authority.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "domains": {
+                    "small.example": { "mode": "reject", "max-message-bytes": 5000000 },
+                    "catch.example": { "mode": "catch-all", "catch-all-mailbox": "inbox@catch.example", "max-message-bytes": 2048 },
+                    "plain.example": { "mode": "reject" }
+                },
+                "mailboxes": {
+                    "a@small.example": { "user": "a", "expires": null },
+                    "b@plain.example": { "user": "b", "expires": null }
+                }
+            }"#,
+        )
+        .unwrap();
+        let authority = FileAuthority::open(&path).unwrap();
+        let limit = |addr: &str| match authority.resolve(addr).unwrap() {
+            Resolution::Accept(r) => r.max_message_bytes,
+            other => panic!("{addr}: {other:?}"),
+        };
+        assert_eq!(limit("A@Small.Example"), Some(5_000_000));
+        assert_eq!(limit("anyone@catch.example"), Some(2048));
+        assert_eq!(limit("b@plain.example"), None);
+
+        std::fs::write(
+            &path,
+            r#"{ "version": 1, "domains": { "x.example": { "mode": "reject", "max-message-bytes": 10 } }, "mailboxes": {} }"#,
+        )
+        .unwrap();
+        let err = FileAuthority::open(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("max-message-bytes must be at least 1024"),
+            "{err}"
+        );
     }
 
     /// The strict file contract: malformed documents are startup

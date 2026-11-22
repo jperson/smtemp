@@ -59,7 +59,7 @@ impl MaildirSink {
     /// than accept mail it cannot deliver.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(&root)
+        crate::fsutil::create_private_dir_all(&root)
             .with_context(|| format!("cannot create maildir root {}", root.display()))?;
         Ok(MaildirSink { root })
     }
@@ -76,9 +76,9 @@ impl DeliverySink for MaildirSink {
         let maildir = self.root.join(&domain).join(&local);
         let tmp = maildir.join("tmp");
         let new = maildir.join("new");
-        std::fs::create_dir_all(&tmp)
+        crate::fsutil::create_private_dir_all(&tmp)
             .with_context(|| format!("cannot create maildir {}", maildir.display()))?;
-        std::fs::create_dir_all(&new)
+        crate::fsutil::create_private_dir_all(&new)
             .with_context(|| format!("cannot create maildir {}", maildir.display()))?;
 
         // Idempotency is per (recipient, queue_id) as *addresses* — case
@@ -188,8 +188,8 @@ fn sanitize(recipient: &str) -> String {
 /// if the file cannot be created, written, or fsynced — the error
 /// message names the path.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+    let mut f = crate::fsutil::create_private_file(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("cannot write {}", path.display()))?;
     f.sync_all()

@@ -32,7 +32,7 @@ Design goals, in order:
 3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
    canonicalization inputs are preserved exactly where security checks
    depend on them.
-4. **Deterministic tests.** The suite (207 tests) runs offline; live
+4. **Deterministic tests.** The suite (229 tests) runs offline; live
    network behavior is behind `#[ignore]` opt-ins and fixture mocks
    (the `mailserv` integration tests exercise the real resolver path —
    see README, Testing).
@@ -138,7 +138,11 @@ results, DMARC verdict, authenticated identity, TLS state.
   interop guidance; the cap is a per-implementation constant). Over-long
   lines get `500`/`552`, are drained (under the read timeout), and the
   session continues — a data-mode overflow aborts into a `Discard` state
-  that swallows until the terminator.
+  that swallows until the terminator. That terminator ends the failed
+  transaction: the protocol layer calls `reset()`, so the envelope and any
+  buffered data are cleared (RFC 5321 §4.1.1.4) and the next MAIL works.
+  The policy is told about an over-long line through `data_line_too_long`,
+  so the dropped message is logged.
 - DATA: the terminator is **exactly `<CRLF>.<CRLF>`**. In `Data` and
   `Discard` states every line is message data — `RSET`, `QUIT`, and all
   other verbs are content, never commands (the SMTP-smuggling class,
@@ -166,8 +170,18 @@ results, DMARC verdict, authenticated identity, TLS state.
     3. spool (if configured)                 → durable write, queue ID
     4. clear envelope; message_count += 1
     5. return Control (Accept, Reject on DMARC p=reject, or
-       Tempfail if the spool write failed)
+       Tempfail if the spool write failed or the DNS deadline ran out)
 ```
+
+Steps 1 and 2 share **one DNS deadline**, `END_OF_DATA_DNS_DEADLINE`
+(20 s, the same as SPF's), covering every DKIM key lookup and the DMARC
+policy fetch. Running out ends the transaction with `451 4.4.3`, a
+temporary failure and never a rejection, since skipping the checks would
+fail DMARC on legitimate mail. It is logged at `warn` with the stage
+(`dkim` or `dmarc`). Without it, five signatures (`dkim::MAX_SIGNATURES`)
+each waiting the 5 s per-query timeout, plus the DMARC fetch, could
+outlast the connection cap and drop the session with no reply (D3 in
+DEPLOYMENT.md).
 
 Ordering matters: DKIM runs first (DMARC consumes its results), and the
 spool write happens on the acceptance path only — the `250` is sent
@@ -203,6 +217,13 @@ enforces MAIL-before-RCPT again next time).
   file) — an interim design, to be replaced by hashed storage or an
   external auth backend before production submission use (PLAN.md,
   Phase 8).
+  **Requirement:** `From:` validation (constrain the authenticated user's
+  `MAIL FROM`/`From:` to domains they own; PLAN.md Phase 8) is a
+  prerequisite for enabling AUTH. The SPF/DMARC exemptions above are
+  unconditional, so without it an authenticated session is a spoofing
+  channel into hosted mailboxes — and a receive-only server has no sending
+  use for AUTH at all. Do not enable `--auth-users` until the validation
+  lands.
 - **Recipient policy**: owned by the **recipient authority** (Phase 12
   gap 1, now a seam): at RCPT time a `RecipientResolver` decides
   hosted-domain membership, per-domain policy (`reject` / `catch-all` /
@@ -221,6 +242,24 @@ enforces MAIL-before-RCPT again next time).
   maildir directories); others get `553 5.1.3`.
 - **Framing DoS**: line caps, per-message size accounting, accept-loop
   backoff.
+- **Message size**: the server-wide `max-data-bytes` (default 10 MiB),
+  lowered per hosted domain by `max-message-bytes` in the authority file.
+  A transaction carries one limit: a recipient whose domain limit differs
+  from those already accepted gets `452 4.5.3` (deliver separately, RFC
+  5321 §4.5.3.1.10), so one tenant's limit never refuses another's mail. A
+  declared `SIZE=` is checked at MAIL (server limit) and RCPT (domain
+  limit); data over the limit gets `552`. Every refusal is logged as
+  `message refused: size limit` (stage, size, limit, recipient domains).
+- **Privileges**: started as root, mailserv binds the port, reads the TLS
+  key and resolver CA, creates missing storage directories owned by
+  `--user`, then drops supplementary groups, gid and uid and verifies that
+  root can't be regained (`privdrop.rs`), all before opening the
+  authority, the spool or the maildirs, and before any connection. Root
+  without `--user` is refused; an unprivileged start (systemd with
+  `CAP_NET_BIND_SERVICE`, or port 2525 for testing) needs no switch.
+- **Storage permissions**: files `0600`, directories `0700`, set explicitly
+  (`fsutil.rs`) whatever the umask, plus `umask 077` at startup. Existing
+  directories that other users can access get a startup warning.
 - **DNS DoS**: pipelined resolver connections, a 20 s SPF evaluation
   deadline, and a per-source-IP limit on concurrent DNS-backed checks
   (`--max-dns-per-ip`, which tempfails with `451` when exhausted); see
@@ -228,7 +267,9 @@ enforces MAIL-before-RCPT again next time).
 
 **Known, deliberate exemptions** (documented policy choices, not bugs):
 authenticated submissions skip SPF/DMARC rejection; `p=none` DMARC logs
-but passes; `pct=` is treated as 100.
+but passes; `pct=` is treated as 100. The authenticated-sender exemption
+is safe only with `From:` validation (see AUTH above); without it, it is a
+bypass of the receive-side spoofing checks.
 
 ---
 
@@ -239,6 +280,18 @@ preferred, TCP; the unauthenticated single-datagram UDP path was retired
 — it could not be made production-safe). Queries advertise a 1232-byte
 EDNS0 payload (flag day 2020), and responses are validated for EDNS0
 conformance on every transport (one OPT, root owner name, version 0).
+**Query names are checked before sending** (`proto::check_name`,
+`normalize_name`): an empty label, a label over 63 octets, or a name over
+253 octets is refused with `InvalidName` (`dns::is_invalid_name`) before
+any capacity is taken or a connection is opened, and the wire encoder
+refuses them too. Such names are attacker-reachable through SPF records
+and DKIM `d=`/`s=` tags; the encoder used to write them anyway, and
+public resolvers silently drop the malformed query, so each one cost the
+full timeout. SPF treats an invalid name as a name that doesn't exist
+(RFC 7208 §4.3); DKIM reports the key lookup as failed straight away.
+Names are normalized once (whitespace and one trailing dot removed), so
+the cache key and the name sent are the same.
+
 Response parsing is **total**: every index and
 slice is bounds-checked; rdata is bounded by the record's own `rdlength`;
 compression pointers are range-checked and depth-limited. The property is
@@ -254,6 +307,19 @@ threaded through `SessionConfig` into
 DKIM's fixture corpus openssl-anchored makes the SPF suite deterministic. The RFC 7208 §4.6.4
 budget (10 lookups / 2 void, shared across include/redirect/a/mx/ptr/
 exists) bounds every evaluation regardless of record hostility.
+
+**Resolver trust.** The resolver's DoT certificate is verified against
+the `--resolver` IP address, using the public web PKI roots
+(`webpki_roots`), so public DoT services such as 1.1.1.1, 9.9.9.9 and
+8.8.8.8 work with no extra configuration. To use a local resolver with a
+private or self-signed certificate, `--resolver-ca <PEM>` (config key
+`resolver-ca`) **adds** its CA certificates to that root set
+(`DnsClient::with_extra_roots`). It never replaces the set, so a public
+resolver still verifies with the option set. The extra roots apply only
+to resolver connections, not to the SMTP listener's TLS. The resolver
+still has to present a certificate with its IP address as a subject
+alternative name. The file is loaded before the listener binds, and a
+missing, empty or invalid file is a startup error.
 
 DMARC reuses `SpfResolver` for its record fetch, which is why the `dmarc`
 crate is pure logic with no DNS dependency of its own.
@@ -431,15 +497,30 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
   `--local-domains` sets the accepted recipient domains.
 - `RUST_LOG` governs verbosity (default INFO); bunyan-JSON on stdout.
   Envelope verdicts, TLS state, and message counts are logged; message
-  bodies never are.
+  bodies never are. The per-line `recv_data` span is at TRACE, so a
+  message produces a fixed handful of records rather than two per line
+  of DATA (D1, DEPLOYMENT.md).
 - The accept loop survives transient errors (log + backoff) and logs
   every connection task's outcome.
+- Defaults are production defaults: port 25, storage under
+  `/var/lib/mailserv` (absolute, so independent of the working directory;
+  a relative path is warned about), 10 MiB messages, a 5-minute connection
+  cap, 100 connections.
+- **Graceful shutdown** (SIGTERM/SIGINT): the listener closes, so new
+  connections are refused; every session is signalled through
+  `SmtpSession::shutdown_signal`. The read loop only acts on it between
+  transactions: idle sessions get `421 4.3.2` at once, and a session
+  mid-message or mid-AUTH finishes, gets its reply, then the `421`. The
+  process exits when all sessions have ended (each holds a permit of the
+  global connection semaphore), after `shutdown-grace-ms` (default 60 s,
+  below systemd's 90 s stop timeout), or at a second signal. Blocking
+  work already running (spool fsync, delivery) completes before exit.
 
 ---
 
 ## 9. Testing strategy
 
-207 tests, four layers:
+229 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).
@@ -475,10 +556,11 @@ Honest, tracked list (details in PLAN):
   not fetched.
 - DNS: no resolver back-off and no sharing of duplicate misses yet
   (§6.1, "Still open"); the resolver address
-  is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only.
+  is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only;
+  a local resolver with a private certificate needs `--resolver-ca`.
 - Per-IP limits are per-address, not per-subnet (IPv6 prefix aggregation
   is future hardening); no RCPT-command rate limiting inside a session.
 - No metrics endpoint (the DNS client's counters are logged every 60 s,
-  §6.1), no graceful shutdown, no ARC.
+  §6.1), no ARC.
 - mailparse: `Content-Disposition` is a stub; no RFC 2047 decoding;
   `Received` with comments/IPv6 literals falls back to the raw view.

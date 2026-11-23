@@ -288,7 +288,7 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
 }
 
 /// The elapsed-time limit for one whole `check_host()` evaluation,
-/// across every DNS lookup it makes (DESIGN §6.1).
+/// across every DNS lookup it makes (DESIGN §9).
 ///
 /// RFC 7208 §4.6.4: implementations SHOULD limit the total time spent
 /// evaluating `check_host()`, the limit SHOULD allow at least 20 seconds,
@@ -751,7 +751,7 @@ mod tests {
         }
     }
 
-    /// DESIGN §6.1 / RFC 7208 §4.6.4: the whole evaluation has an
+    /// DESIGN §9 / RFC 7208 §4.6.4: the whole evaluation has an
     /// elapsed-time limit. A chain of includes whose lookups are each
     /// slow stops at the limit with TempError instead of running for
     /// lookups × per-query timeout; a fast evaluation is unaffected.

@@ -475,11 +475,10 @@ impl Label {
     /// terminator.
     ///
     /// Returns `Err` ([`InvalidName`]) for a name that has no valid wire
-    /// form (see [`check_name`]). Previously such names were written
-    /// anyway: a label's length was cast to one octet, so a 64-255 octet
-    /// label set the top bits that mark a compression pointer or an
-    /// extended label type, a longer one wrapped around, and an empty
-    /// label ended the name early (L1/D3 in REPORT.md and DEPLOYMENT.md).
+    /// form (see [`check_name`]). Footgun: never write such a name anyway.
+    /// A label length is one octet, so a 64–255-octet label would set the
+    /// top bits that mark a compression pointer, a longer one would wrap,
+    /// and an empty label would end the name early.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         check_name(&self.0)?;
         let mut data: Vec<u8> = vec![];

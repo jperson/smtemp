@@ -248,8 +248,8 @@ fn cache_ttl(resp: &DnsMessage) -> Option<Duration> {
     Some(Duration::from_secs(ttl.min(MAX_CACHE_TTL)))
 }
 
-/// Live counters and gauges for a [`DnsClient`] (DESIGN §6.1: the
-/// baseline for sizing the connection pool and measuring pipelining).
+/// Live counters and gauges for a [`DnsClient`]: the baseline for sizing
+/// the connection pool and measuring pipelining.
 ///
 /// Everything is a lock-free atomic. The gauges (`waiting`, `in_flight`)
 /// are maintained by drop guards, so a query whose future is cancelled
@@ -337,7 +337,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-// -- Pipelined connections (DESIGN §6.1) --------------------------------
+// -- Pipelined connections -------------------------------------------
 
 /// Default number of pipelined DoT connections per [`DnsClient`].
 pub const DEFAULT_CONNECTIONS: usize = 2;
@@ -652,7 +652,7 @@ impl Drop for SlotClaim<'_> {
 }
 
 /// A shared DNS-over-TLS client: a few lazily-established, **pipelined**
-/// TLS connections (DESIGN §6.1), plus a TTL-based result cache shared
+/// TLS connections, plus a TTL-based result cache shared
 /// by every consumer (SPF, DKIM, DMARC).
 ///
 /// Each connection carries up to [`DnsClient::max_in_flight`] queries at
@@ -833,8 +833,7 @@ impl DnsClient {
     /// with an [`InvalidName`](crate::proto::InvalidName) error (see
     /// [`is_invalid_name`]). Such names are attacker-reachable (SPF
     /// records, DKIM `d=`/`s=`), and public resolvers silently drop the
-    /// malformed query, so each one used to cost the full timeout (D3 in
-    /// DEPLOYMENT.md). Surrounding whitespace and one trailing dot are
+    /// malformed query, so sending one would cost the full timeout. Surrounding whitespace and one trailing dot are
     /// removed first, so the cache key and the name sent are identical.
     pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
         let domain = proto::normalize_name(domain).map_err(anyhow::Error::new)?;
@@ -925,8 +924,8 @@ impl DnsClient {
     /// none or its connection has closed.
     ///
     /// Returns `Err` if connecting fails or exceeds the timeout. The
-    /// connect (TCP + TLS handshake) is bounded like a query (H6,
-    /// security report): a black-holed resolver must not hold the slot
+    /// connect (TCP + TLS handshake) is bounded like a query: a black-holed
+    /// resolver must not hold the slot
     /// for the kernel's connect timeout.
     async fn get_or_connect(&self, slot: &Slot) -> Result<Arc<Pipeline>> {
         let mut conn = slot.conn.lock().await;
@@ -1234,7 +1233,7 @@ mod tests {
         (addr, cert_der, conns, queries)
     }
 
-    /// `--resolver-ca` (D2, DEPLOYMENT.md): extra roots are added to the
+    /// `--resolver-ca`: extra roots are added to the
     /// public webpki set, never substituted for it, so public DoT
     /// resolvers keep verifying when a private CA is configured.
     #[test]
@@ -1337,8 +1336,8 @@ mod tests {
     }
 
     /// The name is normalized once, so `a.test.` and `a.test` are one
-    /// cache entry (and the trailing-dot form is valid; it used to encode
-    /// as an empty label, i.e. a malformed query).
+    /// cache entry, and the trailing-dot form encodes correctly (not as an
+    /// empty label).
     #[tokio::test]
     async fn trailing_dot_names_share_the_cache_entry() {
         use std::sync::atomic::Ordering;
@@ -1481,7 +1480,7 @@ mod tests {
         );
     }
 
-    /// H6 (security report): a slow lookup (e.g. an attacker-published
+    /// A slow lookup (e.g. an attacker-published
     /// record whose authoritative server never answers) must not stall
     /// unrelated lookups. The mock answers names starting with "slow"
     /// after 1.5 s and everything else immediately; a fast query issued
@@ -1591,7 +1590,7 @@ mod tests {
         assert_eq!(client.stats().in_flight, 0);
     }
 
-    // -- Pipelining (DESIGN §6.1) --------------------------------------
+    // -- Pipelining --------------------------------------------------
 
     /// A pipelining-capable mock DoT resolver.
     struct Mock {
@@ -1931,10 +1930,9 @@ mod tests {
         assert!(!pipeline.is_closed());
     }
 
-    /// H6 (security report, re-opened in round 4): with the old 8-slot
-    /// pool, 8 slow lookups (one client IP's worth of sessions) stalled
-    /// every other lookup. Pipelined, 20 slow lookups in flight still
-    /// leave a fast lookup unaffected, at the default configuration.
+    /// 20 slow lookups in flight leave a fast lookup unaffected at the
+    /// default configuration. (A connection pool without pipelining fails
+    /// this: a handful of slow lookups would stall every other one.)
     #[tokio::test]
     async fn many_slow_lookups_do_not_stall_others() {
         let mock = spawn_mock(MockMode::Concurrent(slow_names)).await;

@@ -96,8 +96,7 @@ pub enum DkimError {
     InvalidSignature(String),
 
     /// The signature's `l=` does not cover the whole body, so content
-    /// outside the signature could have been appended (F5,
-    /// SECURITY-AUDIT.md). Such a signature is never treated as verified.
+    /// outside the signature could have been appended. Such a signature is never treated as verified.
     #[error("body length (l=) does not cover the whole message body")]
     PartialBody,
 
@@ -232,7 +231,7 @@ impl<'a> DkimSignature<'a> {
         }
         // RFC 6376 §6.1.1: a signature that doesn't sign From must be
         // ignored, or the From header could be replaced on a genuinely
-        // signed message and still verify (F5, SECURITY-AUDIT.md).
+        // signed message and still verify.
         if !signed_headers
             .iter()
             .any(|h| h.eq_ignore_ascii_case("from"))
@@ -542,10 +541,10 @@ pub fn signed_header_data(
     sig_header: &RawHeader,
 ) -> Result<Vec<u8>, DkimError> {
     // Index the header instances by lowercased name once, in message order,
-    // so selection is linear in h= entries + headers (S2, SECURITY.md: the
-    // old per-entry scan of the whole header list was O(h × headers) and
-    // let one message pin a worker for minutes). Only names that h= lists
-    // are indexed.
+    // so selection is linear in h= entries + headers. Footgun: scanning the
+    // whole header list per h= entry is O(h × headers), and both are
+    // attacker-controlled; one message could pin a worker for minutes. Only
+    // names that h= lists are indexed.
     let wanted: HashSet<String> = sig
         .signed_headers
         .iter()
@@ -597,10 +596,8 @@ mod tests {
     use mailparse::parse_raw_message;
 
     // A real-world-style signed message (trimmed from an actual received
-    // mail). The bh= tag below is the hash of the body as it exists in this
-    // fixture (cross-checked against openssl); the original message's
-    // bh=evU+ZAhaA7uoDunwy9tpxgyXQlVvxX0ZJTSDyRIcuew= no longer applies
-    // because the body drifted when transcribed into this file.
+    // mail). The bh= tag below is the hash of this fixture's body
+    // (cross-checked against openssl), not of the original message's.
     const TEST_MESSAGE: &str = r#"Delivered-To: jrperson@gmail.com
 Received: by 2002:a05:6841:8607:b0:18c1:ca90:59ae with SMTP id mh7csp748466nlc;
         Fri, 1 Nov 2024 18:16:08 -0700 (PDT)
@@ -1074,10 +1071,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert!(!result.signature_ok);
     }
 
-    /// Live: fetch protonmail's real DKIM key over DNS-over-TLS.
-    /// Opt-in because it touches the network.
-    /// H7 (security report): no matter how many signature headers a
-    /// message carries, at most MAX_SIGNATURES are evaluated (each one
+    /// No matter how many signature headers a message carries, at most MAX_SIGNATURES are evaluated (each one
     /// costs a DNS lookup, a body hash, and a public-key operation). The
     /// resolver points at a closed local port, so every key lookup fails
     /// fast and offline.
@@ -1137,7 +1131,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         (signed, key)
     }
 
-    /// N11 + S1 (SECURITY.md): DKIM works on the raw view, so a signed
+    /// DKIM works on the raw view, so a signed
     /// message whose headers the typed grammar rejects — non-UTF-8 bytes,
     /// or comments nested past mailparse's bound — still verifies, and
     /// deep nesting never reaches the recursive grammar at all.
@@ -1183,9 +1177,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         );
     }
 
-    /// S2 (SECURITY.md): an `h=` list over MAX_SIGNED_HEADERS is refused,
-    /// and selection is linear — a list at the cap against 200,000 headers
-    /// (the shape that used to take minutes) finishes promptly.
+    /// An `h=` list over MAX_SIGNED_HEADERS is refused, and selection is
+    /// linear: a list at the cap against 200,000 headers finishes promptly.
     #[test]
     fn signed_header_list_is_bounded_and_linear() {
         let names = |n: usize| vec!["z"; n].join(":");
@@ -1218,6 +1211,8 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         );
     }
 
+    /// Fetches protonmail's real DKIM key over DNS-over-TLS. Opt-in, because
+    /// it touches the network.
     #[tokio::test]
     #[ignore = "hits live DNS (DoT to 1.1.1.1)"]
     async fn live_fetch_public_key() {
@@ -1378,8 +1373,7 @@ fn auid_matches(sig: &DkimSignature, key: &DkimKeyRecord) -> bool {
 /// RFC 8301 §3.2: the smallest RSA key a verifier may accept.
 pub const MIN_RSA_BITS: usize = 1024;
 
-/// Whether the signature covers the whole canonicalised body (F5,
-/// SECURITY-AUDIT.md). With `l=` shorter than the body, anything after it
+/// Whether the signature covers the whole canonicalised body. With `l=` shorter than the body, anything after it
 /// is unsigned: content appended to a genuinely signed message would still
 /// verify and pass DMARC. With `l=` longer than the body, RFC 6376 §3.5
 /// says the signature is invalid. Either way it must not count as
@@ -1559,8 +1553,7 @@ pub fn verify_with_key<'m>(
     }
 }
 
-/// The most signatures [`verify_dkim`] evaluates per message (H7,
-/// security report). Each signature costs a key lookup, a full body
+/// The most signatures [`verify_dkim`] evaluates per message. Each signature costs a key lookup, a full body
 /// canonicalization + hash, and a public-key operation; without a cap a
 /// 1 MiB message could carry >10,000 signature headers. Legitimate mail
 /// carries a handful (author domain, ESP, a forwarder or two), so the
@@ -1568,7 +1561,7 @@ pub fn verify_with_key<'m>(
 /// are ignored — an ignored signature simply contributes no pass.
 pub const MAX_SIGNATURES: usize = 5;
 
-/// The most `h=` entries a signature may list (S2, SECURITY.md). Real
+/// The most `h=` entries a signature may list. Real
 /// signatures name a few dozen headers even with heavy oversigning; a
 /// longer list is refused as an invalid `h=` tag, so the signature
 /// contributes no pass. Header selection is linear regardless, so this only
@@ -1606,10 +1599,11 @@ pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimRes
     results
 }
 
-/// F5 (SECURITY-AUDIT.md): the three verifier gaps, each reproduced by
-/// genuinely signing a message and then attacking it.
+/// Verifier policy: weak keys, partial-body `l=`, and signatures that don't
+/// sign From. Each is tested by genuinely signing a message, then attacking
+/// it.
 #[cfg(test)]
-mod f5_tests {
+mod verifier_policy_tests {
     use super::*;
     use rsa::pkcs8::EncodePublicKey as _;
     use rsa::signature::{SignatureEncoding as _, Signer as _};

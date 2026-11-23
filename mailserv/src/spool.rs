@@ -1,4 +1,4 @@
-//! Disk spool: durable staging of accepted messages (Phase 7).
+//! Disk spool: durable staging of accepted messages.
 //!
 //! On end-of-data acceptance the session writes the raw message plus its
 //! envelope/verdict metadata to a [`SpoolWriter`] backend, and the SMTP
@@ -10,13 +10,11 @@
 //! the commit point: a payload without metadata is an incomplete write
 //! from a crashed process and may be cleaned up by a future drain pass.
 //!
-//! Backends are pluggable (PLAN.md Phase 12, gap 9): `DiskSpool` is the
-//! first implementation; an object-storage backend follows the same
-//! trait. Payloads pass through an optional [`PayloadEncryptor`] at this
-//! boundary — after SMTP processing, before any bytes reach storage — so
-//! user-held-key encryption (Phase 12, gap 3) never leaks plaintext to
-//! the storage layer. Metadata stays plaintext so the queue can always
-//! be routed and expired.
+//! [`SpoolWriter`] abstracts writes only: the drain's read side (list,
+//! load, record attempt, remove, dead-letter) uses [`DiskSpool`] directly,
+//! so a second backend needs that split out first. Payloads can pass
+//! through an optional [`PayloadEncryptor`] before any bytes reach storage.
+//! Metadata stays plaintext so the queue can always be routed and expired.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -78,15 +76,15 @@ pub trait SpoolWriter: Send + Sync {
 /// Encrypts a message payload before it reaches the spool backend.
 ///
 /// The plaintext never touches storage: the backend stores exactly the
-/// bytes `encrypt` returns. Decryption is *not* part of this trait —
-/// with user-held keys (Phase 12) the server cannot decrypt, and the
-/// front-end does it client-side.
+/// bytes `encrypt` returns. Decryption is *not* part of this trait: with
+/// user-held keys the server can't decrypt. The trait seals the payload
+/// once per message and has no recipient parameter.
 ///
-/// Multi-recipient messages: the current trait seals the payload once
-/// per message. The decided Phase 12 direction is a multi-recipient
-/// container (PGP/age-style: one content key, wrapped per recipient —
-/// see PLAN.md, gap 3); this trait widens to take the recipient key
-/// set once the console authority supplies recipient keys.
+/// Footgun: production configures no encryptor, and two paths assume
+/// plaintext. The drain builds each delivery copy by *prepending*
+/// plaintext trace headers to the stored payload, which would corrupt a
+/// sealed one. The session's fast path delivers the plaintext copy
+/// directly. Both must change before an encryptor is configured.
 pub trait PayloadEncryptor: Send + Sync {
     /// Identifier stored in the message metadata (algorithm + key id)
     /// so readers can tell how a payload was sealed and which key
@@ -99,9 +97,9 @@ pub trait PayloadEncryptor: Send + Sync {
     fn encrypt(&self, payload: &[u8]) -> Result<Vec<u8>>;
 }
 
-/// One accepted recipient with its authority-resolved routing target
-/// (Phase 12 gap 1: the resolved identity is captured at RCPT time and
-/// travels with the message through the queue).
+/// One accepted recipient with its authority-resolved routing target. The
+/// identity is resolved at RCPT time and travels with the message through
+/// the queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct SpoolRcpt {
     /// Envelope address exactly as the client sent it (used for the
@@ -113,8 +111,7 @@ pub struct SpoolRcpt {
     pub mailbox: String,
     /// Owning account (platform user), when the authority knows one.
     pub user: Option<String>,
-    /// Public key registered for this mailbox (Phase 12 payload
-    /// encryption wraps the content key with every recipient's key).
+    /// Public key registered for this mailbox. Carried, not used yet.
     pub public_key: Option<String>,
     /// Key-rotation generation for [`SpoolRcpt::public_key`].
     pub key_generation: Option<u32>,
@@ -238,8 +235,12 @@ impl DiskSpool {
         let _ = std::fs::remove_file(self.tmp.join(format!("{queue_id}.json")));
     }
 
-    /// List all committed messages, oldest queue ID first. Messages are
-    /// returned with their parsed metadata and payload bytes.
+    /// List all committed messages, oldest queue ID first, with their parsed
+    /// metadata and delivery-attempt record. Payloads are **not** read:
+    /// [`QueuedMessage::load_payload`] loads one when the drain is about to
+    /// deliver it. Mail can stay queued for days during an outage, and loading
+    /// the whole backlog every pass would turn that into an out-of-memory
+    /// crash.
     ///
     /// Returns `Err` only if the queue directory is unreadable; a single
     /// malformed or uncommitted entry (a `.eml` without `.json`) is
@@ -263,37 +264,43 @@ impl DiskSpool {
             let Ok(meta) = serde_json::from_slice::<SpoolMeta>(&meta_bytes) else {
                 continue;
             };
-            let Ok(payload) = std::fs::read(&payload_path) else {
+            if !payload_path.exists() {
                 continue;
-            };
+            }
             let attempts_path = self.new_dir.join(format!("{queue_id}.attempts"));
-            let attempts = std::fs::read_to_string(&attempts_path)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
+            let record = std::fs::read_to_string(&attempts_path)
+                .map(|s| AttemptRecord::parse(&s))
+                .unwrap_or_default();
             queued.push(QueuedMessage {
                 queue_id: queue_id.to_string(),
                 meta,
-                payload,
                 payload_path,
                 meta_path: path,
                 attempts_path,
-                attempts,
+                attempts: record.attempts,
+                first_failure: record.first_failure,
+                last_failure: record.last_failure,
             });
         }
         queued.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
         Ok(queued)
     }
 
-    /// Record one failed delivery attempt for a queued message.
+    /// Record one failed delivery attempt at `now` (Unix seconds).
     ///
-    /// Returns the new attempt count (1 on the first call). The count is
-    /// persisted in an `{id}.attempts` sidecar so it survives restarts;
-    /// a missing or unreadable sidecar counts as zero prior attempts.
-    pub fn record_attempt(&self, queued: &QueuedMessage) -> Result<u32> {
-        let attempts = queued.attempts + 1;
-        write_durable(&queued.attempts_path, attempts.to_string().as_bytes())?;
-        Ok(attempts)
+    /// Returns the updated record. It is persisted in the `{id}.attempts`
+    /// sidecar as `count first_failure last_failure`, so the retry schedule
+    /// and the queue lifetime survive restarts. A missing sidecar means no
+    /// prior attempts. A count-only sidecar keeps its count and starts the
+    /// lifetime clock now.
+    pub fn record_attempt(&self, queued: &QueuedMessage, now: u64) -> Result<AttemptRecord> {
+        let record = AttemptRecord {
+            attempts: queued.attempts + 1,
+            first_failure: Some(queued.first_failure.unwrap_or(now)),
+            last_failure: Some(now),
+        };
+        write_durable(&queued.attempts_path, record.to_string().as_bytes())?;
+        Ok(record)
     }
 
     /// Remove a fully handled message (payload, metadata, attempt
@@ -358,9 +365,6 @@ pub struct QueuedMessage {
     pub queue_id: String,
     /// Parsed acceptance metadata.
     pub meta: SpoolMeta,
-    /// Payload bytes (as stored — possibly ciphertext if an encryptor
-    /// was configured at write time).
-    pub payload: Vec<u8>,
     /// Path of the payload file.
     pub payload_path: PathBuf,
     /// Path of the metadata file.
@@ -369,6 +373,57 @@ pub struct QueuedMessage {
     pub attempts_path: PathBuf,
     /// Recorded failed delivery attempts (0 if none).
     pub attempts: u32,
+    /// When the first failed attempt happened (Unix seconds), if recorded.
+    /// The queue lifetime is measured from here.
+    pub first_failure: Option<u64>,
+    /// When the latest failed attempt happened (Unix seconds), if recorded.
+    /// The next retry is due a backoff interval after this.
+    pub last_failure: Option<u64>,
+}
+
+impl QueuedMessage {
+    /// Read the payload bytes, as stored (possibly ciphertext if an
+    /// encryptor was configured at write time).
+    pub fn load_payload(&self) -> Result<Vec<u8>> {
+        std::fs::read(&self.payload_path)
+            .with_context(|| format!("cannot read {}", self.payload_path.display()))
+    }
+}
+
+/// A message's delivery-attempt record, as kept in its `{id}.attempts`
+/// sidecar: `count first_failure last_failure` (Unix seconds).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptRecord {
+    /// Failed delivery attempts so far.
+    pub attempts: u32,
+    /// Time of the first failed attempt.
+    pub first_failure: Option<u64>,
+    /// Time of the latest failed attempt.
+    pub last_failure: Option<u64>,
+}
+
+impl AttemptRecord {
+    /// Parse a sidecar. Unparseable fields are treated as absent: a
+    /// damaged record makes a message due now and restarts its lifetime
+    /// clock, so it can only delay giving up, never lose mail early.
+    pub fn parse(s: &str) -> Self {
+        let mut fields = s.split_ascii_whitespace();
+        AttemptRecord {
+            attempts: fields.next().and_then(|f| f.parse().ok()).unwrap_or(0),
+            first_failure: fields.next().and_then(|f| f.parse().ok()),
+            last_failure: fields.next().and_then(|f| f.parse().ok()),
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.attempts)?;
+        if let (Some(first), Some(last)) = (self.first_failure, self.last_failure) {
+            write!(f, " {first} {last}")?;
+        }
+        Ok(())
+    }
 }
 
 impl SpoolWriter for DiskSpool {
@@ -382,13 +437,13 @@ impl SpoolWriter for DiskSpool {
     /// (if any) *before* the first write; an encryption failure aborts
     /// before any bytes reach disk, so there is nothing to roll back.
     ///
-    /// Crash safety (per the Phase 7 plan): payload and metadata are
+    /// Crash safety: payload and metadata are
     /// each written under `tmp/` and fsynced, then renamed into `new/`
     /// — metadata last. Only the final rename is the commit; anything
     /// left in `tmp/` is an incomplete write. Known simplifications
     /// versus a fully hardened production queue (no write-ahead journal,
     /// single-disk assumption, best-effort rollback on error paths) are
-    /// deliberate scope cuts tracked for later hardening.
+    /// deliberate.
     ///
     /// Returns `Ok(queue_id)` once both files are committed under
     /// `new/`. Returns `Err` if any step fails (encryption,
@@ -654,8 +709,7 @@ mod tests {
     }
 
     /// Queue IDs must never collide: they are the storage key for the
-    /// message pair and, later, the idempotency key for object-storage
-    /// upload (Phase 12, gap 9).
+    /// message pair and part of the delivery idempotency key.
     #[tokio::test]
     async fn queue_ids_are_unique() {
         let dir = tempfile::tempdir().unwrap();

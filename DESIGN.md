@@ -1,76 +1,81 @@
 # DESIGN.md — Architecture of mailserv
 
-This document describes the system as it stands today: the crate layout,
-the core design idea, the request pipeline, the security model, and the
-testing strategy. For the work backlog, see [PLAN.md](PLAN.md); this
-document explains *why the code is shaped the way it is*.
+This document describes how mailserv works **today** and where its design
+falls short (§13). Remaining work is in [PLAN.md](PLAN.md). Running and
+configuring it is covered in [README.md](README.md), and going live in
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ---
 
 ## 1. Overview
 
-**mailserv** is a small SMTP server written in Rust: it accepts mail over
-(plaintext or STARTTLS) SMTP, evaluates SPF, DKIM, and DMARC, enforces a
-closed-relay recipient policy, optionally authenticates submitters, and
-structurally logs every decision. Accepted mail is durably spooled and
-delivered to local maildirs (PLAN §Phase 7); the hosted per-user mailbox
-backend arrives with the platform (PLAN §Phase 12).
+mailserv is an inbound SMTP server (MX) in Rust. For every message it:
 
-**V1 product scope is receive-only**: a hosted email service —
-inbound MX delivery to user-owned addresses on BYO domains (permanent
-by default, optional per-address expiry), no sending. Send-side
-features (submission/MSA, DKIM signing) are post-V1 and low priority;
-the architecture keeps their hooks so they can be added later (PLAN
-§Phase 8, §Phase 12).
+- accepts it over plaintext or STARTTLS SMTP;
+- checks SPF, DKIM and DMARC;
+- accepts recipients only if the **recipient authority** hosts them;
+- durably spools it before replying `250`;
+- delivers it to a local maildir, retrying failures;
+- logs each decision as structured JSON.
+
+**V1 scope is receive-only**: a hosted service for inbound mail to
+user-owned addresses on customer domains, with no relaying, sending or
+bounces. The AUTH and sender-grant code is kept for a future submission role
+but isn't part of V1 (§10).
 
 Design goals, in order:
 
-1. **Correctness over features.** Every protocol behavior is pinned by a
-   test; every reply is justified by an RFC citation in a comment.
+1. **Correctness over features.** Protocol behaviour is pinned by tests, and
+   replies cite the RFC they follow.
 2. **Binding policy.** The policy layer's verdicts are enforced by the
-   protocol layer, not advisory (see §3).
-3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
-   canonicalization inputs are preserved exactly where security checks
-   depend on them.
-4. **Deterministic tests.** The suite (258 tests) runs offline; live
-   network behavior is behind `#[ignore]` opt-ins and fixture mocks
-   (the `mailserv` integration tests exercise the real resolver path —
-   see README, Testing).
+   protocol layer, not advisory (§3).
+3. **Fail closed.** If a policy input is unknown (DNS error, authority
+   unavailable, unparseable header), the answer is a temporary failure or a
+   refusal, never an accept.
+4. **Byte fidelity.** Mail is bytes. Bodies, folded headers and
+   canonicalisation inputs are preserved exactly where checks depend on them.
+5. **Deterministic tests.** The suite runs offline, apart from the
+   exceptions noted in §12.
 
 ---
 
 ## 2. Workspace layout
 
-Crate-per-component, each independently testable:
+```
+mailserv/     the binary: policy (UserSession), authority, auth grants,
+              spool, delivery, limits, privilege drop, TLS, driver
+smtp/         wire protocol: state machine, framing, DATA transparency
+spf/          RFC 7208 evaluation over an abstract resolver (SpfResolver)
+dmarc/        RFC 7489 records, policy discovery, alignment, policy
+dkim/         RFC 6376/8463 verification (RSA, Ed25519)
+mailparse/    RFC 5322/2045 headers: raw byte view + typed (pest) view
+dns/          DNS wire codec, pipelined DNS-over-TLS client, TTL cache
+dnsq/         DNS query CLI
+smtp-client/  demo SMTP client
+```
+
+Dependencies only point downward:
 
 ```
-mailserv/       the binary: policy (UserSession), TLS acceptor, driver loop
-smtp/           wire protocol: state machine, framing, DATA transparency
-spf/            RFC 7208 evaluation over an abstract DNS resolver
-dmarc/          RFC 7489 record parsing, alignment, policy application
-dkim/           RFC 6376/8463 verification (canonicalization, hashing, RSA/Ed25519)
-mailparse/      RFC 5322/2045 header parsing: raw + typed views (pest grammar)
-dns/            DNS wire codec + DNS-over-TLS queries (hostile-input hardened)
-dnsq/           CLI query tool (uses the dns crate)
-smtp-client/    CLI test client
+mailserv → smtp, spf, dkim, dmarc
+spf      → dns
+dkim     → mailparse, dns
+dmarc    → spf      (the SpfResolver trait only)
 ```
 
-Dependency direction is strictly downward: `mailserv → {smtp, spf, dkim,
-dmarc, mailparse}` → `spf → dns`, `dkim → {mailparse, dns}`. The `smtp`
-crate depends on nothing but `anyhow`/`tokio`/`base64` — it cannot see
-policy internals.
+The `smtp` crate depends on nothing but `anyhow`, `tokio` and `base64`, so
+it can't see policy internals.
 
 ---
 
-## 3. The core idea: protocol vs. policy
+## 3. Protocol versus policy
 
-The central design is a strict seam between *what SMTP is* and *what this
-server is*. The `smtp` crate owns the former — verbs, states, sequencing,
-framing — and delegates every decision to a policy trait:
+The `smtp` crate owns *what SMTP is*: verbs, states, sequencing, framing.
+Every decision is delegated to the `SmtpSession` trait, which `mailserv`
+implements as `UserSession`:
 
 ```rust
 pub trait SmtpSession {
-    // One callback per decision point, each returning a Control:
     fn helo(&mut self, ehlo: bool, arg: &str) -> Control;
     fn mail_from(&mut self, path: &str) -> Control;
     fn rcpt_to(&mut self, path: &str) -> Control;
@@ -81,561 +86,465 @@ pub trait SmtpSession {
     fn starttls(&mut self) -> Control;
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> Control;
     fn auth_line(&mut self, line: &[u8]) -> Control;
-    ...
+    // … plus the greeting, data_line_too_long, shutdown_signal
 }
 ```
 
-The currency across the seam is the **verdict**, and it binds:
+The verdict binds the state machine:
 
-- `Control::Accept` — the command succeeds; the state machine advances
-  where the protocol allows (HELO → Ready, DATA → Data).
-- `Control::Reject` / `Tempfail` — refused (5xx/4xx); **the state does not
-  advance**. A client that ignores a `550` HELO rejection still cannot
-  reach MAIL (this is enforced and tested, not assumed).
-- `Control::Upgrade` — STARTTLS: the loop writes the `220`, returns
-  `EndReason::TlsHandshake`, and the driver performs the handshake and
-  resumes `run()` over the TLS stream.
-- `Control::Challenge` — AUTH continuation: the machine enters
-  `SmtpState::Auth(return_to)` and feeds lines to `auth_line` until a
-  final verdict (or the client's `*` abort).
+- `Accept`: the command succeeds, and the state advances where the protocol
+  allows (HELO → Ready, DATA → Data).
+- `Reject` / `Tempfail` (5xx/4xx): **the state does not advance**. A client
+  that ignores a `550` to HELO still can't reach MAIL.
+- `Upgrade`: STARTTLS. The loop writes the `220` and returns
+  `EndReason::TlsHandshake`; the driver does the handshake and resumes the
+  loop over TLS.
+- `Challenge`: an AUTH continuation. The machine enters
+  `SmtpState::Auth(return_to)` and feeds lines to `auth_line` until a final
+  verdict, or until the client sends `*`.
 
-Why this shape works: across three rewrites of everything above the seam
-(SPF policy rewritten twice, DKIM added, STARTTLS + AUTH added), the seam
-itself barely moved — the migration to verdict-based control was
-mechanical. It also makes the protocol layer testable without any policy:
-a 40-line `TestSession` drives the full state machine in-process.
-
-The state is carried in `SessionState` (state + `greeted` flag), owned by
-the **connection driver** (`mailserv::handle_connection`) rather than
-`run()`, so it survives the STARTTLS pause. `run` is generic over
-`AsyncRead + AsyncWrite + Unpin + Send`, which is what allows the same
-loop to serve `TcpStream`, a TLS stream, and in-memory duplexes in tests.
+`SessionState` (the state plus a `greeted` flag) is owned by the connection
+driver, so it survives the STARTTLS pause. `run()` is generic over the
+stream, so the same loop serves TCP, TLS and in-memory test duplexes. A
+small `TestSession` drives the whole state machine with no policy at all.
 
 ---
 
-## 4. The connection lifecycle
+## 4. Connection lifecycle
 
 ```
-accept → handle_connection:
-    UserSession::new(policy state)                    ← policy config
-    run(BufReader<TcpStream>, SessionState)           ← plaintext loop
-      │ QUIT/EOF/timeout  → end
-      │ Control::Upgrade  → TLS handshake (rustls, 10 s cap)
-      │                     session.tls_established()   ← discard pre-TLS state
-      │                     state = Idle, no re-banner  ← RFC 3207 §4.2
-      └─── run(BufReader<TlsStream>, SessionState)      ← secure loop
-    log session summary (envelope verdicts; never bodies)
+accept loop
+  canonical_peer(): ::ffff:a.b.c.d → a.b.c.d
+  limits: server-wide semaphore, per-IP concurrency, per-IP rate (60 s window)
+    over a limit → 421, sent from a bounded pool of 32 refusal tasks
+  spawn: timeout_at(max-conn-duration) {
+    handle_connection:
+      run(plaintext)
+        Upgrade → TLS handshake (rustls, 10 s cap)
+                  buffered plaintext after STARTTLS is dropped
+                  session.tls_established(): pre-TLS state discarded,
+                  authenticated identity cleared, state = Idle, no new banner
+        run(TLS)
+      log the session summary (never the body)
+  }
+  release limits
 ```
 
-Session policy state (`UserSession`): HELO identity + its SPF verdict,
-envelope sender + SPF verdict, recipients, accumulated raw body, DKIM
-results, DMARC verdict, authenticated identity, TLS state.
+**Graceful shutdown** (SIGTERM or SIGINT):
+- the listener closes, so new connections are refused;
+- sessions are signalled through `shutdown_signal`. The read loop acts on
+  it only between transactions: idle sessions get `421 4.3.2`, and a session
+  in DATA or AUTH finishes first;
+- the process exits when every session has ended, after
+  `shutdown-grace-ms`, or on a second signal.
 
 ### 4.1 Framing
 
-- Command lines capped at **512 octets** (RFC 5321 §4.5.3.1.4), data
-  lines at **64 KiB** (deliberately above the RFC's 1000-octet
-  interop guidance; the cap is a per-implementation constant). Over-long
-  lines get `500`/`552`, are drained (under the read timeout), and the
-  session continues — a data-mode overflow aborts into a `Discard` state
-  that swallows until the terminator. That terminator ends the failed
-  transaction: the protocol layer calls `reset()`, so the envelope and any
-  buffered data are cleared (RFC 5321 §4.1.1.4) and the next MAIL works.
-  The policy is told about an over-long line through `data_line_too_long`,
-  so the dropped message is logged.
-- DATA: the terminator is **exactly `<CRLF>.<CRLF>`**. In `Data` and
-  `Discard` states every line is message data — `RSET`, `QUIT`, and all
-  other verbs are content, never commands (the SMTP-smuggling class,
-  CVE-2023-51764/51765/51766). A bare-LF `.` is an empty data line,
-  never a terminator, and a `.<CRLF>` line only terminates when the line
-  before it also ended with CRLF: after a bare-LF line, `.<CRLF>` is
-  message data (the `<LF>.<CRLF>` smuggling variant). The read loop
-  tracks this and hands such a line to the handler dot-stuffed, so
-  unstuffing delivers it as a literal `.`. Bare LF remains legal
-  message data (byte fidelity). Dot-unstuffing (RFC 5321 §4.5.2) happens in the
-  protocol layer before the policy sees a line. `recv_data` receives the
-  *unstuffed* line with its original line ending, as raw bytes (8-bit
-  safe — invalid UTF-8 in DATA never drops the session).
-- `RSET` clears the envelope but keeps the session greeted (the next
-  `MAIL` needs no new EHLO, RFC 5321 §4.1.1.5). Unknown verbs are
-  refused with `500` and the state is preserved. `RSET`/`QUIT` are only
-  verbs outside DATA.
-
-### 4.2 The end-of-data pipeline
-
-```
-"." → end_data():
-    1. dkim::verify_dkim(raw bytes)          → per-signature verdicts
-    2. dmarc::fetch_policy + evaluate        → alignment + policy action
-    3. spool (if configured)                 → durable write, queue ID
-    4. clear envelope; message_count += 1
-    5. return Control (Accept, Reject on DMARC p=reject, or
-       Tempfail if the spool write failed or the DNS deadline ran out)
-```
-
-Steps 1 and 2 share **one DNS deadline**, `END_OF_DATA_DNS_DEADLINE`
-(20 s, the same as SPF's), covering every DKIM key lookup and the DMARC
-policy fetch. Running out ends the transaction with `451 4.4.3`, a
-temporary failure and never a rejection, since skipping the checks would
-fail DMARC on legitimate mail. It is logged at `warn` with the stage
-(`dkim` or `dmarc`). Without it, five signatures (`dkim::MAX_SIGNATURES`)
-each waiting the 5 s per-query timeout, plus the DMARC fetch, could
-outlast the connection cap and drop the session with no reply (D3 in
-DEPLOYMENT.md).
-
-Ordering matters: DKIM runs first (DMARC consumes its results), and the
-spool write happens on the acceptance path only — the `250` is sent
-after a durable write, so accepted mail is never silently dropped (a
-failed write is a `451` retryable tempfail). Rejected mail (DMARC
-`p=reject`) is never spooled. The envelope is cleared before the verdict
-is returned (a rejected transaction is still over — the state machine
-enforces MAIL-before-RCPT again next time).
+- **Line caps.** Command lines are capped at 512 octets and data lines at
+  64 KiB.
+  - An over-long command gets `500` and is drained, and the session
+    continues.
+  - An over-long data line gets `552` and the session enters `Discard`,
+    which swallows everything up to the terminator. The terminator then
+    resets the transaction.
+- **The DATA terminator is exactly `<CRLF>.<CRLF>`.** In `Data`/`Discard`,
+  every line is message data: `RSET`, `QUIT` and all other verbs are
+  content (the SMTP-smuggling class, CVE-2023-51764/51765/51766).
+  - A bare-LF `.` is data.
+  - `.<CRLF>` after a bare-LF line is data too (the `<LF>.<CRLF>` variant).
+    The read loop tracks the previous line ending to catch it.
+- **Dot-unstuffing** (RFC 5321 §4.5.2) happens in the protocol layer.
+  `recv_data` gets raw, unstuffed bytes with their original line ending; it
+  is 8-bit safe.
+- **`RSET`** clears the envelope but keeps the session greeted. Unknown verbs
+  get `500`, and the state is kept.
 
 ---
 
-## 5. Security model
+## 5. The message pipeline
 
-**Sender authentication stack** (evaluated per message at end-of-data):
+| Step | Policy (`UserSession`) |
+|---|---|
+| **HELO/EHLO** | The argument must be a domain (letters, digits, `-`, `_`; 1–63-octet labels, ≤ 255 total) or an address literal, else `501 5.5.2`, refused *before* it is recorded. That's because it's copied into `Received:` (it once allowed bare-CR header injection). SPF is evaluated for the HELO identity under a per-IP DNS permit: Fail → `550`, anything else is just recorded. The EHLO reply advertises `SIZE`, `STARTTLS` (plaintext only) and `AUTH` (TLS only, and only when configured). |
+| **MAIL FROM** | The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
+| **RCPT TO** | MAIL must come first, and at most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. |
+| **DATA** | Needs a sender and at least one recipient. Bytes are counted against the transaction's limit; going over it gets `552` and `Discard`. |
+| **End of data** | See below. |
 
-| Check | What it proves | Fail result |
+**End of data**, in order:
+
+```
+1. bare CR in the header block?      → 550 5.6.0   (no DNS work spent)
+2. take a per-IP DNS permit          → 451 4.7.0 if none frees within 10 s
+   ── one 20 s deadline (END_OF_DATA_DNS_DEADLINE) covers 3 and 6 ──
+3. DKIM verify (raw view)            → per-signature verdicts
+4. exactly one From:, one domain     → 550 5.7.1 otherwise
+5. authenticated? every From author granted (§10) → 550 5.7.1 otherwise
+6. DMARC: discover policy, evaluate  → p=reject fail: 550 5.7.1
+                                       lookup error:  451 4.4.3
+   deadline exceeded at 3 or 6       → 451 4.4.3
+7. release the DNS permit
+8. spool (durable write)             → 451 4.3.0 if it fails
+9. fast-path delivery to each recipient (failures stay queued)
+10. clear the envelope; reply 250
+```
+
+How the ordering is constrained:
+
+- DKIM runs before DMARC, which consumes its results. DMARC uses **only this
+  message's** DKIM results, so a verified signature from an earlier message
+  on the connection can't help a later spoof.
+- Rejected mail is never spooled.
+- The `250` is sent only after the durable write, so accepted mail is never
+  silently dropped.
+- Every exit clears the envelope, so the next transaction starts with MAIL
+  again.
+
+---
+
+## 6. Sender authentication
+
+### 6.1 SPF (`spf`)
+
+- **Parser.** It works term by term (RFC 7208 §4.6.1).
+  - Mechanism and modifier names are case-insensitive.
+  - Any unknown or malformed term makes the record **PermError**: nothing is
+    ever silently skipped.
+  - `a`/`mx` take a dual-CIDR suffix (`a/24`, `mx//64`).
+  - `redirect=` and `exp=` may each appear at most once.
+  - A TXT string counts as a record only if it starts `v=spf1`
+    (case-insensitive) followed by a space or the end; `v=spf10` doesn't
+    count.
+- **Evaluation.** All mechanisms are supported.
+  - The RFC 7208 §4.6.4 budget applies: 10 DNS-querying terms and 2 void
+    lookups, shared across `include`/`redirect`.
+  - Macros are expanded per RFC 7208 §7.
+  - A whole evaluation has a 20 s deadline (`EVALUATION_DEADLINE`).
+  - DNS goes through the `SpfResolver` trait (TXT, A, MX, PTR). Production
+    uses the shared DoT client; tests use fixture mocks.
+- **Results.** Fail and PermError reject at MAIL. TempError → `451`. Pass,
+  Neutral, SoftFail and None are accepted and recorded for DMARC.
+
+### 6.2 DKIM (`dkim`)
+
+- **Input.** DKIM reads only the **raw** message view
+  (`mailparse::parse_raw_message`), so untrusted bytes never reach the pest
+  grammar (§11). Non-UTF-8 headers still verify.
+- **Limits.**
+  - At most 5 signatures (the topmost) are evaluated per message.
+  - A signature may list at most 256 `h=` entries.
+  - Header selection indexes headers by name once, so it is linear
+    (RFC 6376 §5.4.2 bottom-up, each instance used once).
+- **A signature counts only if all of these hold:**
+  - it signs `From` (RFC 6376 §6.1.1);
+  - its RSA key is ≥ 1024 bits (RFC 8301; the `rsa` crate caps keys at
+    4096 bits);
+  - any `l=` equals the canonical body length, so appended content can't
+    verify;
+  - it hasn't expired (`x=`);
+  - its `i=` matches `d=`;
+  - the key permits email.
+- **Algorithms:** rsa-sha256 and ed25519-sha256. SHA-1 is refused.
+
+### 6.3 DMARC (`dmarc`)
+
+- **From domain.** It comes from a tolerant byte scan of the raw headers,
+  which reads the value as an RFC 5322 mailbox-list.
+  - Comments and quoted strings never supply the domain.
+  - Folding and the obsolete `From :` spelling are understood.
+  - Zero, several, multi-domain or unparseable `From:` headers → `550 5.7.1`
+    (RFC 7489 §6.6.1).
+- **Policy discovery** (`policy_candidates`, `fetch_policy`): query
+  `_dmarc.` at the From domain, then at each parent down to two labels,
+  making at most 8 queries; stop at the first record.
+  - This finds `victim.co.uk` for `x.victim.co.uk` without a Public Suffix
+    List.
+  - A long name skips straight to its 7-label suffix (the DMARCbis
+    tree-walk bound).
+  - The result, `FoundPolicy`, records where the record was found, so `sp=`
+    applies to inherited policies.
+- **Fails closed.** Any lookup error is `DmarcError::Temp` → `451 4.4.3`:
+  skipping a name could skip the policy that applies. Several records at one
+  name means DMARC isn't applied (RFC 7489 §6.6.3), logged at `warn`.
+- **Alignment.** Strict (`adkim`/`aspf=s`) is an exact match. Relaxed is a
+  **suffix test**, which is safe but rejects sibling subdomains (§13).
+- **Policy.** A `reject` failure → `550`. `quarantine` and `none` are
+  delivered. `pct` is treated as 100. Authenticated senders are exempt from
+  rejection, but only after the grant check (§10).
+
+---
+
+## 7. Recipient authority
+
+The `RecipientResolver` trait is consulted at RCPT, on the blocking pool
+with a 5 s timeout. It answers `NotHosted` (`550 5.7.1`),
+`Accept(Recipient)`, or `Refuse { mode, reason }` (`550 5.1.1`, the same
+reply for every reason, so addresses can't be enumerated from the reply
+text). If the authority can't answer: `451`.
+
+A `Recipient` carries:
+- the routing **mailbox** (the address itself, or the catch-all inbox);
+- the owning user;
+- `public_key` and `key_generation`, reserved for encryption;
+- the domain's `max-message-bytes`.
+
+All of this travels with the message in the spool metadata (`SpoolRcpt`).
+
+- **`FileAuthority`** is the production implementation: a strict JSON
+  schema (unknown fields rejected), hot-reloaded when the file's mtime or
+  size changes.
+  - A bad publish keeps the last good snapshot in force and logs at `error`.
+    The failed version is remembered, so it isn't re-parsed on every RCPT.
+  - Domain modes:
+    - `reject`: listed, unexpired mailboxes only;
+    - `catch-all`: unknown addresses go to a designated inbox;
+    - `grace`: an expired address accepts for N ≤ 366 days.
+- **`StaticAuthority`** is the development fallback: every local-part at a
+  `--local-domains` domain is accepted and routed to itself.
+- **Caching.** Each session caches **successful** lookups only, so every
+  refusal reaches the authority. That keeps the console's refusal stream
+  complete.
+
+---
+
+## 8. Storage and delivery
+
+**Spool** (`DiskSpool`, `--spool-dir`):
+- **Layout.** Maildir-style `tmp/` → `new/`. The payload is written and
+  fsynced first, the `.json` metadata last: its presence in `new/` is the
+  commit point.
+- **Queue IDs** are `<hex seconds>.<uuid>`: sortable and globally unique.
+- **Metadata** holds the envelope, peer, HELO, verdicts, TLS state, the
+  authenticated identity and the resolved recipients.
+- **Not yet wired:** `SpoolWriter` (`write`, `remove`) is the write seam,
+  and a `PayloadEncryptor` hook exists on it, but production configures no
+  encryptor (§13).
+
+**Delivery** (`DeliverySink`, `MaildirSink`, `--maildir-dir`):
+- **Path.** One maildir per routing mailbox: `{root}/{domain}/{local}/new`.
+  The sink re-validates each path component, as defence in depth against
+  path traversal.
+- **Idempotent** per (mailbox, queue ID): the target file name is derived
+  from both, so the fast path and the drain can race safely.
+- **Trace headers.** Each copy gets `Return-Path:` and a `Received:` (HELO,
+  peer, `by` host, ESMTP/ESMTPS, queue ID, `for <this recipient>` only).
+  Non-printable bytes in a stored HELO are replaced with `?`.
+- **Fast path.** Delivery is attempted inside end-of-data, before the
+  `250`. A failure is logged, and the message stays queued.
+
+**Queue drain** (startup, then every 60 s, on the blocking pool;
+`delivery::drain_at`):
+- **Retry schedule.** A message that isn't due yet is skipped without
+  reading its payload. "Due" means a backoff of 1 min, doubling to 1 h,
+  since its last failure.
+- **Attempt record.** Each due message is attempted for every recipient. A
+  failure is recorded in `{id}.attempts` as
+  `count first_failure last_failure`; the old count-only format still
+  loads.
+- **Dead-lettering.** A message still failing `MAX_QUEUE_LIFETIME` (5 days)
+  after its first failure moves to `spool/dead-letter/` with all its files,
+  logged at `error`. Requeuing it is a file move (DEPLOYMENT.md H2).
+- **Visibility.** A `drain pass` log line with a `queued` count is emitted
+  while the queue isn't empty.
+
+**File modes.** Files are `0600` and directories `0700`, set explicitly,
+with `umask 077` as a backstop. Existing directories that are open to other
+users produce a startup warning.
+
+---
+
+## 9. DNS layer (`dns`)
+
+- **Codec.** Parsing is **total**: every index is bounds-checked, rdata is
+  bounded by `rdlength`, and compression pointers are range-checked and
+  depth-limited. This is tested by every truncation length and about 5,800
+  bit-flips of a real response.
+  - Responses are validated: ID, QR flag, question echo, and EDNS0 (one OPT
+    record, root owner, version 0).
+  - Queries advertise a 1232-byte EDNS0 payload.
+  - Query names over the label/length limits are refused before sending,
+    and treated as non-existent by SPF.
+- **Transport.** DNS-over-TLS only; UDP was removed. The resolver's
+  certificate is verified against the `--resolver` IP using the web PKI
+  roots, plus any `--resolver-ca` certificates, which are added rather than
+  substituted. There's one upstream, IPv4 only.
+- **Pipelining.** `--dns-connections` connections (default 2), each with up
+  to 64 queries in flight.
+  - Replies are matched by transaction ID, and IDs are never reused while in
+    flight.
+  - A timed-out query releases its slot without harming the connection.
+  - A connection failure fails every waiter, and each retries once on a
+    fresh connection.
+  - Every per-query resource is released by a drop guard, so cancellation
+    leaks nothing.
+- **Cache.** TTL-based, holding up to 4,096 entries. Positive answers use
+  the minimum answer TTL; NXDOMAIN and NODATA use the SOA negative TTL. Both
+  are clamped to 1 h, and SERVFAIL is never cached.
+- **Per-source-IP limit** (`DnsLimiter`, `--max-dns-per-ip`, default 4).
+  - A session holds one of its IP's permits around each DNS-backed check:
+    the HELO SPF check, the MAIL FROM SPF check, and end-of-data DKIM +
+    DMARC.
+  - If no permit frees within 10 s, the result is temporary, never a
+    permanent reject: HELO records TempError; MAIL FROM and end-of-data get
+    `451 4.7.0`.
+- **Metrics.** A `dns stats` log line is emitted every 60 s while DNS is in
+  use: queries, cache hits, connects, failures, timeouts, late replies,
+  waits, in-flight peaks and per-IP limiter counts.
+
+---
+
+## 10. AUTH and sender grants (not part of V1)
+
+- **Mechanisms.** AUTH PLAIN and LOGIN (RFC 4954/4616), with challenge
+  continuation and `*` to abort. AUTH is advertised and accepted **only over
+  TLS** (`538` on plaintext; RFC 8310).
+- **Credentials.** `--auth-users` is a plaintext `user:password` map.
+- **Grants.** `--auth-senders` (`auth.rs`, `SenderGrants`) maps each login to
+  exact addresses and `@domain` grants.
+  - An authenticated `MAIL FROM` must be granted, or the reply is `553
+    5.7.1`; the null sender is always refused.
+  - Every `From:` author must be granted, or the reply is `550 5.7.1`.
+  - Matching is case-insensitive. A quoted local-part matches only a
+    whole-domain grant.
+  - A login without grants can authenticate but can't send. A grant for a
+    login not in `--auth-users` is a startup error.
+- **Exemptions.** Authenticated sessions skip SPF and are exempt from DMARC
+  rejection. Both apply only after the grant checks pass, so being
+  authenticated never means "may use any From".
+- **Relay stays closed** even for authenticated sessions.
+
+AUTH is unsuitable for internet-facing use (§13): passwords are plaintext,
+failed attempts aren't limited, comparison isn't constant-time, and AUTH is
+advertised on any TLS listener, including port 25.
+
+---
+
+## 11. Header parsing (`mailparse`)
+
+There are two views of a message:
+
+- **Raw:** `parse_raw_message` returns a `RawMessage { headers, body }`. It
+  keeps every header in order, duplicates included, byte-exact with folding.
+  It is built by an iterative byte scan, accepts non-UTF-8, and can't fail on
+  header syntax.
+- **Typed:** `parse_message` returns `ParsedMessage::typed` (`MailHeaders`),
+  produced by a pest grammar: addresses, dates, MIME parameters, trace
+  entries. Malformed headers degrade to `optional_field`. Because the
+  grammar's `comment` rule is recursive, `parse_headers` first runs a
+  conservative pre-scan and refuses more than 64 levels of nesting
+  (`TooDeeplyNested`). A stack overflow aborts the process; it isn't a
+  panic, so nothing could catch it.
+
+**Invariant:** untrusted mail is parsed only through the raw view. In the
+server, DKIM takes `&RawMessage`, and the From-domain and bare-CR scans
+work on bytes. Nothing in the server calls the typed parser. The depth
+bound only protects library callers that use it.
+
+---
+
+## 12. Configuration, operations and testing
+
+- **Configuration.** Values come from CLI flags, then the `--config` TOML
+  file (kebab-case keys), then defaults. A pure, unit-tested
+  `resolve_config` handles this.
+  - Defaults are production defaults: port 25, `/var/lib/mailserv`, 10 MiB
+    messages, a 5-minute connection cap, 100 connections.
+  - Only `--domain` is required.
+- **Privileges.** Started as root, mailserv:
+  1. binds the port;
+  2. reads the TLS key and resolver CA;
+  3. creates missing storage directories owned by `--user`;
+  4. drops supplementary groups, gid and uid, and verifies that root can't
+     be regained;
+  5. only then opens the authority, spool and maildirs, and accepts
+     connections.
+
+  Root without `--user` is refused.
+- **Logging.** bunyan JSON on stdout, filtered by `RUST_LOG` (default
+  `info`). Bodies are never logged, and the per-line `recv_data` span is at
+  `trace`. The accept loop survives transient errors (log and back off), and
+  every connection task's outcome is logged.
+- **Testing.** 261 tests in four layers:
+  1. **unit**, per crate;
+  2. **protocol**, driving the state machine through `handler`;
+  3. **framing**, running `run()` over in-memory duplexes;
+  4. **integration**, with a real rustls client against the real driver
+     over loopback.
+
+  Conformance anchors are external, never circular: DKIM hashes come from
+  openssl or the RFC's own examples, SPF fixtures from recorded real
+  records, and DNS hostile-input tests mutate a real response. Every
+  security finding has a regression test named after it.
+
+  The DMARC tests use a local mock DoT resolver. Two things touch the
+  network:
+  - the `mailserv` integration tests use the real resolver (1.1.1.1);
+  - one `#[ignore]`d test fetches a live DKIM key.
+
+---
+
+## 13. Gap assessment
+
+Current design gaps, by area. Impact assumes the V1 receive-only pilot.
+IDs refer to PLAN.md, SECURITY-AUDIT.md (F-, L-) or REPORT.md (M-, N-).
+
+### Abuse resistance
+
+| Gap | Impact | Ref |
 |---|---|---|
-| SPF (MAIL FROM identity; HELO for the null sender) | the connecting IP is authorized by the *sender's* policy | envelope-level: `550`/`451` at MAIL time |
-| DKIM | the message (signed headers + body) is unchanged since a holder of the domain's key signed it (at most 5 signatures, the topmost, are evaluated per message). A signature counts only if it signs `From`, its RSA key is at least 1024 bits (RFC 8301), and any `l=` covers the whole body | logged per signature; feeds DMARC |
-| DMARC (From-header domain) | at least one aligned pass exists; else apply `p=` (or `sp=` when the record was inherited from a parent domain). The policy is found by a bounded walk: the From domain, then each ancestor down to two labels, at most 8 queries (`dmarc::policy_candidates`), so a multi-label public suffix (`co.uk`) can't hide the organisational domain's record | `550 5.7.1` at end-of-data for `p=reject`; `451 4.4.3` when the lookup fails (fail closed, never "no policy") |
-| From header (RFC 7489 §6.6.1) | exactly one `From` header naming one author domain, read as an RFC 5322 mailbox-list from the raw bytes (comments and quoted strings never supply the domain; folding and the obsolete `From :` spelling are understood) | `550 5.7.1` when missing, duplicated, multi-domain, or unparseable |
-| Header block hygiene | no CR outside a CRLF in the header block, so every reader agrees where each header begins (a bare CR used to hide a second `From:` from the DMARC scan) | `550 5.6.0` at end-of-data, before any DNS work |
-| Alignment | SPF/DKIM identity matches the **From** header domain (relaxed/strict per record) | — |
+| No storage quotas (per message, mailbox or domain) and no free-disk tempfail | A sender can fill the disk. Contained only by a dedicated filesystem and alerts | N10 / F8 |
+| No session-wide limit on refused RCPTs (`RSET` resets the 100 cap) | Unlimited probing for which addresses exist; a privacy problem for disposable addresses | F9 |
+| Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | L4 |
+| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | M12 |
 
-**Transport & access:**
+### Correctness and delivery
 
-- **STARTTLS** (RFC 3207): rustls; pre-TLS state discarded at upgrade;
-  repeated STARTTLS → `503`; never advertised on a TLS connection.
-- **AUTH** (RFC 4954, RFC 8310): PLAIN/LOGIN, **TLS-only** (`538` on
-  plaintext, advertised only over TLS), credentials via `--auth-users`.
-  Authenticated senders (MSA semantics): SPF skipped, DMARC rejection
-  exempt (they passed local authentication), relay still closed.
-  *Known limitation:* credentials are stored in plaintext (CLI/config
-  file) — an interim design, to be replaced by hashed storage or an
-  external auth backend before production submission use (PLAN.md,
-  Phase 8).
-  **Sender authorization (`From:` validation, `mailserv/src/auth.rs`).**
-  AUTH proves *who* the client is. *What* that identity may claim is a
-  separate policy decision, made in the policy layer: each login maps to
-  exact addresses and whole domains (`--auth-senders`). An authenticated
-  session's `MAIL FROM` must be granted (`553 5.7.1`; the null sender is
-  always refused), and so must every `From:` author, read with the same
-  tolerant raw scan DMARC uses (`550 5.7.1` at end-of-data). Both checks
-  run before the SPF skip and the DMARC exemption can apply, so those
-  exemptions only cover senders the login owns. It fails closed: a login
-  with no grants can authenticate but can't send, and a grant for an
-  unknown login is a startup error.
-  **Still required before AUTH faces the internet:** hashed credential
-  storage (above), failed-attempt limiting and constant-time comparison
-  (M16), and offering AUTH on a submission listener only, never on port
-  25. A receive-only V1 has no sending use for AUTH, so leave
-  `--auth-users` unset there.
+| Gap | Impact | Ref |
+|---|---|---|
+| The connection cap can fire between the spool commit and the `250`; the fast path runs before the reply | The client retries, and the message is delivered twice | F6 / M11 |
+| Catch-all recipients in one transaction share a mailbox and queue ID | They collapse into one file recording one envelope address | M9 |
+| No fsync of the maildir directory after the rename | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued) | M14 |
+| SPF budget charges MX-host and PTR-name address lookups against the 10-term limit | Large legitimate records can hit PermError → `550` | M2 |
+| Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | M5 |
+| No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | N16 |
+| SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | H1 note |
+| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | M10 |
+| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | M17 |
+| `quarantine` is delivered as normal mail | Out of V1 scope by decision | M6 |
 
-  **Credential storage decision (interim: file; later: auth backend).**
-  A file is an accepted V1 choice: for a small receive-only server it has
-  no network dependency, no new attack surface, and no failure mode that
-  can block inbound delivery — properties an external backend must earn.
-  The file is only acceptable if it is treated as a *secrets file*, not a
-  command-line argument:
+### What users are shown
 
-  - **Split secrets from policy.** The same spec currently carries both the
-    AUTH credentials (`user -> password`) and the sender grants
-    (`user -> addresses/domains`). These have different owners and
-    rotation cadences: credentials are secrets (hash with argon2id, never
-    log, never pass in argv/`ps`); grants are authorization policy (change
-    when users are added/removed, and must be reloadable without a
-    restart). Store them in separate files (or separate sections with
-    separate handling) and give each its own owner.
-  - **Hash at rest.** Even the interim file stores argon2id hashes, not
-    plaintext passwords, so a leaked file is not a password dump.
-  - **File hygiene.** `0600`, owned by the `mailserv` user; refuse to start
-    if the file is group/world-readable; never accept credentials via CLI
-    arguments (they land in shell history and `ps`).
-  - **Reload without restart.** A revoked grant or user must stop working
-    at the next SIGHUP, not at the next process restart. Today only the
-    authority is hot-reloaded; auth config is not.
-  - **Two seams, not one.** The backend integration is only credible if
-    the file impl is already behind interfaces: a `CredentialVerifier`
-    (`verify(user, pass) -> Identity`) and a `SenderAuthorizer`
-    (`permits(identity, local, domain) -> bool`). The file impl is one
-    implementation of each; a future LDAP/DB backend replaces the
-    verifier, while sender authorization normally stays in the app
-    because "which Froms may this identity claim" is application policy,
-    not directory data.
+| Gap | Impact | Ref |
+|---|---|---|
+| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | M7 |
+| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | N9 |
 
-  **Constraints for the future backend.** Fail closed for AUTH only — a
-  backend outage must not block inbound MX delivery. Cache credentials with
-  a TTL (no per-message network lookup), revoke without restart, and bound
-  every call with a timeout plus a circuit breaker so a slow auth backend
-  is not a submission-path DoS. Do not build the backend until submission
-  is an actual product: a receive-only V1 with AUTH disabled has no use for
-  it.
-- **Recipient policy**: owned by the **recipient authority** (Phase 12
-  gap 1, now a seam): at RCPT time a `RecipientResolver` decides
-  hosted-domain membership, per-domain policy (`reject` / `catch-all` /
-  `grace`), and the address→mailbox routing — with user and public key
-  attached for later encryption. V1 ships a JSON `FileAuthority`
-  (hot-reloaded; the console's publishing contract) and a
-  `StaticAuthority` fallback for `--local-domains`. Failure is
-  fail-closed (`451`); a malformed authority publish keeps the last good
-  policy in force and is logged at `error`; refusals are logged as structured events with
-  one uniform SMTP reply (no address enumeration). Plus the
-  100-recipient cap and MAIL-before-RCPT sequence enforcement. Envelope
-  paths are parsed as `<path> [ESMTP-parameters]` (RFC 5321 §4.1.2);
-  `SIZE=` over the advertised limit is refused with `552` at MAIL time,
-  and paths containing control characters are refused. Recipient
-  local-parts must be RFC 5321 dot-atom text without `/` (they name
-  maildir directories); others get `553 5.1.3`.
-- **HELO identity**: the HELO/EHLO argument must be a domain (letters,
-  digits, `-`, `_`; labels of 1–63 octets; at most 255) or an address
-  literal, else `501 5.5.2`. It is refused before it is recorded, because
-  it is copied into the delivered `Received:` header (M8: a bare CR once
-  injected a header). The delivery path also replaces any non-printable
-  byte in a stored HELO with `?` as a second line of defence.
-- **Peer address**: IPv4-mapped IPv6 peers (`::ffff:a.b.c.d`, from a
-  dual-stack `[::]` listener) are converted to plain IPv4 at accept, so
-  SPF, per-IP limits, logs and trace headers all see the real IPv4
-  address (N19).
-- **Framing DoS**: line caps, per-message size accounting, accept-loop
-  backoff.
-- **Header-parse DoS**: DKIM reads headers through the iterative raw
-  view only, and the typed grammar refuses comment nesting past 64 levels
-  (§7, S1). DKIM header selection indexes headers by name once, so it is
-  linear, and a signature's `h=` list is capped at 256 entries
-  (`dkim::MAX_SIGNED_HEADERS`, S2).
-- **Message size**: the server-wide `max-data-bytes` (default 10 MiB),
-  lowered per hosted domain by `max-message-bytes` in the authority file.
-  A transaction carries one limit: a recipient whose domain limit differs
-  from those already accepted gets `452 4.5.3` (deliver separately, RFC
-  5321 §4.5.3.1.10), so one tenant's limit never refuses another's mail. A
-  declared `SIZE=` is checked at MAIL (server limit) and RCPT (domain
-  limit); data over the limit gets `552`. Every refusal is logged as
-  `message refused: size limit` (stage, size, limit, recipient domains).
-- **Privileges**: started as root, mailserv binds the port, reads the TLS
-  key and resolver CA, creates missing storage directories owned by
-  `--user`, then drops supplementary groups, gid and uid and verifies that
-  root can't be regained (`privdrop.rs`), all before opening the
-  authority, the spool or the maildirs, and before any connection. Root
-  without `--user` is refused; an unprivileged start (systemd with
-  `CAP_NET_BIND_SERVICE`, or port 2525 for testing) needs no switch.
-- **Storage permissions**: files `0600`, directories `0700`, set explicitly
-  (`fsutil.rs`) whatever the umask, plus `umask 077` at startup. Existing
-  directories that other users can access get a startup warning.
-- **DNS DoS**: pipelined resolver connections, a 20 s SPF evaluation
-  deadline, and a per-source-IP limit on concurrent DNS-backed checks
-  (`--max-dns-per-ip`, which tempfails with `451` when exhausted); see
-  §6.1.
+### Storage and encryption seams
 
-**Known, deliberate exemptions** (documented policy choices, not bugs):
-authenticated submissions skip SPF/DMARC rejection; `p=none` DMARC logs
-but passes; `pct=` is treated as 100. The authenticated-sender exemption
-applies only after sender authorization (see AUTH above): an authenticated
-session can only use the `MAIL FROM`/`From:` addresses granted to its
-login.
+| Gap | Impact | Ref |
+|---|---|---|
+| The queue's read side is concrete: the drain takes `&DiskSpool` (list, load, record attempt, remove, dead-letter) | A second spool backend (S3) needs a `SpoolQueue` trait first | PLAN §2.2 |
+| `PayloadEncryptor` has no recipient parameter and isn't configured. If it were, the drain would prepend plaintext trace headers to ciphertext | Per-user encryption needs the seal/trace-header ordering fixed first | PLAN §2.2 |
+| The fast path writes plaintext to the maildir | It bypasses any encryption boundary | M14, PLAN §2.2 |
+| Final storage is local maildir only | Blocks multiple MX hosts sharing mailboxes | PLAN §4 |
 
----
+### Operations
 
-## 6. DNS layer
+| Gap | Impact | Ref |
+|---|---|---|
+| One listener (`--host`), one identity (`--domain`), one certificate; no SNI selection; no TLS hot reload | A restart is needed to change certificates; there are no per-domain MX identities | L10, PLAN §4 |
+| One IPv4 resolver; no back-off when it's down; concurrent misses aren't shared | A resolver outage defers all mail (safe, but nothing is received) | PLAN §5 |
+| Metrics are log lines only (`dns stats`, `drain pass`) | Monitoring has to parse logs | PLAN §5 |
+| No DNSSEC validation in mailserv | It relies on the resolver; use a validating local resolver | L3 |
 
-`dns` is a hostile-input-hardened wire codec plus two transports (DoT
-preferred, TCP; the unauthenticated single-datagram UDP path was retired
-— it could not be made production-safe). Queries advertise a 1232-byte
-EDNS0 payload (flag day 2020), and responses are validated for EDNS0
-conformance on every transport (one OPT, root owner name, version 0).
-**Query names are checked before sending** (`proto::check_name`,
-`normalize_name`): an empty label, a label over 63 octets, or a name over
-253 octets is refused with `InvalidName` (`dns::is_invalid_name`) before
-any capacity is taken or a connection is opened, and the wire encoder
-refuses them too. Such names are attacker-reachable through SPF records
-and DKIM `d=`/`s=` tags; the encoder used to write them anyway, and
-public resolvers silently drop the malformed query, so each one cost the
-full timeout. SPF treats an invalid name as a name that doesn't exist
-(RFC 7208 §4.3); DKIM reports the key lookup as failed straight away.
-Names are normalized once (whitespace and one trailing dot removed), so
-the cache key and the name sent are the same.
+### AUTH (not part of V1)
 
-Response parsing is **total**: every index and
-slice is bounds-checked; rdata is bounded by the record's own `rdlength`;
-compression pointers are range-checked and depth-limited. The property is
-tested systematically (every truncation length + ~5,800 bit-flips of a
-real response must parse to Ok/Err, never panic).
+| Gap | Impact | Ref |
+|---|---|---|
+| Plaintext credentials, no attempt limit, non-constant-time comparison, stale LOGIN state after `*`, AUTH advertised on port 25 | Unsafe to enable on an internet-facing listener | M16 / F10, PLAN §2.3 and §5 |
 
-SPF evaluation goes through the `SpfResolver` **trait** (`txt`, `a`, `mx`,
-`ptr`): production uses `DotResolver` around one process-wide `DnsClient`
-(pipelined DoT connections, TTL cache; §6.1) built from the resolver address chosen
-at startup (`--resolver` / config-file `resolver` key, default 1.1.1.1,
-threaded through `SessionConfig` into
-`UserSession`); tests use fixture mocks — the same property that makes
-DKIM's fixture corpus openssl-anchored makes the SPF suite deterministic. The RFC 7208 §4.6.4
-budget (10 lookups / 2 void, shared across include/redirect/a/mx/ptr/
-exists) bounds every evaluation regardless of record hostility.
+### Parsing
 
-**Resolver trust.** The resolver's DoT certificate is verified against
-the `--resolver` IP address, using the public web PKI roots
-(`webpki_roots`), so public DoT services such as 1.1.1.1, 9.9.9.9 and
-8.8.8.8 work with no extra configuration. To use a local resolver with a
-private or self-signed certificate, `--resolver-ca <PEM>` (config key
-`resolver-ca`) **adds** its CA certificates to that root set
-(`DnsClient::with_extra_roots`). It never replaces the set, so a public
-resolver still verifies with the option set. The extra roots apply only
-to resolver connections, not to the SMTP listener's TLS. The resolver
-still has to present a certificate with its IP address as a subject
-alternative name. The file is loaded before the listener binds, and a
-missing, empty or invalid file is a startup error.
-
-DMARC reuses `SpfResolver` for its record fetch, which is why the `dmarc`
-crate is pure logic with no DNS dependency of its own.
-
-### 6.1 DNS connections: pipelining
-
-Every SPF, DKIM-key and DMARC lookup in the process goes through one
-`DnsClient`, so its connection handling sets how much DNS the whole
-server can do at once. It also sets how much harm one hostile domain can
-do: an attacker can publish records whose authoritative servers never
-answer, so each of their lookups stays outstanding for the full 5 s
-timeout.
-
-**How it works** (`dns/src/lib.rs`). This replaced an 8-slot pool that
-carried one exchange per connection: eight slow lookups, which one client
-IP could hold, stalled every other session's DNS (H6 in REPORT.md).
-
-- **Connections:** a few pipelined DoT connections (RFC 7766 §6.2.1.1,
-  RFC 7858 §3.4). The default is 2, set with `--dns-connections` /
-  `dns-connections` (1–16; an out-of-range value is a startup error).
-  Each carries up to 64 queries in flight (`DEFAULT_MAX_IN_FLIGHT`).
-  Connections open lazily. A slot is locked while connecting, so queries
-  arriving during a handshake wait for that one handshake instead of each
-  opening their own.
-- **Choosing a connection:** a query takes a unit of client-wide capacity
-  (a semaphore of connections × in-flight limit), then the least-loaded
-  connection; ties go to the lowest slot, so a quiet server keeps one
-  warm connection. When every connection is at its limit, the query waits
-  for capacity. That wait is what the `waits` / `wait_*` metrics measure.
-- **One reader task and one writer task per connection.** Queries hand
-  whole frames to the writer over a channel, so a query cancelled
-  mid-send can never leave a partial frame on the wire. The writer
-  batches whatever is queued before each flush.
-- **Matching replies:** each reply goes to the waiter registered under its
-  transaction ID, then must pass `validate_response` (QR flag, question
-  echo) and the EDNS0 conformance check.
-  - IDs are random and never reused while still in flight on that
-    connection.
-  - A reply that matches an ID but fails validation means the resolver's
-    view of the connection can't be trusted, so the connection is torn
-    down.
-- **Timeouts** no longer cost the connection. The waiter gives up, its
-  entry is removed, and a late reply is counted (`late_replies`) and
-  discarded.
-- **Connection failure** (EOF, I/O error, malformed frame, invalid reply)
-  fails every waiting query at once, and each retries once on a fresh
-  connection. The reader sees a resolver-side close as EOF straight away
-  and marks the connection closed, so the next query reconnects without
-  first failing on a dead stream. That is why no client-side idle timer
-  was needed.
-- **Cancellation:** each pending entry is removed by a drop guard. The
-  guard carries a per-query token, so it can't remove a later query that
-  reused the same transaction ID. Capacity, slot load and the
-  `in_flight` gauge are drop guards too.
-- **Lifecycle:** a closed connection is replaced in its slot on next use.
-  The old connection's tasks are aborted when the last query holding it
-  finishes; dropping the `DnsClient` closes everything.
-- **Unchanged:** connecting (TCP + TLS) and each query are both limited to
-  the timeout, and the `DnsClient::query` signature is the same, so
-  `spf`, `dkim` and `dmarc` didn't change.
-
-**Metrics:** `DnsClient::stats()` returns a `DnsStatsSnapshot`:
-- cumulative counters: queries, cache hits, connects, connect failures,
-  replies OK, failed attempts (`exchange_errors`), timeouts,
-  `late_replies`, waits for capacity, and total wait time;
-- gauges: `waiting` and `in_flight`;
-- peaks: `wait_max_us` and `peak_in_flight`, cleared by `reset_peaks()`.
-
-`mailserv` logs these as a `dns stats` line every 60 s while DNS is in
-use, together with `connections` and `max_in_flight`. Use it to size
-`--dns-connections`. Sustained `waits` mean every connection is at its
-in-flight limit.
-
-**SPF evaluation deadline:** `spf::check_host` limits a whole evaluation
-to `spf::EVALUATION_DEADLINE` (20 s), across every lookup it makes.
-Running out gives `TempError` → `451`, logged at `warn`.
-- RFC 7208 §4.6.4 says the limit SHOULD allow at least 20 s, so 20 s is
-  the floor. It is still well below the old worst case of 10 × 5 s plus
-  the include TXT lookups.
-- `check_host_within` takes an explicit limit, which tests use.
-- *Interaction to note:* the default 30 s whole-connection cap (M11 in
-  REPORT.md) is shorter than a HELO evaluation plus a MAIL FROM
-  evaluation that both run to the limit. That cap should become
-  per-phase (M11).
-
-**Tests** (mock DoT resolvers in `dns` tests):
-- replies out of order, several in one read, on one connection;
-- a fast query overtaking a slow one on the same connection;
-- a timeout that keeps the connection and discards the late reply;
-- a connection closed with three queries pending (each retries once and
-  succeeds);
-- back-pressure at the in-flight limit;
-- a cancelled query freeing its capacity, slot load and table entry;
-- 20 slow lookups in flight not delaying an unrelated one (this test
-  fails if the in-flight limit is set back to 1, i.e. the old behaviour).
-
-**Per-source-IP DNS limit** (`mailserv/src/limit.rs`, `DnsLimiter`):
-pipelining raised the bar for H6 from 8 slow lookups to `connections ×
-64` (128 by default). That is more than one IP's sessions could hold
-before this limit existed, but enough IPs could still fill it. A
-per-session limit wouldn't help, since an attacker just opens more
-sessions, so the limit is per source IP.
-- A session holds one of its IP's permits around each DNS-backed check:
-  the HELO SPF evaluation, the MAIL FROM SPF evaluation, and DKIM +
-  DMARC together at end-of-data. The permit is released before the spool
-  write, so disk I/O never holds DNS capacity.
-- The limit is `--max-dns-per-ip` / `max-dns-per-ip`, default 4 (0 is a
-  startup error). Since each SPF evaluation makes its lookups one after
-  another, this bounds one IP to about 4 lookups in flight out of the
-  client's 128.
-- With the share exhausted, a check waits up to 10 s
-  (`limit::DNS_LIMIT_WAIT`). That absorbs bursts from busy legitimate
-  senders: cached lookups free permits in milliseconds. A live burst of 6
-  concurrent sessions from one IP at a limit of 2 saw 4 short waits and
-  no refusals.
-- If no permit frees up in time, the outcome is always **temporary**:
-  - HELO proceeds with SPF `TempError` (which never rejects HELO);
-  - MAIL FROM gets `451 4.7.0`;
-  - end-of-data gets `451 4.7.0`.
-
-  Skipping DKIM/DMARC instead would fail DMARC and permanently reject
-  legitimate mail.
-- IPs are keyed per address, like the connection limiter. An IPv6 /64
-  isn't aggregated, because large senders send from many addresses
-  within one /64.
-- An IP's entry exists only while some check holds or waits for its
-  permits, and is removed on the last release, including a cancelled
-  wait. Memory is bounded by the checks in progress.
-- The `dns stats` log line carries `ip_limit_waits`, `ip_limit_refusals`,
-  `ip_limit_active_ips` and `max_dns_per_ip`.
-
-#### Still open
-
-1. **Back-off when the resolver is down.** With the resolver unreachable,
-   every cache miss tries to connect and waits the full timeout. After N
-   consecutive connect failures, new queries should fail straight away
-   for a short cool-down. SPF/DMARC already treat that as `TempError` →
-   `451`, so this is safe. Log the state change, and add it to the
-   metrics.
-2. **Share duplicate misses.** Concurrent misses for the same
-   `(name, type)` each send their own query. A map from key to a shared
-   in-flight result would let later callers wait for the first answer.
-   Do this once the `dns stats` log shows enough repeated-miss traffic to
-   matter.
-3. **One upstream.** There is a single resolver address (IPv4 only) and
-   no failover.
-
-`edns-tcp-keepalive` (RFC 7828) negotiation remains optional. EOF
-detection already handles resolver-side idle closes.
-
----
-
-## 7. Parsing (mailparse)
-
-One pest grammar (`mail.pest`) covers RFC 5322 + MIME + DKIM-Signature
-tag structure. Two views:
-
-- **Raw** — `parse_raw_message` → `RawMessage { headers, body }`:
-  `RawHeader`s in message order, duplicates preserved, values byte-exact
-  including folding. This is the *security* view, and it is built by an
-  iterative byte scan only: it never runs the grammar, accepts non-UTF-8
-  header bytes, and cannot fail on header syntax. DKIM uses only this view
-  (`dkim` takes `&RawMessage`), so untrusted mail never reaches the pest
-  parser in the server (S1, N11 in SECURITY.md).
-- **Typed** — `parse_message` → `ParsedMessage::typed` (`MailHeaders`):
-  addresses, dates (jiff), MIME parameters, trace entries. This is the
-  *application* view; malformed headers degrade to `optional_field`
-  rather than failing. The grammar's `comment` rule is recursive, so `parse_headers` first
-  runs a conservative nesting pre-scan and refuses a block nested deeper
-  than `MAX_COMMENT_DEPTH` (64) with `TooDeeplyNested`: unbounded nesting
-  overflowed the stack and aborted the process (S1). A stack overflow is
-  an abort, not a panic, so no caller-side handling could contain it.
-
-The body is a raw byte slice after the blank line (`RawMessage::body`)
-— DKIM's `bh=` hashes exactly those bytes.
-
----
-
-## 8. Configuration & operations
-
-- `--config <file>` (TOML) with CLI-over-file-over-default precedence,
-  resolved by a pure, unit-tested `resolve_config`.
-- `--tls-cert`/`--tls-key` enable STARTTLS; `--auth-users` enables AUTH;
-  `--local-domains` sets the accepted recipient domains.
-- `RUST_LOG` governs verbosity (default INFO); bunyan-JSON on stdout.
-  Envelope verdicts, TLS state, and message counts are logged; message
-  bodies never are. The per-line `recv_data` span is at TRACE, so a
-  message produces a fixed handful of records rather than two per line
-  of DATA (D1, DEPLOYMENT.md).
-- The accept loop survives transient errors (log + backoff) and logs
-  every connection task's outcome.
-- Defaults are production defaults: port 25, storage under
-  `/var/lib/mailserv` (absolute, so independent of the working directory;
-  a relative path is warned about), 10 MiB messages, a 5-minute connection
-  cap, 100 connections.
-- **Graceful shutdown** (SIGTERM/SIGINT): the listener closes, so new
-  connections are refused; every session is signalled through
-  `SmtpSession::shutdown_signal`. The read loop only acts on it between
-  transactions: idle sessions get `421 4.3.2` at once, and a session
-  mid-message or mid-AUTH finishes, gets its reply, then the `421`. The
-  process exits when all sessions have ended (each holds a permit of the
-  global connection semaphore), after `shutdown-grace-ms` (default 60 s,
-  below systemd's 90 s stop timeout), or at a second signal. Blocking
-  work already running (spool fsync, delivery) completes before exit.
-
----
-
-## 9. Testing strategy
-
-258 tests, four layers:
-
-1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
-   alignment, config resolution, SASL decoding).
-2. **Protocol** — the state machine driven by a test session
-   (`handler(&state, line)`): every verb, every rejection path, sequence
-   enforcement, DATA transparency.
-3. **Framing** — `run()` over in-memory duplexes: full sessions, cap
-   overflows, STARTTLS pause/resume, silent-client timeouts, EOF.
-4. **Integration** — a real rustls client against the real connection
-   driver over loopback TCP: STARTTLS dance, AUTH flows, relay policy,
-   DMARC logging.
-
-Conformance anchors are external, never circular: DKIM expected hashes
-come from openssl (or the RFC's own examples), SPF fixtures come from
-recorded real records, DNS hostile-input tests mutate a real response.
-One opt-in live test (`#[ignore]`) fetches protonmail's real DKIM key.
-
----
-
-## 10. Known limitations
-
-Honest, tracked list (details in PLAN):
-
-- **No hosted delivery backend** — mail is delivered to local maildirs
-  (`--maildir-dir`, one per recipient address, with `Return-Path:`/
-  `Received:` trace headers); the platform backend (API/queue/LMTP to
-  the console's mailboxes) replaces the maildir sink via the
-  `DeliverySink` trait (Phase 12).
-- DKIM signing does not exist (Phase 8); the crate verifies only.
-- SPF macros follow RFC 7208 §7 (letters, digit/`r` transformers,
-  delimiters, `%%`/`%_`/`%-`, URL-escaping); `%{p}` expands to the
-  specified `unknown` (no PTR validation) and `exp=` explanations are
-  not fetched.
-- DNS: no resolver back-off and no sharing of duplicate misses yet
-  (§6.1, "Still open"); the resolver address
-  is configurable (`--resolver`/config file, default 1.1.1.1) but IPv4-only;
-  a local resolver with a private certificate needs `--resolver-ca`.
-- Per-IP limits are per-address, not per-subnet (IPv6 prefix aggregation
-  is future hardening); no RCPT-command rate limiting inside a session.
-- No metrics endpoint (the DNS client's counters are logged every 60 s,
-  §6.1), no ARC.
-- mailparse: `Content-Disposition` is a stub; no RFC 2047 decoding;
-  `Received` with comments/IPv6 literals falls back to the raw view.
+| Gap | Impact | Ref |
+|---|---|---|
+| The typed `mailparse` view: no RFC 2047 decoding; `Content-Disposition` is a stub; `Received:` with comments falls back to raw; more than 64 unclosed `(` in a header block is refused | Affects only library and future UI use, not the server | — |

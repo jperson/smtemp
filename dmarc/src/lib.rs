@@ -255,7 +255,7 @@ impl FoundPolicy {
 pub const MAX_POLICY_QUERIES: usize = 8;
 
 /// The names [`fetch_policy`] queries, in order: the From domain itself,
-/// then its ancestors down to two labels (F2, SECURITY-AUDIT.md). A domain
+/// then its ancestors down to two labels. A domain
 /// with more labels than the bound skips straight from the full name to
 /// its 7-label suffix (as DMARCbis's tree walk does), so at most
 /// [`MAX_POLICY_QUERIES`] names are returned.
@@ -281,14 +281,13 @@ pub fn policy_candidates(from_domain: &str) -> Vec<String> {
 ///
 /// Queries `_dmarc.<domain>` for the From domain and then each ancestor
 /// (see [`policy_candidates`]), stopping at the first that publishes a
-/// record. This replaces the old "last two labels" organisational-domain
-/// guess, which skipped the real organisational domain under multi-label
-/// public suffixes: for `x.victim.co.uk` it asked `co.uk` and never
-/// `victim.co.uk`, so spoofs of any non-existent subdomain found no policy
-/// (F2). Walking every ancestor can't skip the organisational domain,
-/// whatever the suffix structure, and needs no Public Suffix List.
+/// record. Walking every ancestor can't skip the organisational domain,
+/// whatever the suffix structure, and needs no Public Suffix List. Footgun:
+/// don't replace this with a "last two labels" guess. For `x.victim.co.uk`
+/// that asks `co.uk`, never `victim.co.uk`, so a spoof from any
+/// non-existent subdomain would find no policy.
 ///
-/// Errors fail closed (F1): a transient DNS failure at any step is
+/// Errors fail closed: a transient DNS failure at any step is
 /// [`DmarcError::Temp`], because skipping that name could skip the policy
 /// that applies, and the caller must defer the message, not deliver it.
 /// [`DmarcError::MultipleRecords`] ends discovery (RFC 7489 §6.6.3: DMARC
@@ -560,9 +559,8 @@ mod discovery_tests {
         dns
     }
 
-    /// F2 (SECURITY-AUDIT.md): a spoof from a non-existent subdomain of a
-    /// domain under a multi-label public suffix must find the victim's
-    /// policy. The old fallback asked `_dmarc.co.uk` and delivered.
+    /// A spoof from a non-existent subdomain of a domain under a
+    /// multi-label public suffix finds the victim's policy, not `co.uk`'s.
     #[tokio::test]
     async fn multi_label_suffix_subdomain_finds_the_victims_policy() {
         let dns = with(&[("_dmarc.victim.co.uk", "v=DMARC1; p=reject")]);
@@ -596,8 +594,7 @@ mod discovery_tests {
         assert_eq!(found.domain, "corp.example.com");
     }
 
-    /// F1 (SECURITY-AUDIT.md): a DNS failure anywhere in the walk is a
-    /// temporary error, never "no policy" — the policy might be at the
+    /// A DNS failure anywhere in the walk is a temporary error, never "no policy" — the policy might be at the
     /// name that failed.
     #[tokio::test]
     async fn dns_failure_is_temp_not_no_policy() {

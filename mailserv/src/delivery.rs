@@ -1,4 +1,4 @@
-//! Local delivery (Phase 7): the `DeliverySink` seam and the maildir
+//! Local delivery: the `DeliverySink` seam and the maildir
 //! implementation, plus the message fixing (trace headers) applied when
 //! a message leaves the queue and the drain/retry loop.
 //!
@@ -13,8 +13,8 @@
 //!   after partial failure must never duplicate mail.
 //! - [`drain_once`] — the retry engine. Scans the committed spool,
 //!   delivers each message to each recipient, removes fully delivered
-//!   messages, counts failed attempts, and dead-letters messages that
-//!   exceed the attempt budget.
+//!   messages, retries failures with exponential backoff, and dead-letters
+//!   messages still undeliverable after `MAX_QUEUE_LIFETIME` (5 days).
 //!
 //! Message fixing happens in [`prepare_for_delivery`]: the final MTA
 //! prepends `Return-Path` (RFC 5321 §4.5.2) and a `Received:` trace
@@ -24,6 +24,7 @@
 use anyhow::{Context, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::spool::{DiskSpool, SpoolMeta};
 
@@ -103,17 +104,11 @@ impl DeliverySink for MaildirSink {
     }
 }
 
-/// Split an address into (local-part, domain), both lowercased. Returns
-/// `Err` for addresses without an `@`.
 /// Split an address into (local-part, domain), both lowercased, and
-/// validate both as filesystem-safe path components (C1, security
-/// report).
+/// validate both as filesystem-safe path components.
 ///
 /// The components become maildir directory names under the sink root,
-/// so each must be a single safe component: no `/` or `\` (a `/` in an
-/// RFC-atext local-part used to allow relative traversal, and
-/// `Path::join` with an absolute path used to discard the root
-/// entirely), no `..` runs, no leading dot, no control characters, and
+/// so each must be a single safe component: no `/` or `\`, no `..` runs, no leading dot, no control characters, and
 /// within reasonable length. Returns `Err` for anything that could
 /// escape the maildir root — the caller treats that as a failed
 /// delivery (the message stays queued), never as a path to honor.
@@ -265,31 +260,86 @@ pub struct DrainStats {
     /// Messages still queued after failed (or partially failed)
     /// delivery attempts.
     pub retrying: usize,
-    /// Messages moved to the dead-letter directory after exhausting
-    /// the attempt budget.
+    /// Messages moved to the dead-letter directory after failing for
+    /// [`MAX_QUEUE_LIFETIME`].
     pub dead_lettered: usize,
+    /// Messages left untouched because their next retry is not due yet.
+    pub deferred: usize,
 }
 
-/// Retry budget per message before dead-lettering.
-pub const MAX_DELIVERY_ATTEMPTS: u32 = 5;
+/// The first retry interval after a failed delivery attempt. Each further
+/// failure doubles it, up to [`RETRY_MAX`].
+pub const RETRY_BASE: Duration = Duration::from_secs(60);
 
-/// One pass of the queue drain: attempt delivery of every committed
-/// spool message, remove fully delivered ones, count attempts, and
-/// dead-letter messages past [`MAX_DELIVERY_ATTEMPTS`].
+/// The longest interval between retries.
+pub const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How long a message keeps being retried, counted from its first failed
+/// delivery attempt, before it is dead-lettered. Five days is the usual MTA
+/// queue lifetime (Postfix's `maximal_queue_lifetime`; RFC 5321 §4.5.4.1
+/// suggests 4–5 days). Mail that got a `250` must survive any realistic
+/// outage of the delivery backend.
+pub const MAX_QUEUE_LIFETIME: Duration = Duration::from_secs(5 * 24 * 60 * 60);
+
+/// The wait before the next attempt after `attempts` failed ones:
+/// 1, 2, 4, 8 … minutes, capped at [`RETRY_MAX`].
+pub fn retry_delay(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(16);
+    RETRY_BASE.saturating_mul(1u32 << doublings).min(RETRY_MAX)
+}
+
+/// Seconds since the Unix epoch, now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// One pass of the queue drain at the current time (see [`drain_at`]).
+pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainStats> {
+    drain_at(spool, sink, unix_now())
+}
+
+/// One pass of the queue drain at `now` (Unix seconds).
+///
+/// For each committed message:
+/// - not yet due (its last failure was less than [`retry_delay`] ago):
+///   skipped, and its payload is not read;
+/// - due: delivery is attempted to every recipient (idempotent per
+///   recipient, so recipients that already have their copy are not
+///   duplicated). A message delivered to every recipient is dequeued.
+/// - a failed attempt is recorded. If the message has been failing for
+///   [`MAX_QUEUE_LIFETIME`], it is dead-lettered and logged at `error`.
 ///
 /// Blocking; callers run it on a blocking thread pool. Per-message
 /// failures are logged and counted, never fatal to the pass — the drain
 /// is designed to run forever.
-pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainStats> {
+pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<DrainStats> {
     let mut stats = DrainStats::default();
     for queued in spool.list()? {
         let meta = &queued.meta;
+        if let Some(last) = queued.last_failure {
+            if now < last.saturating_add(retry_delay(queued.attempts).as_secs()) {
+                stats.deferred += 1;
+                continue;
+            }
+        }
+        // Loaded only now, for a message that is due.
+        let payload = match queued.load_payload() {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Removed by a concurrent fast-path dequeue, or damaged.
+                // Either way there is nothing to deliver this pass.
+                tracing::warn!(queue_id = %meta.queue_id, error = %e, "queued payload unreadable; skipped");
+                continue;
+            }
+        };
         let mut all_delivered = true;
         for rcpt in &meta.rcpt_to {
             // The trace headers name the envelope address; the copy goes
             // to the authority-resolved routing mailbox (which differs
             // from the address only under catch-all).
-            let message = prepare_for_delivery(meta, &rcpt.address, &queued.payload);
+            let message = prepare_for_delivery(meta, &rcpt.address, &payload);
             if let Err(e) = sink.deliver(&rcpt.mailbox, &meta.queue_id, &message) {
                 all_delivered = false;
                 tracing::warn!(
@@ -309,17 +359,30 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
             continue;
         }
 
-        let attempts = spool.record_attempt(&queued)?;
-        if attempts >= MAX_DELIVERY_ATTEMPTS {
+        let record = spool.record_attempt(&queued, now)?;
+        let failing_for = now.saturating_sub(record.first_failure.unwrap_or(now));
+        if failing_for >= MAX_QUEUE_LIFETIME.as_secs() {
             spool.dead_letter(&queued)?;
             stats.dead_lettered += 1;
-            tracing::warn!(
+            // Accepted mail is leaving the queue undelivered: an operator
+            // must see this (alert on it) and can requeue it once the cause
+            // is fixed (move `.eml`, then `.json`, back to `new/` and delete
+            // `.attempts`).
+            tracing::error!(
                 queue_id = %meta.queue_id,
-                attempts,
-                "delivery attempts exhausted; message dead-lettered"
+                attempts = record.attempts,
+                failing_for_secs = failing_for,
+                recipients = meta.rcpt_to.len(),
+                "accepted message undeliverable for the queue lifetime; dead-lettered"
             );
         } else {
             stats.retrying += 1;
+            tracing::info!(
+                queue_id = %meta.queue_id,
+                attempts = record.attempts,
+                next_attempt_in_secs = retry_delay(record.attempts).as_secs(),
+                "delivery deferred"
+            );
         }
     }
     Ok(stats)
@@ -394,8 +457,8 @@ mod tests {
             .contains(" with ESMTPS id "));
     }
 
-    /// M8 (SECURITY.md), defense in depth: a HELO with a bare CR stored by
-    /// an older build can't inject a header into the delivered copy.
+    /// Defence in depth: a stored HELO containing a bare CR can't inject a
+    /// header into the delivered copy.
     #[test]
     fn delivery_copy_neutralises_control_characters_in_helo() {
         let mut meta = sample_meta();
@@ -475,8 +538,7 @@ mod tests {
             stats,
             DrainStats {
                 delivered: 1,
-                retrying: 0,
-                dead_lettered: 0
+                ..DrainStats::default()
             }
         );
 
@@ -499,56 +561,117 @@ mod tests {
         assert_eq!(stats, DrainStats::default());
     }
 
-    /// A sink that always fails: attempts accumulate in the sidecar and
-    /// the message dead-letters after MAX_DELIVERY_ATTEMPTS passes.
-    #[tokio::test]
-    async fn drain_retries_then_dead_letters() {
-        struct FailingSink;
+    /// A sink that fails while `failing` is set, then delivers.
+    struct FlakySink {
+        failing: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
 
-        impl DeliverySink for FailingSink {
-            fn name(&self) -> &str {
-                "failing"
-            }
-
-            fn deliver(&self, _r: &str, _q: &str, _m: &[u8]) -> Result<()> {
-                Err(anyhow::anyhow!("disk on fire"))
+    impl FlakySink {
+        fn failing() -> Self {
+            FlakySink {
+                failing: true.into(),
+                calls: 0.into(),
             }
         }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
+    impl DeliverySink for FlakySink {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+
+        fn deliver(&self, _r: &str, _q: &str, _m: &[u8]) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(anyhow::anyhow!("disk on fire"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn retry_schedule_backs_off_to_the_cap() {
+        let mins = |a| retry_delay(a).as_secs() / 60;
+        assert_eq!([1, 2, 3, 4, 5, 6, 7].map(mins), [1, 2, 4, 8, 16, 32, 60]);
+        assert_eq!(retry_delay(10_000), RETRY_MAX, "no overflow");
+    }
+
+    /// A day-long delivery outage loses nothing. Retries back off (a message isn't touched
+    /// before it is due), and the message is delivered once the sink
+    /// recovers, a day later.
+    #[tokio::test]
+    async fn long_outage_is_retried_with_backoff_then_delivered() {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path().join("spool"), None).unwrap();
-        let sink = FailingSink;
+        let sink = FlakySink::failing();
+        spool.write(sample_meta(), b"payload").unwrap();
+        let t0: u64 = 1_700_000_000;
 
-        let raw = b"payload".to_vec();
-        let queue_id = spool.write(sample_meta(), &raw).unwrap();
+        // First failure, then nothing is attempted until the backoff ends.
+        let stats = drain_at(&spool, &sink, t0).unwrap();
+        assert_eq!((stats.retrying, stats.deferred), (1, 0));
+        let calls = sink.calls();
+        let stats = drain_at(&spool, &sink, t0 + 59).unwrap();
+        assert_eq!((stats.retrying, stats.deferred), (0, 1));
+        assert_eq!(sink.calls(), calls, "not due: no delivery attempt");
 
-        for expected_attempts in 1..=(MAX_DELIVERY_ATTEMPTS - 1) {
-            let stats = drain_once(&spool, &sink).unwrap();
-            assert_eq!(
-                stats,
-                DrainStats {
-                    delivered: 0,
-                    retrying: 1,
-                    dead_lettered: 0
-                }
-            );
-            let queued = &spool.list().unwrap()[0];
-            assert_eq!(queued.attempts, expected_attempts);
+        // Keep failing for a day, one pass per minute: far fewer attempts
+        // than passes (backoff), and never dead-lettered.
+        let day = 24 * 60 * 60;
+        let mut now = t0;
+        while now < t0 + day {
+            now += 60;
+            let stats = drain_at(&spool, &sink, now).unwrap();
+            assert_eq!(stats.dead_lettered, 0);
         }
+        let queued = &spool.list().unwrap()[0];
+        assert!(
+            queued.attempts < 40,
+            "backoff: {} attempts in a day",
+            queued.attempts
+        );
+        assert_eq!(queued.first_failure, Some(t0));
 
-        // Final failing pass dead-letters the message.
-        let stats = drain_once(&spool, &sink).unwrap();
+        // The backend recovers: the next due pass delivers and dequeues.
+        sink.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let due = queued.last_failure.unwrap() + retry_delay(queued.attempts).as_secs();
+        let stats = drain_at(&spool, &sink, due).unwrap();
+        assert_eq!(stats.delivered, 1);
+        assert!(spool.list().unwrap().is_empty());
+    }
+
+    /// A message still failing after MAX_QUEUE_LIFETIME is dead-lettered
+    /// with all three files preserved, so it can be inspected and requeued.
+    #[tokio::test]
+    async fn dead_letters_only_after_the_queue_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = DiskSpool::open(dir.path().join("spool"), None).unwrap();
+        let sink = FlakySink::failing();
+        let queue_id = spool.write(sample_meta(), b"payload").unwrap();
+        let t0: u64 = 1_700_000_000;
+        let lifetime = MAX_QUEUE_LIFETIME.as_secs();
+
+        drain_at(&spool, &sink, t0).unwrap();
+        // Due, still failing, just inside the lifetime: kept.
+        let stats = drain_at(&spool, &sink, t0 + lifetime - 1).unwrap();
+        assert_eq!((stats.retrying, stats.dead_lettered), (1, 0));
+        // Due again past the lifetime: dead-lettered.
+        let stats = drain_at(&spool, &sink, t0 + lifetime + RETRY_MAX.as_secs()).unwrap();
         assert_eq!(
             stats,
             DrainStats {
-                delivered: 0,
-                retrying: 0,
-                dead_lettered: 1
+                dead_lettered: 1,
+                ..DrainStats::default()
             }
         );
         assert!(spool.list().unwrap().is_empty());
 
-        // All three files preserved for operator inspection.
         let dead = dir.path().join("spool/dead-letter");
         let mut names = Vec::new();
         let mut rd = tokio::fs::read_dir(&dead).await.unwrap();
@@ -564,5 +687,44 @@ mod tests {
                 format!("{queue_id}.json"),
             ]
         );
+
+        // The requeue procedure: move .eml then .json
+        // back to new/ and delete .attempts. The message is due at once,
+        // with a fresh lifetime.
+        let new = dir.path().join("spool/new");
+        for ext in ["eml", "json"] {
+            std::fs::rename(
+                dead.join(format!("{queue_id}.{ext}")),
+                new.join(format!("{queue_id}.{ext}")),
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(dead.join(format!("{queue_id}.attempts"))).unwrap();
+        sink.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stats = drain_at(&spool, &sink, t0 + 2 * lifetime).unwrap();
+        assert_eq!(stats.delivered, 1);
+    }
+
+    /// Sidecars round-trip, and a count-only sidecar still loads (the
+    /// message is due now and its lifetime clock starts at the next failure).
+    #[test]
+    fn attempt_record_formats() {
+        use crate::spool::AttemptRecord;
+        let r = AttemptRecord {
+            attempts: 3,
+            first_failure: Some(10),
+            last_failure: Some(20),
+        };
+        assert_eq!(r.to_string(), "3 10 20");
+        assert_eq!(AttemptRecord::parse("3 10 20\n"), r);
+        assert_eq!(
+            AttemptRecord::parse("5"),
+            AttemptRecord {
+                attempts: 5,
+                ..AttemptRecord::default()
+            }
+        );
+        assert_eq!(AttemptRecord::parse("garbage"), AttemptRecord::default());
     }
 }

@@ -1,4 +1,4 @@
-//! Dropping root privileges after binding the SMTP port (D4, DEPLOYMENT.md).
+//! Dropping root privileges after binding the SMTP port.
 //!
 //! Port 25 is privileged. mailserv may start as root to bind it, but then
 //! switches to an unprivileged user (`--user`, optionally `--group`)

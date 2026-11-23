@@ -169,7 +169,8 @@ struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, resolver, resolver-ca, dns-connections,
+    /// tls-cert, tls-key, auth-users, auth-senders, resolver, resolver-ca,
+    /// dns-connections,
     /// spool-dir, maildir-dir,
     /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
     /// max-dns-per-ip, user, group, shutdown-grace-ms,
@@ -919,7 +920,7 @@ const DNS_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Log the DNS client's metrics once per [`DNS_STATS_INTERVAL`] while it
 /// is being used, together with the per-source-IP DNS limiter's counters
-/// (DESIGN §6.1: the signals for sizing `--dns-connections` and
+/// (DESIGN §9: the signals for sizing `--dns-connections` and
 /// `--max-dns-per-ip`). Counters are cumulative; the peaks cover the
 /// interval just ended. Quiet intervals (no new queries) are skipped.
 async fn report_dns_stats(dns: Arc<dns::DnsClient>, dns_limit: Arc<limit::DnsLimiter>) {
@@ -1202,7 +1203,7 @@ impl smtp::SmtpSession for UserSession<'_> {
             None
         } else {
             // The evaluation holds one of this source IP's DNS permits
-            // (DESIGN §6.1). If none frees up in time, the HELO identity
+            // (DESIGN §9). If none frees up in time, the HELO identity
             // is TempError, which never rejects HELO: MAIL FROM decides.
             match self.dns_limit.acquire(self.peer.ip()).await {
                 Err(limit::DnsBusy) => {
@@ -1438,7 +1439,7 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         let result = match identity {
             Some((sender, domain)) => {
-                // One of this source IP's DNS permits (DESIGN §6.1). If
+                // One of this source IP's DNS permits (DESIGN §9). If
                 // none frees up in time, refuse temporarily: the sender
                 // retries; nothing is recorded.
                 let Ok(_permit) = self.dns_limit.acquire(self.peer.ip()).await else {
@@ -1713,7 +1714,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         }
 
         // DKIM key lookups and the DMARC policy fetch hold one of this
-        // source IP's DNS permits (DESIGN §6.1). If none frees up in
+        // source IP's DNS permits (DESIGN §9). If none frees up in
         // time, the message is refused *temporarily*: skipping the checks
         // instead would fail DMARC and permanently reject legitimate mail.
         let Ok(dns_permit) = self.dns_limit.acquire(self.peer.ip()).await else {
@@ -2221,7 +2222,8 @@ async fn main() -> Result<()> {
 
     // The drain is the retry engine: it delivers whatever the fast path
     // could not (crashes, sink failures), removes fully delivered
-    // messages, and dead-letters messages past the attempt budget. The
+    // messages, retries failures with backoff, and dead-letters messages
+    // still failing after the queue lifetime (F7). The
     // first pass runs immediately at startup (recovering anything queued
     // before a restart); later passes run on a fixed interval. Per-message
     // failures inside a pass are logged and counted, never fatal.
@@ -2240,11 +2242,22 @@ async fn main() -> Result<()> {
                 })
                 .await;
                 match pass {
-                    Ok(Ok(stats)) if stats.delivered + stats.dead_lettered > 0 => {
+                    // Logged whenever the queue is not empty, so a backlog
+                    // (a delivery outage) is visible every pass and can be
+                    // alerted on (`queued` > 0 for a sustained period).
+                    Ok(Ok(stats))
+                        if stats.delivered
+                            + stats.retrying
+                            + stats.dead_lettered
+                            + stats.deferred
+                            > 0 =>
+                    {
                         info!(
                             delivered = stats.delivered,
                             retrying = stats.retrying,
+                            deferred = stats.deferred,
                             dead_lettered = stats.dead_lettered,
+                            queued = stats.retrying + stats.deferred,
                             "drain pass"
                         );
                     }
@@ -2265,7 +2278,7 @@ async fn main() -> Result<()> {
         max_dns_per_ip = config.max_dns_per_ip,
         "DNS-over-TLS client ready (pipelined connections, TTL cache)"
     );
-    // Per-source-IP share of DNS work (DESIGN §6.1, H6): one client must
+    // Per-source-IP share of DNS work (DESIGN §9, H6): one client must
     // not fill the shared resolver capacity with its own slow lookups.
     let dns_limit = Arc::new(limit::DnsLimiter::new(
         config.max_dns_per_ip,
@@ -2930,7 +2943,7 @@ mod tests {
         assert!(err.to_string().contains("max-dns-per-ip"), "{err}");
     }
 
-    /// Per-IP DNS limit (DESIGN §6.1, H6): with this source IP's share
+    /// Per-IP DNS limit (DESIGN §9, H6): with this source IP's share
     /// exhausted, every DNS-backed stage fails *temporarily*, never
     /// permanently — HELO proceeds with SPF TempError, MAIL FROM and
     /// end-of-data get `451 4.7.0` — and once the share frees up the

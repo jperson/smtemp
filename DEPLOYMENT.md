@@ -1,11 +1,14 @@
 # DEPLOYMENT.md — VPS Readiness Assessment and Deployment Checklist
 
 **Assessed:** commit `d014804` ("dns pipelining finished") on `main`, 2026-11-22.
+**Updated:** 2026-11-22 for `8e3a643` ("Security fixes, SPF parser rewrite")
+plus the F7 queue-retry fix (SECURITY-AUDIT.md), which must be committed
+before A4. Statuses below reflect that tree.
 **Target:** a receive-only public MX on a single Linux VPS (systemd), V1 scope
 per DESIGN.md §1. No outbound mail, no submission.
 **Baseline:** `cargo fmt --check` clean, `cargo clippy --workspace
---all-targets -D warnings` clean, `cargo test --workspace` **207 passed, 0
-failed, 1 ignored**.
+--all-targets -D warnings` clean, `cargo test --workspace` **261 passed, 0
+failed, 1 ignored** (was 207 at the original assessment).
 
 This document is the go/no-go record. It covers:
 1. the readiness verdict;
@@ -14,7 +17,8 @@ This document is the go/no-go record. It covers:
 4. the deployment steps, each with a check;
 5. runbooks and the sign-off list.
 
-Finding IDs (C/H/M/L/N) refer to REPORT.md. Items marked **[verified]**
+Finding IDs (C/H/M/L/N) refer to REPORT.md, S-IDs to SECURITY.md, and
+F-IDs to SECURITY-AUDIT.md. Items marked **[verified]**
 were reproduced on the current code. The rest are from reading the code.
 
 ---
@@ -22,23 +26,27 @@ were reproduced on the current code. The rest are from reading the code.
 ## 1. Readiness verdict
 
 **Not ready for general production. Ready for a limited pilot** (a few
-friendly domains, low volume, an operator watching the logs) once the two
-code fixes in Phase A are merged and Phases B–H are complete.
+friendly domains, low volume, an operator watching the logs) once the
+release is built from a commit (A3–A4) and Phases B–H are complete. All
+Phase A code fixes are merged.
 
 | Area | State |
 |---|---|
-| Protocol safety (smuggling, framing, path traversal, header spoofing that skips DMARC) | ✅ Good. All round-1 criticals are fixed and regression-tested. |
+| Protocol safety (smuggling, framing, path traversal, header-parser crashes) | ✅ Good. All round-1 criticals, S1 (nested-comment stack overflow) and S2 (DKIM `h=` CPU) are fixed and regression-tested. |
+| Spoofing that bypasses policy (DMARC/SPF/DKIM correctness) | ✅ Good for a pilot. F1–F5 are fixed: DMARC fails closed on lookup errors, policy discovery walks parent domains (`x.victim.co.uk` finds `victim.co.uk`), `sp=` is applied, bare-CR headers are refused, the SPF parser no longer weakens `-all` records, and the DKIM verifier enforces RFC 8301 key sizes, whole-body `l=` and `From` in `h=`. |
 | DNS robustness (pipelining, per-IP DNS limit, SPF deadline) | ✅ Good. The round-4 H6 re-open is resolved in `d014804`. |
-| Durability (spool before `250`, idempotent delivery, retry and dead-letter) | ✅ Adequate for a pilot. See M11 and M14 for the edge cases. |
-| **Operability** (logging, sizing, shutdown, privilege, paths) | ⚠️ **Configuration needed.** Log amplification (D1) is fixed; the rest is handled by configuration in Phases B, C and E. |
-| **Abuse resistance** (disk exhaustion) | ⚠️ **Pilot only.** N10 has no quotas. Configuration narrows it; only code closes it. |
-| **Mail-loss risk** (legitimate mail wrongly rejected) | ⚠️ **Pilot only.** M2, M5, N11 and N16 can permanently reject real mail. Acceptable while the logs are watched; fix before general availability. |
-| Spoofing that reaches users (display names, bare-CR headers, no `Authentication-Results:`) | ⚠️ **Pilot only.** N8, N9, M7 and M8. |
+| Durability (spool before `250`, idempotent delivery, retry and dead-letter) | ✅ Adequate for a pilot. Failed deliveries are retried with backoff for 5 days (F7); payloads are loaded one at a time. M11 (duplicates when the connection cap fires after commit) remains. |
+| **Operability** (logging, sizing, shutdown, privilege, paths) | ⚠️ **Configuration needed.** Log amplification (D1), graceful shutdown and privilege drop (D4) are fixed in code; the rest is configuration in Phases B, C and E. |
+| **Abuse resistance** (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** N10 has no quotas; F9 allows unlimited address probing per session. Configuration and monitoring narrow both; only code closes them. |
+| **Mail-loss risk** (legitimate mail wrongly rejected) | ⚠️ **Pilot only.** M2, M5 and N16 can permanently reject real mail. So can the stricter SPF parser (F4): a sender whose SPF record has a typo or unknown term now gets PermError → `550`, as RFC 7208 requires. Acceptable while the logs are watched (G2); fix M2/M5/N16 before general availability. |
+| Spoofing that reaches users (display names, no `Authentication-Results:`) | ⚠️ **Pilot only.** N9 and M7. |
 
 **Go-live blockers** (all must be ✅ before port 25 is opened):
 - ~~**D1:** per-DATA-line log spans.~~ ✅ **Fixed** (see D1 status).
-- **N19:** IPv4-mapped peers break SPF. Fix in code (one line), or the
-  configuration workaround in B4 (IPv4-only listener, no AAAA record).
+- ~~**N19:** IPv4-mapped peers break SPF.~~ ✅ **Fixed in code**
+  (`canonical_peer`). Stay IPv4-only anyway (B4): SPF `a`/`mx` still don't
+  query AAAA.
+- **Release built from a commit that includes the F7 fix** (A3, A4).
 - **Run with `--authority` in `reject` mode**, never the `StaticAuthority`
   fallback. Configuration (C1).
 - **AUTH not configured.** Configuration (C1).
@@ -238,6 +246,12 @@ is listed (C2).
 its header. Fix the REPORT round-4 summary line. Replace the README
 example with the config from C1.
 
+**Status (2026-11-22):** resolved, except the REPORT round-4 summary
+line. PLAN.md was rewritten to list only remaining work: §3 indexes every
+open finding, and DESIGN.md §13 describes each gap. The README was
+rewritten too. Its production example no longer passes `--auth-users`, and
+its authority-file example, which was invalid JSON, is fixed.
+
 ---
 
 ## 3. Open findings, classified for go-live
@@ -251,34 +265,41 @@ example with the config from C1.
 
 | ID | Summary | Class | Mitigation in this checklist |
 |---|---|---|---|
+| S1 | Nested header comments overflowed the stack and aborted the process | ✅ FIXED | — (DKIM uses the raw view; mailparse bounds nesting) |
+| S2 | DKIM `h=` selection O(h × headers): one message pinned a worker for minutes | ✅ FIXED | — |
 | D1 | Per-DATA-line log spans | ✅ FIXED | A1 (done) |
-| N19 | IPv4-mapped peers break SPF on an IPv6 listener | **BLOCK** → CONFIG | A2 (code) or B4 (IPv4 only) |
+| N19 | IPv4-mapped peers break SPF on an IPv6 listener | ✅ FIXED | A2 (done); B4 still recommended (no SPF AAAA) |
 | — | `StaticAuthority` fallback accepts every local-part | **BLOCK** → CONFIG | C1/C2: always `--authority`, `reject` mode |
-| Design | AUTH enabled → spoofing channel for credential holders | **BLOCK** → CONFIG | C1: never set `auth-users` |
-| N10 | No storage quotas (100× per message, unlimited maildirs) | **BLOCK** → CONFIG for the pilot | B3 dedicated filesystem, G1 alerts, C2 `reject` mode, avoid `catch-all` |
+| Design | AUTH enabled → spoofing channel for credential holders | **BLOCK** → CONFIG | C1: never set `auth-users`. `auth-senders` grants now constrain `MAIL FROM`/`From:`, but AUTH is still advertised on port 25 with no attempt limit (F10, M16) |
+| N10 / F8 | No storage quotas (100× per message, unlimited maildirs) | **BLOCK** → CONFIG for the pilot | B3 dedicated filesystem, G1 alerts, C2 `reject` mode, avoid `catch-all` |
 | D4 | Unsafe defaults (paths, size, duration cap, umask, privileges, shutdown) | ✅ FIXED | C1 (sizing only), E1 |
 | D5 / N15 | Memory per session | CONFIG | B2 sizing, E1 `MemoryMax` |
 | D6 | Postmaster not routable | CONFIG | C2 |
 | D2 / L3 | Third-party DoT resolver only | ✅ RESOLVED (choice is now CONFIG) | B6: public provider, or a local resolver with `resolver-ca` |
-| M14 | 0644 files, no directory fsync, maildir bypasses encryption | CONFIG (perms) / PILOT (fsync) | E1 `UMask=0077`; durability risk accepted |
-| M11 / N17 | Whole-connection cap; duplicates on timeout | CONFIG / PILOT | C1 `max-conn-duration-ms = 300000` |
+| F7 | Accepted mail dead-lettered after ~5 min of delivery failure, silently | ✅ FIXED | Retried with backoff (1 min doubling to 1 h) for 5 days; dead-lettering logs at `error` (G1); requeue H2 |
+| M13 | Drain loaded all queued payloads each pass | ✅ FIXED (with F7) | G1 queue-depth alert still useful |
+| M14 | Directory fsync after maildir rename; maildir bypasses encryption | PILOT | File/dir modes are now `0600`/`0700` in code (E1 `UMask=0077` as backstop); fsync risk accepted |
+| M11 / N17 / F6 | Whole-connection cap can fire between spool commit and `250` → duplicate on retry | CONFIG / PILOT | C1 `max-conn-duration-ms = 300000`; G1 duration-limit alert |
 | L10 | No TLS reload | CONFIG | D3 restart hook |
+| F1 / M6 | DMARC failed open on DNS errors | ✅ FIXED | Lookup errors now `451 4.4.3` (G1 alert). `quarantine` is delivered as normal mail: out of V1 scope by decision |
+| F2 / M3 / M4 | DMARC org-domain heuristic (`x.victim.co.uk` → `co.uk`); `sp=` ignored | ✅ FIXED | F6b smoke test |
+| F3 / N8 | Bare CR in the header block hid a second `From:` from DMARC | ✅ FIXED | F7 smoke test |
+| F4 / M1 | SPF parser weakened hard-fail records (`-ALL`, unknown terms, `mx/24`) | ✅ FIXED | — |
+| F4 (side effect) | Stricter SPF: malformed records are now PermError → **550** | PILOT | G2: watch `SPF policy error` rejections |
+| F5 / M17 | DKIM: no RSA floor, `l=` honoured, `h=` need not include From | ✅ FIXED | Remainder (duplicate tags, `k=`/`a=`) LATER |
+| N11 | DKIM gave no results for non-UTF-8 headers | ✅ FIXED | — |
+| M8 | HELO not validated (bare-CR `Received:` injection) | ✅ FIXED | — |
 | M2 | SPF budget over-counts MX/PTR lookups, giving spurious PermError → **550** | PILOT | G2: watch `SPF policy error` rejections |
 | M5 | Relaxed alignment rejects sibling subdomains → **550** under `p=reject` | PILOT | G2: watch DMARC rejections |
-| N11 | DKIM gives no results for non-UTF-8 headers → legitimate mail rejected | PILOT | G2 |
 | N16 | Null-sender SPF never aligns → unsigned bounces from `p=reject` domains rejected | PILOT | G2 |
-| M1 | SPF parser stops at unknown terms / case-sensitive (weaker, not stricter) | PILOT | — |
-| M3 / M4 | DMARC org-domain heuristic; `sp=` ignored (missed spoofing) | PILOT | — |
-| M6 | DMARC fails open on DNS errors; `quarantine` ignored | PILOT | G1: `dns stats` connect failures |
+| F9 | Unlimited recipient probing per session (`RSET` resets the cap) | PILOT | G1: `recipient refused` rate; firewall abusive sources |
 | M7 | No `Authentication-Results:`; forged ones kept | PILOT | Pilot users are told verdicts aren't shown |
-| N8 / N9 / M8 | Bare-CR header hiding, display-name spoofing, HELO not validated | PILOT | — |
+| N9 | Display-name spoofing | PILOT | — |
 | M9 | Catch-all copies collapse | PILOT | C2: don't use `catch-all` in the pilot |
 | M12 | Limiter sweep O(n); per-IP count leaks on panic | PILOT | E1 `Restart=always` clears leaks |
-| M13 | Drain loads all queued payloads each pass | PILOT | G1 queue-depth alert |
-| M16 | AUTH weaknesses | n/a while AUTH is unset | C1 |
-| M17 | DKIM: no RSA floor, `l=` honoured, `h=` need not include From | PILOT | — |
+| M16 / F10 | AUTH weaknesses | n/a while AUTH is unset | C1 |
 | D3 / L1 | Malformed query names; no end-of-data DNS deadline | ✅ FIXED | — (L9 fixed with it) |
-| N12, N14, L2, L4–L8, L11, L12 | Low items | LATER | N14: never pass maildir paths through a shell in ops scripts |
+| N12, N14, L2, L4–L8, L11, L12, SECURITY-AUDIT L1–L9 | Low items | LATER | N14: never pass maildir paths through a shell in ops scripts |
 | D7 / N18 | Doc status gaps | LATER (before GA) | — |
 
 ---
@@ -293,13 +314,20 @@ did each one and when in §6.
 - [x] **A1. Fix D1 (log spans).** Done: `recv_data`'s `#[instrument(...)]`
   is now `level = "trace"`. **Check:** F10 shows no `RECV_DATA` lines at
   `RUST_LOG=info` (already verified on a dev build; repeat on the VPS).
-- [ ] **A2. Fix N19 (recommended even with B4).** Canonicalise the peer
+- [x] **A2. Fix N19 (recommended even with B4).** Done (`canonical_peer` in
+  the accept loop and `handle_connection`; `mapped_peers_are_canonical`).
+  The original instructions are kept for reference: Canonicalise the peer
   address once, in `handle_connection`, and the accept loop's
   `let ip = peer.ip()`. Use `peer.ip().to_canonical()` (keep the port),
   before `UserSession::new` and both limiters. Add a test that a
   `::ffff:192.0.2.1` peer matches `ip4:192.0.2.0/24`.
   **Check:** with `host = "[::]"`, EHLO answers `Hello [127.0.0.1]`, not
   `[::ffff:127.0.0.1]`.
+- [x] **A2b. Security fixes from SECURITY.md (S1, S2, M8, N11) and
+  SECURITY-AUDIT.md (F1–F5)** are in `8e3a643`. **F7** (queue retry with
+  backoff, lazy payload loading) is in the working tree and must be
+  committed. **Check:** `git log` shows a commit containing
+  `drain_at` / `MAX_QUEUE_LIFETIME` before A4.
 - [ ] **A3. Run the CI gate:** `cargo fmt --all -- --check && cargo clippy
   --workspace --all-targets -- -D warnings && cargo test --workspace`.
   **Check:** all green. The `mailserv` integration tests need outbound
@@ -322,10 +350,11 @@ did each one and when in §6.
   at `/var/lib/mailserv`, so a full mail store can't fill `/` or the
   journal. Size it to at least 10× the expected daily volume.
   **Check:** `findmnt /var/lib/mailserv` shows its own device.
-- [ ] **B4. IPv4-only MX (N19 and missing SPF AAAA).** Unless A2 is merged
-  *and* tested, listen on `0.0.0.0` only and **publish no AAAA record**
-  for the MX host. Even with A2, SPF `a`/`mx` mechanisms don't resolve
-  AAAA (H1 note), so IPv6 senders using them get SPF Fail. Stay
+- [ ] **B4. IPv4-only MX (missing SPF AAAA).** Listen on `0.0.0.0` only and
+  **publish no AAAA record** for the MX host. N19 is fixed (A2), but SPF
+  `a`/`mx` mechanisms still don't resolve AAAA (H1 note), so IPv6 senders
+  authorised only through them would get SPF Fail. Per-IP limits are also
+  per address, so an IPv6 /64 would escape them (SECURITY-AUDIT L4). Stay
   IPv4-only for the pilot.
   **Check:** `dig AAAA mx1.<domain>` returns nothing.
 - [ ] **B5. Firewall.**
@@ -447,7 +476,8 @@ did each one and when in §6.
   ExecStart=/usr/local/bin/mailserv --config /etc/mailserv/mailserv.toml
   WorkingDirectory=/var/lib/mailserv
   Environment=RUST_LOG=info
-  # Port 25 without root (D4: no privilege-drop code)
+  # Port 25 without root. (mailserv can also drop privileges itself:
+  # see the alternative below.)
   AmbientCapabilities=CAP_NET_BIND_SERVICE
   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
   NoNewPrivileges=yes
@@ -515,8 +545,16 @@ Run the authority-dependent tests against a test domain listed in
   `Return-Path:` and `Received:` headers.
 - [ ] **F6. DMARC enforcement:** an unsigned message with `From:
   ceo@paypal.com` → `550 5.7.1 … DMARC policy`.
+- [ ] **F6b. DMARC policy discovery (F2):** an unsigned message with
+  `From: ceo@payroll.nonexistent.bbc.co.uk` (a non-existent subdomain of a
+  `p=reject` domain under a two-label suffix) → `550 5.7.1 … DMARC policy`.
+  The log's `dmarc evaluation` shows `from_domain` as the subdomain and
+  `dmarc_action":"Reject"`.
 - [ ] **F7. From-header policy:** a message with no `From:`, or two
   `From:` headers → `550 5.7.1 Message rejected: missing or malformed From header`.
+  A header block containing a bare CR (`Subject: x\rFrom: ceo@paypal.com`,
+  then a normal `From:` line) → `550 5.6.0 Message header contains a bare
+  CR` (F3). Also: `EHLO evil.example\rX: y` → `501 5.5.2` (M8).
 - [ ] **F8. Size:** `MAIL FROM:<> SIZE=<max+1>` → `552 5.3.4`, and `MAIL FROM:<> SIZE=100` → `250`.
 - [ ] **F9. Protocol safety:**
   - `RCPT TO:<../../x@<test-domain>>` → `553 5.1.3`;
@@ -529,13 +567,21 @@ Run the authority-dependent tests against a test domain listed in
   other provider to a pilot mailbox.
   **Check:** each is delivered, and the log's `dmarc evaluation` shows
   `dmarc_pass: true`. If any legitimate message is rejected, record its
-  `spf_result`/`dkim`/`dmarc` lines and match them to M2, M5, N11 or N16
-  before go-live.
+  `spf_result`/`dkim`/`dmarc` lines and match them to M2, M5, N16 or the
+  stricter SPF parser (F4 side effect) before go-live.
 - [ ] **F12. Restart recovery:** send a message, then immediately run
   `systemctl restart mailserv`.
   **Check:** the message is either delivered or still in
   `spool/new/`, and is delivered within 60 s of the restart (startup
   drain). Nothing goes to `dead-letter/`.
+- [ ] **F13. Delivery outage (F7):** make the maildir unwritable for a few
+  minutes (`chmod 000 /var/lib/mailserv/maildir/<domain>/<local>/new`),
+  send a message (it gets `250` and is spooled), then restore the mode.
+  **Check:** the log shows `delivery deferred` with a growing
+  `next_attempt_in_secs` (60, 120, 240 …), the message is delivered at the
+  first retry after the restore (within ~10 minutes for a short outage),
+  and nothing goes to `dead-letter/`. Run this on the test
+  domain only.
 
 ### Phase G — Monitoring and alerting
 
@@ -546,12 +592,17 @@ Run the authority-dependent tests against a test domain listed in
   |---|---|---|
   | Disk usage of `/var/lib/mailserv` (bytes **and** inodes) | `df -h`, `df -i` | > 70% warn, > 85% page (N10) |
   | Dead letters | `ls /var/lib/mailserv/spool/dead-letter/*.json` | any file (accepted mail at risk) |
-  | Queue depth | `ls /var/lib/mailserv/spool/new/*.json \| wc -l` | > 100 for 10 min (M13) |
+  | Queue depth | `drain pass` log line (every 60 s while the queue is non-empty): `queued` field; or `ls /var/lib/mailserv/spool/new/*.json \| wc -l` | > 100 for 10 min, or any `queued` > 0 for 1 h (a delivery outage: mail is safe for 5 days, but find the cause) |
   | `spool write failed; refusing with a temporary error` | log | any |
   | `authority reload failed; serving the last good policy (stale)` | log | any |
-  | `delivery attempts exhausted; message dead-lettered` | log | any |
+  | `accepted message undeliverable for the queue lifetime; dead-lettered` (level `error`) | log | any (accepted mail left the queue undelivered: requeue with H2 after fixing the cause) |
+  | `delivery deferred` | log | > 20 in 10 min (the delivery backend is failing) |
   | `fast-path delivery failed; queued for retry` / `delivery failed; message stays queued` | log | > 5 in 10 min |
-  | `dns stats` with `connect_failures` rising or `timeouts` > 5% of queries | log, every 60 s | sustained 5 min (M6: DMARC fails open on DNS errors) |
+  | `dns stats` with `connect_failures` rising or `timeouts` > 5% of queries | log, every 60 s | sustained 5 min (all mail is being deferred with `451`) |
+  | `dmarc policy lookup failed; temporary failure` | log | > 5 in 10 min (resolver trouble: inbound mail is deferring, F1) |
+  | `multiple DMARC records; DMARC not applied` | log | daily review (a sender domain's misconfiguration) |
+  | `message refused: bare CR in the header block` | log | daily review; a spike means a spoofing campaign (F3) |
+  | `recipient refused` | log | > 50 in 10 min from one `peer` (address probing, F9): block the source at the firewall |
   | `per-IP DNS limit: no permit within the wait; temporary failure` | log | > 20 in 10 min (attack, or `max-dns-per-ip` too low) |
   | `message refused: size limit` | log | daily review; a spike for one domain means its `max-message-bytes` may be too low |
   | `shutdown grace period over; closing the remaining sessions` | log | any (sessions were cut; raise `shutdown-grace-ms`) |
@@ -569,7 +620,8 @@ Run the authority-dependent tests against a test domain listed in
   journalctl -u mailserv --since today | grep -E '"(dmarc_action":"Reject|spf_result":"(PermError|Fail))'
   ```
   For each rejection, decide whether it was legitimate mail hit by M2,
-  M5, N11 or N16, and keep a tally. Any legitimate rejection is a reason
+  M5, N16, or the stricter SPF parser (a sender whose record has a typo or
+  unknown term now gets PermError, F4), and keep a tally. Any legitimate rejection is a reason
   to prioritise that fix.
 
 ### Phase H — Backups and runbooks
@@ -588,17 +640,24 @@ Run the authority-dependent tests against a test domain listed in
   id=<queue-id>
   mv dead-letter/$id.eml new/          # payload first
   mv dead-letter/$id.json new/         # metadata last: this is the commit point
-  rm -f dead-letter/$id.attempts       # reset the 5-attempt budget
+  rm -f dead-letter/$id.attempts       # reset the backoff and the 5-day lifetime
   ```
-  The next drain pass (≤ 60 s) delivers it. Delivery is idempotent per
+  With no `.attempts` record the message is due immediately, so the next
+  drain pass (≤ 60 s) delivers it. Keeping the `.attempts` file would
+  dead-letter it again at the next failure, because its lifetime clock
+  would still be running from the first failure. (This exact sequence is
+  the `dead_letters_only_after_the_queue_lifetime` test.) Delivery is idempotent per
   recipient, so re-queuing an already-delivered message doesn't
   duplicate it, unless the user has since moved it from `new/` to `cur/`
   (M9).
 - [ ] **H3. Runbook: disk full.** Spool writes fail, so senders get `451`
-  and retry; nothing that was already accepted is lost. Delivery
-  failures dead-letter after about 5 minutes. To recover:
-  1. free space;
-  2. re-queue dead letters (H2);
+  and retry; nothing that was already accepted is lost. Deliveries of
+  accepted mail fail, and are retried with backoff (1 min doubling to
+  1 h) for 5 days (F7), so nothing is dead-lettered unless the outage lasts
+  that long. To recover:
+  1. free space (queued mail is then delivered at each message's next
+     retry, within an hour);
+  2. re-queue anything that was dead-lettered (H2);
   3. find the cause: per-recipient or per-sender volume in `message
      spooled` / `recipient refused` logs (N10). Block an abusive source
      at the firewall if needed.
@@ -615,9 +674,11 @@ Run the authority-dependent tests against a test domain listed in
   A restart can duplicate any message that was spooled but hadn't yet
   received its `250` (M11).
 - [ ] **H5. Runbook: resolver outage.** If `dns stats` shows sustained
-  connect failures, SPF returns TempError (`451`, so senders retry) and
-  DMARC **fails open** (M6). Switch `resolver` in C1 to another DoT
-  provider from B6, then `systemctl restart mailserv`.
+  connect failures, SPF returns TempError and the DMARC lookup fails, so
+  inbound mail is deferred with `451` and senders retry (F1: DMARC no
+  longer fails open). Nothing is accepted unchecked, but nothing is
+  received either. Switch `resolver` in C1 to another DoT provider from B6,
+  then `systemctl restart mailserv`.
 - [ ] **H6. Runbook: authority publish.** Write to a temporary file, `jq .`
   it, then `mv` it into place, and confirm `recipient authority
   reloaded` in the log. If the log shows `authority reload failed`,
@@ -628,24 +689,32 @@ Run the authority-dependent tests against a test domain listed in
 
 ## 5. Recommended fix order after the pilot starts
 
-1. **Mail-loss group:** M2 (SPF budget), M5 (relaxed alignment by
-   organisational domain), N11 (DKIM from the raw view), N16 (HELO
-   alignment for bounces).
-2. **N10:** per-domain and per-mailbox quotas, a cap on stored bytes per
-   message, and a free-space tempfail (`452 4.3.1`). Then `catch-all`
-   can be enabled.
-3. **M11 / N17:** per-phase timeouts (the end-of-data DNS deadline from
-   D3 is in). This removes the duplicates on timeout and allows the
-   default connection cap to drop again.
-4. **Spoofing presentation:** M7 (add and strip
-   `Authentication-Results:`), N9 (display-name domain check), N8 and M8
-   (bare CR in headers and HELO).
-5. **N15:** memory copies. This allows larger `max-data-bytes` on the
+Done since the original assessment, so not listed: N11, N8, M8, M1, M3,
+M4, M6, M13, M17 (main gaps), graceful shutdown, and F7.
+
+1. **Mail-loss group:** M2 (SPF budget; keep RFC 7208 §4.6.4's 10-address
+   cap per `mx`/`ptr`), M5 (relaxed alignment by organisational domain;
+   needs the Public Suffix List), N16 (HELO alignment for bounces).
+2. **N10 / F8:** per-domain and per-mailbox quotas, a cap on stored bytes
+   per message, and a free-space tempfail (`452 4.3.1`). Then `catch-all`
+   can be enabled (after M9).
+3. **M11 / N17 / F6:** never let the connection cap fire between the spool
+   commit and the `250`, and move fast-path delivery after the reply. This
+   removes the duplicates on timeout.
+4. **F9:** close the session after N refused RCPTs, and add a per-IP
+   refused-RCPT budget, against address probing.
+5. **Spoofing presentation:** M7 (add and strip `Authentication-Results:`),
+   N9 (display-name domain check).
+6. **AUTH decision (F10, M16):** either remove AUTH from V1, or add a
+   submission-only listener, hashed credentials, attempt limiting and
+   constant-time comparison before anyone sets `auth-users`.
+7. **N15:** memory copies. This allows larger `max-data-bytes` on the
    same RAM.
-6. **Operability:** graceful shutdown (stop accepting, finish in-flight
-   sessions), TLS hot reload (L10), IPv6 resolver addresses (D2 follow-up), and a metrics
-   endpoint instead of log-only `dns stats`.
-7. The remaining M- and L-tier items, and the documentation updates (D7).
+8. **Operability:** TLS hot reload (L10), IPv6 resolver addresses (D2
+   follow-up), SPF AAAA lookups (then B4 can be lifted), and a metrics
+   endpoint instead of log-only `dns stats` / `drain pass`.
+9. The remaining M- and L-tier items (including SECURITY-AUDIT L1–L9),
+   and the documentation updates (D7).
 
 ---
 
@@ -653,18 +722,19 @@ Run the authority-dependent tests against a test domain listed in
 
 | Item | Owner | Date | Result / evidence |
 |---|---|---|---|
-| A1 log-span fix merged (commit) | | 2026-11-22 | Done in working tree; record commit hash |
-| A2 IPv4-mapped fix merged, **or** B4 IPv4-only confirmed | | | |
+| A1 log-span fix merged (commit) | | 2026-11-22 | In `8e3a643` (or earlier) |
+| A2 IPv4-mapped fix merged; B4 IPv4-only confirmed | | 2026-11-22 | Fix in `8e3a643`; record B4 check |
+| A2b security fixes merged (S1, S2, M8, N11, F1–F5 in `8e3a643`; F7 commit) | | | record the F7 commit hash |
 | A3 CI gate green | | | |
 | A4 release hash | | | |
 | B1–B7 host ready | | | |
 | C1–C3 configuration reviewed (no `auth-users`, `authority` set, absolute paths) | | | |
 | D1–D3 DNS and TLS in place; D4 MX switched | | | |
 | E1–E2 unit hardened, files `0600` | | | |
-| F1–F12 smoke tests passed | | | |
+| F1–F13 smoke tests passed (incl. F6b) | | | |
 | G1 alerts firing in a test (e.g. touch a fake dead-letter `.json`) | | | |
 | H1 backup restore tested | | | |
-| Pilot risk acceptance for the PILOT-class items in §3 | | | |
+| Pilot risk acceptance for the PILOT-class items in §3 (as updated 2026-11-22) | | | |
 
 **Go** requires every row above to be filled in, and no BLOCK item in §3
 left unresolved.

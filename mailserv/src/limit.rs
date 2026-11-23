@@ -1,4 +1,4 @@
-//! Connection limits and per-source-IP rate limiting (Phase 10).
+//! Connection limits and per-source-IP rate limiting.
 //!
 //! A receive-only public MX is probed constantly: connection floods and
 //! (once alias domains exist) dictionary attacks all arrive as TCP
@@ -24,7 +24,7 @@
 //! at end-of-data). Every session shares one resolver client, so without
 //! it a client could publish records whose authoritative servers never
 //! answer and fill the client's in-flight capacity with its own slow
-//! lookups (H6 in REPORT.md, DESIGN §6.1).
+//! lookups.
 
 use anyhow::Result;
 use std::collections::HashMap;

@@ -7,8 +7,7 @@
 //! the DMARC-rejection exemption that authenticated sessions get are only
 //! safe because every `MAIL FROM` and every `From:` author of an
 //! authenticated session is checked against that set first, so being
-//! authenticated never means "may use any From" (Phase 8, PLAN.md;
-//! SECURITY.md §3.1).
+//! authenticated never means "may use any From".
 //!
 //! Fail-closed: a login with no grants can authenticate but can't send
 //! anything, and the null sender is never allowed for an authenticated
@@ -23,7 +22,8 @@ use anyhow::{bail, Result};
 /// a configuration that authorizes senders without AUTH.
 #[derive(Debug, Default)]
 pub struct AuthConfig {
-    /// `user -> password` (plaintext; interim, see PLAN.md Phase 8).
+    /// `user -> password`, in plaintext. Footgun: these come from argv or the
+    /// config file, so they show up in `ps` and shell history.
     pub credentials: HashMap<String, String>,
     /// `user -> addresses/domains` that user may send as.
     pub senders: SenderGrants,

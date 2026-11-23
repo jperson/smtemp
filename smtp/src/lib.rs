@@ -1325,7 +1325,7 @@ mod tests {
             SmtpState::Ready,
         )
         .await;
-        // A malformed keyword no longer resets the state to Idle.
+        // A malformed keyword leaves the state unchanged (still Ready).
         expect(
             &mut s,
             SmtpState::Ready,

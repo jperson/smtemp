@@ -1,4 +1,4 @@
-//! Recipient authority (Phase 12, gap 1): the seam between the SMTP
+//! Recipient authority: the seam between the SMTP
 //! server and the external system that knows which domains are hosted,
 //! which addresses belong to which users, and how each domain treats
 //! recipients it does not know.
@@ -9,12 +9,12 @@
 //! who owns which domain, who owns which address, whether addresses
 //! expire — lives behind the [`RecipientResolver`] trait.
 //!
-//! **Contract semantics (decided, see PLAN.md Phase 12):**
+//! **Contract semantics:**
 //!
 //! - **Fail-closed**: an authority that cannot be consulted (unreachable,
 //!   timed out, unusable answer) means mail is refused with `451` —
-//!   never accepted-and-later-failed. Accepting mail the platform cannot
-//!   route produces backscatter once delivery exists.
+//!   never accepted-and-later-failed. Accepting mail the platform can't
+//!   route would mean bouncing it later (backscatter).
 //! - **Cache successes only**: the session caches *accepted* resolutions
 //!   per connection; refusals always reach the authority, giving the
 //!   invariant *every refusal is observed by the authority exactly
@@ -25,14 +25,13 @@
 //!   which addresses once existed); the reason is recorded in the
 //!   structured refusal log instead.
 //! - **Keys ride the lookup**: the resolution carries the owning user
-//!   and mailbox public key, so the Phase 12 multi-key payload
-//!   encryption has its recipient key set at write time without a
-//!   second lookup or a later schema migration.
+//!   and mailbox public key, so payload encryption (not implemented yet)
+//!   can have its recipient key set at write time without a second lookup.
 //!
 //! # The file-backed authority (the console's first API contract)
 //!
 //! [`FileAuthority`] loads a JSON document and hot-reloads it when the
-//! file's mtime changes; the console (or any operator) publishes policy
+//! file's mtime or size changes; the console (or any operator) publishes policy
 //! by rewriting this file. The schema is deliberately small and strict
 //! (unknown fields are rejected — extend it by bumping `version`):
 //!
@@ -59,8 +58,8 @@
 //!   of `reject`, `catch-all`, `grace` (see [`PolicyMode`]).
 //! - `mailboxes` keys are full addresses (lowercase). `expires` is an
 //!   RFC 3339 timestamp or `null` (permanent). `public-key` is an
-//!   opaque string for now (the Phase 12 container format fixes the
-//!   encoding); `key-generation` supports rotation.
+//!   opaque string (its encoding isn't fixed yet); `key-generation`
+//!   supports rotation. Both are carried, not used.
 //! - Under `catch-all`, an *unknown* address routes to the designated
 //!   mailbox; a *known but expired* address is refused (`Expired`) — an
 //!   admin who expired an address gets the refusal signal, not silent
@@ -68,9 +67,10 @@
 //! - Under `grace`, an expired address keeps accepting for `grace-days`
 //!   past its expiry, then refuses. Permanent addresses never age out.
 //!
-//! If no authority is configured, [`StaticAuthority`] provides the
-//! pre-authority behavior for `--local-domains`: every local-part at a
-//! hosted domain is accepted and routes to itself.
+//! If no authority is configured, [`StaticAuthority`] serves
+//! `--local-domains`: every local-part at a hosted domain is accepted and
+//! routes to itself. Footgun: that accepts any address, so never use it on
+//! an internet-facing server.
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -121,8 +121,7 @@ pub struct Recipient {
     /// The mailbox mail routes to: the addressed mailbox itself, or the
     /// designated inbox under catch-all.
     pub mailbox: String,
-    /// Public key registered for this mailbox — the Phase 12 payload
-    /// encryption wraps the content key with every recipient's key.
+    /// Public key registered for this mailbox. Carried, not used yet.
     pub public_key: Option<String>,
     /// Key-rotation generation for [`Recipient::public_key`].
     pub key_generation: Option<u32>,
@@ -266,11 +265,10 @@ impl AuthorityData {
                         reason: RefusalReason::NoSuchMailbox,
                     });
                 };
-                // H8 (security report): a permanent mailbox (expires:
-                // null) must always accept — the old `is_some_and` logic
-                // treated it as expired and refused every permanent user
-                // on a grace domain. Only addresses WITH an expiry can
-                // age out, and only past expiry + grace.
+                // A permanent mailbox (`expires: null`) always accepts. Only
+                // addresses WITH an expiry can age out, and only past
+                // expiry + grace. Footgun: `is_some_and` here would treat
+                // `null` as expired and refuse every permanent mailbox.
                 let in_grace = mb
                     .expires
                     .is_none_or(|exp| now.as_second() < exp.as_second() + *days * 86_400);
@@ -391,9 +389,7 @@ impl AuthorityFile {
                     if days == 0 {
                         anyhow::bail!("domain {name}: grace-days must be at least 1");
                     }
-                    // H8 (security report): cap the window — bounded
-                    // arithmetic in the expiry comparison, no absurd
-                    // configurations.
+                    // Cap the window, so the expiry arithmetic stays bounded.
                     if days > 366 {
                         anyhow::bail!("domain {name}: grace-days must be at most 366");
                     }
@@ -441,9 +437,9 @@ pub struct FileAuthority {
     state: RwLock<Arc<Loaded>>,
 }
 
-/// The loaded snapshot plus the change token it was loaded from (mtime
-/// and file size — M15, security report: mtime alone misses a second
-/// publish within one mtime tick).
+/// The loaded snapshot plus the change token it was loaded from: mtime
+/// and file size, because mtime alone misses a second publish within one
+/// mtime tick.
 #[derive(Debug)]
 struct Loaded {
     stamp: Option<(SystemTime, u64)>,
@@ -487,11 +483,9 @@ impl FileAuthority {
 
     /// The current snapshot, reloading first if the file changed.
     ///
-    /// M15 (security report): a failed reload (console publishing
-    /// non-atomically, a typo'd policy) keeps serving the **last good
-    /// snapshot** — a broken publish used to turn every RCPT for every
-    /// hosted domain into a `451` until the file was fixed, and the
-    /// failed file was re-parsed on every RCPT. The last attempted
+    /// A failed reload (a non-atomic publish, a typo'd policy) keeps serving
+    /// the **last good snapshot**, so a broken publish never turns every
+    /// RCPT into a `451`. The last attempted
     /// change token is memoized, so a persistently bad file is read
     /// once per change, not once per lookup.
     fn current(&self) -> Result<Arc<Loaded>, AuthorityUnavailable> {
@@ -516,8 +510,8 @@ impl FileAuthority {
                 // Serve the last good snapshot; memoize this change
                 // token so the broken file is not re-parsed per lookup.
                 // It will load successfully on the next content change.
-                // N5 (security report): the failure is logged loudly —
-                // recipient policy is now stale (e.g. an expiry or a
+                // The failure is logged loudly: recipient policy is now
+                // stale (e.g. an expiry or a
                 // domain removal in the rejected publish is NOT in
                 // effect) and operators must know. Logged once per
                 // change, not per lookup.
@@ -736,10 +730,8 @@ mod tests {
             }
         );
 
-        // H8 (security report): permanent mailboxes (expires: null) and
-        // not-yet-expired ones must always accept on a grace domain —
-        // the old `is_some_and` logic treated every permanent mailbox as
-        // expired and refused them all.
+        // Permanent mailboxes (`expires: null`) and not-yet-expired ones
+        // always accept on a grace domain.
         assert!(matches!(
             authority.resolve("permanent@example.org").unwrap(),
             Resolution::Accept(_)
@@ -779,9 +771,8 @@ mod tests {
             }
         );
 
-        // M15 (security report): a malformed rewrite (the console
-        // publishing non-atomically) must NOT turn every RCPT into a
-        // `451` — the last good snapshot keeps serving, the broken file
+        // A malformed rewrite (a non-atomic publish) must NOT turn every
+        // RCPT into a `451`: the last good snapshot keeps serving, the broken file
         // is not re-parsed per lookup, and the next good publish
         // applies.
         std::thread::sleep(std::time::Duration::from_millis(50));

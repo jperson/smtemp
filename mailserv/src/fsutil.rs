@@ -2,8 +2,7 @@
 //!
 //! Mail is personal data: everything mailserv stores is created readable
 //! by the service user only — files `0600`, directories `0700` — whatever
-//! the process umask is (D4 in DEPLOYMENT.md; previously the umask
-//! decided, which typically meant world-readable `0644`/`0755`). The
+//! the process umask is. The
 //! startup `umask(0o077)` in `main` is defense in depth for anything
 //! created elsewhere. The modes only ever remove permissions relative to
 //! the umask, never add them.

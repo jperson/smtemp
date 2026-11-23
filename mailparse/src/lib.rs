@@ -64,13 +64,13 @@ pub enum MailHeaderError {
     /// The header block nests comments deeper than
     /// [`MAX_COMMENT_DEPTH`]. The typed parse is refused rather than
     /// attempted: the grammar's `comment` rule is recursive, and unbounded
-    /// nesting would overflow the stack and abort the process (S1,
-    /// SECURITY.md). The raw view ([`parse_raw_message`]) is unaffected.
+    /// nesting would overflow the stack and abort the process (an abort,
+    /// not a panic, so callers can't catch it). The raw view ([`parse_raw_message`]) is unaffected.
     #[error("Header comments nested too deeply")]
     TooDeeplyNested,
 }
 
-/// The deepest comment nesting the typed parse accepts (S1, SECURITY.md).
+/// The deepest comment nesting the typed parse accepts.
 ///
 /// Real mail nests comments at most two or three levels deep. Each level
 /// costs several recursive pest frames, so the bound keeps the parse far
@@ -190,8 +190,8 @@ pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage<'_>, MailHeaderError> {
 /// This is the view for security checks on untrusted bytes (DKIM
 /// canonicalization, header scanning): it is built by iterative byte
 /// scanning only, so it never runs the recursive pest grammar, accepts
-/// non-UTF-8 header bytes, and cannot fail on header syntax (S1 and N11,
-/// SECURITY.md).
+/// non-UTF-8 header bytes, and cannot fail on header syntax. Footgun:
+/// parse untrusted mail only through this view, never [`parse_message`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawMessage<'m> {
     /// All headers in their original order, duplicates preserved.
@@ -417,8 +417,7 @@ pub struct ContentDescription<'p> {
     pub description: &'p str,
 }
 
-/// The Content-Disposition header (parameters are not parsed yet; see
-/// the PLAN).
+/// The Content-Disposition header. Its parameters are not parsed yet.
 #[derive(Debug, Default)]
 pub struct ContentDisposition<'p> {
     /// The disposition type ("inline", "attachment").
@@ -1733,9 +1732,8 @@ VGVzdA==
             .unwrap()
     }
 
-    /// S1 (SECURITY.md): deeply nested comments in a parsed header used to
-    /// overflow the stack and abort the whole process. They are now
-    /// refused before the grammar runs; the raw view still works.
+    /// Deeply nested comments are refused before the grammar runs (they
+    /// would overflow the stack); the raw view still works.
     #[test]
     fn deep_nesting_is_refused_not_overflowed() {
         for header in ["Received", "From", "To", "Message-ID"] {

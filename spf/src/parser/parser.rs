@@ -201,10 +201,9 @@ pub fn is_spf_record(txt: &str) -> bool {
 /// Terms are separated by spaces (RFC 7208 §4.6.1), and mechanism and
 /// modifier names are case-insensitive. **Any** term that isn't a valid
 /// mechanism or modifier is an `Err`, which evaluation maps to PermError
-/// (§4.6). The old parser stopped silently at the first term it didn't
-/// recognise, so `-ALL`, `mx/24` or an unknown mechanism dropped the rest of
-/// the record, including a trailing `-all`, and turned a hard fail into
-/// Neutral (F4, SECURITY-AUDIT.md). `redirect=` and `exp=` may appear at
+/// (§4.6). Footgun: never skip a term you can't parse. Dropping it, and
+/// everything after it, would lose a trailing `-all` and turn a hard fail
+/// into Neutral. `redirect=` and `exp=` may appear at
 /// most once each (§6). Other modifiers are kept and ignored.
 pub fn parse(subs: &SpfMacroSubs, s: &str) -> Result<Spf> {
     let mut terms = s.split_ascii_whitespace();
@@ -616,7 +615,7 @@ mod tests {
         assert_eq!(expected, result);
     }
 
-    /// H2 (security report): RFC 7208 Section 7 macro expansion. The
+    /// RFC 7208 Section 7 macro expansion. The
     /// expected values are the RFC's own examples (Section 7.4) for
     /// sender strong-bad@email.example.com, IP 192.0.2.3.
     #[test]
@@ -687,8 +686,7 @@ mod tests {
         }
     }
 
-    /// H2: `include:` with a macro domain-spec lexes and expands (the
-    /// lexer used to exclude `%`, silently dropping such terms).
+    /// `include:` with a macro domain-spec parses and expands.
     #[test]
     fn include_with_macro_parses() {
         let subs = SpfMacroSubs::new(

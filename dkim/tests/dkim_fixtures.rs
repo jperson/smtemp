@@ -8,16 +8,16 @@
 //! stays LF-native.
 
 use dkim::{body_hash_matches, find_signatures, signed_header_data};
-use mailparse::{parse_message, ParsedMessage};
+use mailparse::{parse_raw_message, RawMessage};
 
 fn crlf(fixture: &str) -> Vec<u8> {
     fixture.replace('\n', "\r\n").into_bytes()
 }
 
 /// Parse a message from owned bytes, leaking them so the returned
-/// `ParsedMessage` can borrow with `'static` (fine for tests).
-fn parse(bytes: Vec<u8>) -> ParsedMessage<'static> {
-    parse_message(Box::leak(bytes.into_boxed_slice())).expect("fixture must parse")
+/// `RawMessage` can borrow with `'static` (fine for tests).
+fn parse(bytes: Vec<u8>) -> RawMessage<'static> {
+    parse_raw_message(Box::leak(bytes.into_boxed_slice())).expect("fixture must parse")
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

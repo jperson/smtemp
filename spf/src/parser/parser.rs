@@ -1,15 +1,25 @@
 use anyhow::{anyhow, Result};
-use logos::{Lexer, Logos};
 use memchr;
 
 use ipnet::{Ipv4Net, Ipv6Net};
-use std::iter::Peekable;
 use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
-use crate::parser::lexer::Token;
+/// The `dual-cidr-length` of an `a` or `mx` mechanism (RFC 7208 §5.6):
+/// the prefix lengths applied to each address the mechanism resolves.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DualCidr {
+    /// Prefix length for IPv4 addresses (0–32; default 32).
+    pub v4: u8,
+    /// Prefix length for IPv6 addresses (0–128; default 128).
+    pub v6: u8,
+}
 
-type SpfLexer<'source> = Peekable<Lexer<'source, Token<'source>>>;
+impl Default for DualCidr {
+    fn default() -> Self {
+        DualCidr { v4: 32, v6: 128 }
+    }
+}
 
 /// A mechanism qualifier: the `+`/`-`/`?`/`~` prefix.
 #[derive(Debug, Eq, PartialEq)]
@@ -32,10 +42,10 @@ pub enum SpfMechanism {
     All,
     /// `include:<domain>`.
     Include(String),
-    /// `a[:domain]`.
-    A(String),
-    /// `mx[:domain]`.
-    Mx(String),
+    /// `a[:domain][/v4-cidr][//v6-cidr]`.
+    A(String, DualCidr),
+    /// `mx[:domain][/v4-cidr][//v6-cidr]`.
+    Mx(String, DualCidr),
     /// `ptr[:domain]`.
     Ptr(String),
     /// `ip4:network`.
@@ -53,8 +63,8 @@ impl SpfMechanism {
         match &self {
             SpfMechanism::All => None,
             SpfMechanism::Include(s) => Some(s.to_string()),
-            SpfMechanism::A(s) => Some(s.to_string()),
-            SpfMechanism::Mx(s) => Some(s.to_string()),
+            SpfMechanism::A(s, _) => Some(s.to_string()),
+            SpfMechanism::Mx(s, _) => Some(s.to_string()),
             SpfMechanism::Ptr(s) => Some(s.to_string()),
             SpfMechanism::Ip4(_) => None,
             SpfMechanism::Ip6(_) => None,
@@ -177,209 +187,206 @@ impl SpfMacroSubs {
     }
 }
 
+/// Whether a TXT string is an SPF record: it begins with `v=spf1`
+/// (ASCII case-insensitive), followed by a space or the end of the string
+/// (RFC 7208 §4.5). `v=spf10` is not one.
+pub fn is_spf_record(txt: &str) -> bool {
+    let txt = txt.as_bytes();
+    txt.len() >= 6 && txt[..6].eq_ignore_ascii_case(b"v=spf1") && (txt.len() == 6 || txt[6] == b' ')
+}
+
 /// Parse a full SPF record (`v=spf1` plus terms) into its AST, expanding
-/// macros with `subs`. Unknown syntax is an `Err` (which evaluation maps
-/// to PermError).
+/// macros with `subs`.
+///
+/// Terms are separated by spaces (RFC 7208 §4.6.1), and mechanism and
+/// modifier names are case-insensitive. **Any** term that isn't a valid
+/// mechanism or modifier is an `Err`, which evaluation maps to PermError
+/// (§4.6). The old parser stopped silently at the first term it didn't
+/// recognise, so `-ALL`, `mx/24` or an unknown mechanism dropped the rest of
+/// the record, including a trailing `-all`, and turned a hard fail into
+/// Neutral (F4, SECURITY-AUDIT.md). `redirect=` and `exp=` may appear at
+/// most once each (§6). Other modifiers are kept and ignored.
 pub fn parse(subs: &SpfMacroSubs, s: &str) -> Result<Spf> {
-    let mut lex = Token::lexer(s).peekable();
-
-    let version = parse_version(&mut lex)?;
-
-    let mut terms: Vec<SpfTerm> = Vec::new();
-    loop {
-        if let Ok(d) = parse_directive(subs, &mut lex) {
-            terms.push(SpfTerm::Directive(d));
-        } else if let Ok(m) = parse_modifier(subs, &mut lex) {
-            terms.push(SpfTerm::Modifier(m));
-        } else {
-            break;
-        }
-    }
-
-    Ok(Spf { version, terms })
-}
-
-fn parse_version(lex: &mut SpfLexer) -> Result<SpfVersion> {
-    match lex.next_if(|t| matches!(*t, Ok(Token::Version(_)))) {
-        Some(Ok(Token::Version(v))) => Ok(SpfVersion(v.to_owned())),
-        _ => Err(anyhow!("Failed to parse version")),
-    }
-}
-
-fn parse_directive(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfDirective> {
-    let qualifier = match lex.next_if(|t| matches!(*t, Ok(Token::Qualifier(_)))) {
-        Some(Ok(Token::Qualifier(q))) => match q {
-            "+" => SpfQualifier::Plus,
-            "-" => SpfQualifier::Dash,
-            "?" => SpfQualifier::Question,
-            "~" => SpfQualifier::Tilde,
-            _ => SpfQualifier::Plus,
-        },
-        _ => SpfQualifier::Plus,
+    let mut terms = s.split_ascii_whitespace();
+    let version = match terms.next() {
+        Some(v) if v.eq_ignore_ascii_case("v=spf1") => SpfVersion("v=spf1".to_string()),
+        _ => return Err(anyhow!("Failed to parse version")),
     };
 
-    match lex.peek() {
-        Some(Ok(Token::All(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_all(lex)?,
-        }),
-        Some(Ok(Token::Include(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_include(subs, lex)?,
-        }),
-        Some(Ok(Token::A(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_a(subs, lex)?,
-        }),
-        Some(Ok(Token::Mx(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_mx(subs, lex)?,
-        }),
-        Some(Ok(Token::Ptr(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_ptr(subs, lex)?,
-        }),
-        Some(Ok(Token::Ip4(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_ip4(lex)?,
-        }),
-        Some(Ok(Token::Ip6(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_ip6(lex)?,
-        }),
-        Some(Ok(Token::Exists(_))) => Ok(SpfDirective {
-            qualifier,
-            mechanism: parse_exists(subs, lex)?,
-        }),
-
-        _ => Err(anyhow!("Failed to parse directive")),
-    }
-}
-
-fn parse_modifier(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfModifier> {
-    match lex.next_if(|t| matches!(*t, Ok(Token::Modifier(_)))) {
-        Some(Ok(Token::Modifier(m))) => {
-            let (name, value) = m
-                .split_once("=")
-                .ok_or(anyhow!("Failed to parse modifier"))?;
-
-            let value = &expand_macro_string(subs, &value.to_string())?;
-            Ok(SpfModifier {
-                name: name.to_string(),
-                value: value.to_string(),
-            })
-        }
-        _ => Err(anyhow!("Failed to parse modifier")),
-    }
-}
-
-fn parse_all(lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::All(_))) = lex.next() {
-        Ok(SpfMechanism::All)
-    } else {
-        Err(anyhow!("Failed to parse All directive"))
-    }
-}
-
-fn parse_include(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Include(s))) = lex.next() {
-        let (_, value) = s
-            .split_once(":")
-            .ok_or(anyhow!("Failed to parse include, missing ':'"))?;
-        let ds = expand_macro_string(subs, &value.to_string())?;
-        Ok(SpfMechanism::Include(ds.to_owned()))
-    } else {
-        Err(anyhow!("Failed to parse Include directive"))
-    }
-}
-
-fn parse_a(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::A(s))) = lex.next() {
-        let mut a: String = "".to_string();
-        if s.contains(":") {
-            let (_, ax) = s
-                .split_once(":")
-                .ok_or(anyhow!("Failed to parse A directive"))?;
-            a = expand_macro_string(subs, &ax.to_string())?;
-        }
-        Ok(SpfMechanism::A(a.to_string()))
-    } else {
-        Err(anyhow!("Failed to parse Include directive"))
-    }
-}
-
-fn parse_mx(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Mx(s))) = lex.next() {
-        let mut value: String = "".to_string();
-        if s.contains(":") {
-            let (_, vx) = s
-                .split_once(":")
-                .ok_or(anyhow!("Failed to parse MX directive"))?;
-            value = expand_macro_string(subs, &vx.to_string())?;
-        }
-        Ok(SpfMechanism::Mx(value.to_string()))
-    } else {
-        Err(anyhow!("Failed to parse Include directive"))
-    }
-}
-
-fn parse_ptr(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Ptr(s))) = lex.next() {
-        let mut value: String = "".to_string();
-        if s.contains(":") {
-            let (_, px) = s
-                .split_once(":")
-                .ok_or(anyhow!("Failed to parse PTR directive"))?;
-            value = expand_macro_string(subs, &px.to_string())?;
-        }
-        Ok(SpfMechanism::Ptr(value.to_string()))
-    } else {
-        Err(anyhow!("Failed to parse Include directive"))
-    }
-}
-
-fn parse_ip4(lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Ip4(s))) = lex.next() {
-        if let Some((_, ip)) = s.split_once(":") {
-            // "a.b.c.d" or "a.b.c.d/prefix-length" (RFC 7208 Section 5.1).
-            if let Some((addr, prefix)) = ip.split_once('/') {
-                let addr: Ipv4Addr = addr.parse()?;
-                let prefix: u8 = prefix
-                    .parse()
-                    .map_err(|_| anyhow!("invalid ip4 prefix length"))?;
-                if prefix > 32 {
-                    return Err(anyhow!("ip4 prefix length exceeds 32"));
-                }
-                return Ok(SpfMechanism::Ip4(Ipv4Net::new(addr, prefix)?));
+    let mut parsed: Vec<SpfTerm> = Vec::new();
+    let (mut redirects, mut exps) = (0, 0);
+    for term in terms {
+        if let Some(modifier) = parse_modifier(subs, term)? {
+            match modifier.name.as_str() {
+                "redirect" => redirects += 1,
+                "exp" => exps += 1,
+                _ => {}
             }
-            return Ok(SpfMechanism::Ip4(Ipv4Net::from(ip.parse::<Ipv4Addr>()?)));
+            if redirects > 1 || exps > 1 {
+                return Err(anyhow!("duplicate {} modifier", modifier.name));
+            }
+            parsed.push(SpfTerm::Modifier(modifier));
+        } else {
+            parsed.push(SpfTerm::Directive(parse_directive(subs, term)?));
         }
-        Err(anyhow!("Failed to parse Ip4, missing ':'"))
-    } else {
-        Err(anyhow!("Failed to parse Ip4 token"))
+    }
+
+    Ok(Spf {
+        version,
+        terms: parsed,
+    })
+}
+
+/// A `name=value` modifier, or `None` when the term isn't one (its text
+/// before the first `=` isn't a modifier name, RFC 7208 §12:
+/// `ALPHA *( ALPHA / DIGIT / "-" / "_" / "." )`). The name is lowercased.
+fn parse_modifier(subs: &SpfMacroSubs, term: &str) -> Result<Option<SpfModifier>> {
+    let Some((name, value)) = term.split_once('=') else {
+        return Ok(None);
+    };
+    let is_name = name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !is_name {
+        return Ok(None);
+    }
+    Ok(Some(SpfModifier {
+        name: name.to_ascii_lowercase(),
+        value: expand_macro_string(subs, &value.to_string())?,
+    }))
+}
+
+/// One directive: an optional qualifier, then a mechanism whose name is
+/// matched case-insensitively. Unknown mechanisms are an error.
+fn parse_directive(subs: &SpfMacroSubs, term: &str) -> Result<SpfDirective> {
+    let (qualifier, rest) = match term.as_bytes().first() {
+        Some(b'+') => (SpfQualifier::Plus, &term[1..]),
+        Some(b'-') => (SpfQualifier::Dash, &term[1..]),
+        Some(b'?') => (SpfQualifier::Question, &term[1..]),
+        Some(b'~') => (SpfQualifier::Tilde, &term[1..]),
+        _ => (SpfQualifier::Plus, term),
+    };
+    // The mechanism name runs up to its argument (`:domain`) or its
+    // dual-CIDR suffix (`/24`).
+    let split = rest.find([':', '/']).unwrap_or(rest.len());
+    let (name, arg) = rest.split_at(split);
+    let mechanism = match name.to_ascii_lowercase().as_str() {
+        "all" if arg.is_empty() => SpfMechanism::All,
+        "include" => SpfMechanism::Include(required_domain(subs, arg)?),
+        "exists" => SpfMechanism::Exists(required_domain(subs, arg)?),
+        "ptr" => SpfMechanism::Ptr(optional_domain(subs, arg)?),
+        "a" => {
+            let (domain, cidr) = domain_and_cidr(subs, arg)?;
+            SpfMechanism::A(domain, cidr)
+        }
+        "mx" => {
+            let (domain, cidr) = domain_and_cidr(subs, arg)?;
+            SpfMechanism::Mx(domain, cidr)
+        }
+        "ip4" => SpfMechanism::Ip4(parse_ip4(arg)?),
+        "ip6" => SpfMechanism::Ip6(parse_ip6(arg)?),
+        _ => return Err(anyhow!("unknown SPF mechanism in term {term:?}")),
+    };
+    Ok(SpfDirective {
+        qualifier,
+        mechanism,
+    })
+}
+
+/// `":" domain-spec`, required (`include`, `exists`).
+fn required_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
+    match arg.strip_prefix(':') {
+        Some(spec) if !spec.is_empty() && !spec.contains('/') => {
+            expand_macro_string(subs, &spec.to_string())
+        }
+        _ => Err(anyhow!("mechanism needs \":domain\", got {arg:?}")),
     }
 }
 
-fn parse_ip6(lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Ip6(s))) = lex.next() {
-        if let Some((_, ip)) = s.split_once(":") {
-            return Ok(SpfMechanism::Ip6(Ipv6Net::from_str(ip)?));
-        }
-        Err(anyhow!("Failed to parse Ip6, missing ':'"))
+/// `[ ":" domain-spec ]` (`ptr`); empty means the current domain.
+fn optional_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
+    if arg.is_empty() {
+        Ok(String::new())
     } else {
-        Err(anyhow!("Failed to parse Ip6 token"))
+        required_domain(subs, arg)
     }
 }
 
-fn parse_exists(subs: &SpfMacroSubs, lex: &mut SpfLexer) -> Result<SpfMechanism> {
-    if let Some(Ok(Token::Exists(s))) = lex.next() {
-        let (_, value) = s
-            .split_once(":")
-            .ok_or(anyhow!("Failed to parse include, missing ':'"))?;
-        let value = expand_macro_string(subs, &value.to_string())?;
-        Ok(SpfMechanism::Exists(value.to_string()))
+/// `[ ":" domain-spec ] [ dual-cidr-length ]` (`a`, `mx`; RFC 7208 §5.6).
+/// A domain-spec never contains `/`, so the first `/` starts the CIDR.
+fn domain_and_cidr(subs: &SpfMacroSubs, arg: &str) -> Result<(String, DualCidr)> {
+    let (domain_part, cidr_part) = arg.split_at(arg.find('/').unwrap_or(arg.len()));
+    let domain = if domain_part.is_empty() {
+        String::new()
     } else {
-        Err(anyhow!("Failed to parse Include directive"))
+        required_domain(subs, domain_part)?
+    };
+    Ok((domain, parse_dual_cidr(cidr_part)?))
+}
+
+/// `dual-cidr-length = [ "/" ip4-len ] [ "//" ip6-len ]`, with ip4-len
+/// 0–32 and ip6-len 0–128. Empty means /32 and /128.
+fn parse_dual_cidr(s: &str) -> Result<DualCidr> {
+    let mut cidr = DualCidr::default();
+    if s.is_empty() {
+        return Ok(cidr);
+    }
+    let bad = || anyhow!("invalid dual-cidr-length {s:?}");
+    let digits = |d: &str, max: u8| -> Result<u8> {
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) || d.len() > 3 {
+            return Err(bad());
+        }
+        let n: u8 = d.parse().map_err(|_| bad())?;
+        if n > max {
+            return Err(bad());
+        }
+        Ok(n)
+    };
+    let rest = s.strip_prefix('/').ok_or_else(bad)?;
+    let (v4, v6) = match rest.strip_prefix('/') {
+        Some(v6) => (None, Some(v6)),
+        None => match rest.split_once("//") {
+            Some((v4, v6)) => (Some(v4), Some(v6)),
+            None => (Some(rest), None),
+        },
+    };
+    if let Some(v4) = v4 {
+        cidr.v4 = digits(v4, 32)?;
+    }
+    if let Some(v6) = v6 {
+        cidr.v6 = digits(v6, 128)?;
+    }
+    Ok(cidr)
+}
+
+/// `ip4:` network: `a.b.c.d` or `a.b.c.d/prefix` (RFC 7208 §5.6).
+fn parse_ip4(arg: &str) -> Result<Ipv4Net> {
+    let ip = arg
+        .strip_prefix(':')
+        .ok_or_else(|| anyhow!("Failed to parse Ip4, missing ':'"))?;
+    if let Some((addr, prefix)) = ip.split_once('/') {
+        let addr: Ipv4Addr = addr.parse()?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| anyhow!("invalid ip4 prefix length"))?;
+        if prefix > 32 {
+            return Err(anyhow!("ip4 prefix length exceeds 32"));
+        }
+        return Ok(Ipv4Net::new(addr, prefix)?);
+    }
+    Ok(Ipv4Net::from(ip.parse::<Ipv4Addr>()?))
+}
+
+/// `ip6:` network: an address with an optional `/prefix`.
+fn parse_ip6(arg: &str) -> Result<Ipv6Net> {
+    let ip = arg
+        .strip_prefix(':')
+        .ok_or_else(|| anyhow!("Failed to parse Ip6, missing ':'"))?;
+    if ip.contains('/') {
+        Ok(Ipv6Net::from_str(ip)?)
+    } else {
+        Ok(Ipv6Net::from(ip.parse::<std::net::Ipv6Addr>()?))
     }
 }
 
@@ -526,11 +533,11 @@ mod tests {
             terms: vec![
                 SpfTerm::Directive(SpfDirective {
                     qualifier: SpfQualifier::Plus,
-                    mechanism: SpfMechanism::A("127.0.0.1".to_string()),
+                    mechanism: SpfMechanism::A("127.0.0.1".to_string(), DualCidr::default()),
                 }),
                 SpfTerm::Directive(SpfDirective {
                     qualifier: SpfQualifier::Plus,
-                    mechanism: SpfMechanism::A("".to_string()),
+                    mechanism: SpfMechanism::A("".to_string(), DualCidr::default()),
                 }),
                 SpfTerm::Directive(SpfDirective {
                     qualifier: SpfQualifier::Plus,

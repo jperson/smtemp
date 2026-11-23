@@ -27,14 +27,16 @@ use rsa::pkcs1::DecodeRsaPublicKey as _;
 use rsa::pkcs1v15::{Signature as Pkcs1v15Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey as _;
 use rsa::signature::Verifier;
+use rsa::traits::PublicKeyParts as _;
 use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use dns::DnsClient;
 
-use mailparse::{parse_message, ParsedMessage, RawHeader};
+use mailparse::{parse_raw_message, RawHeader, RawMessage};
 
 /// Errors from DKIM signature parsing, key handling, and verification.
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -92,6 +94,16 @@ pub enum DkimError {
     /// type.
     #[error("invalid signature encoding: {0}")]
     InvalidSignature(String),
+
+    /// The signature's `l=` does not cover the whole body, so content
+    /// outside the signature could have been appended (F5,
+    /// SECURITY-AUDIT.md). Such a signature is never treated as verified.
+    #[error("body length (l=) does not cover the whole message body")]
+    PartialBody,
+
+    /// The RSA key is shorter than RFC 8301's 1024-bit minimum.
+    #[error("RSA key too short: {0} bits (RFC 8301 requires at least 1024)")]
+    WeakKey(usize),
 }
 
 /// A parsed `DKIM-Signature` header (RFC 6376 Section 3.5).
@@ -170,6 +182,9 @@ impl<'a> DkimSignature<'a> {
                         .map(trim_fws)
                         .filter(|h| !h.is_empty())
                         .collect();
+                    if headers.len() > MAX_SIGNED_HEADERS {
+                        return Err(DkimError::InvalidTag("h"));
+                    }
                     signed_headers = Some(headers);
                 }
                 "l" => {
@@ -215,6 +230,15 @@ impl<'a> DkimSignature<'a> {
         if signed_headers.is_empty() {
             return Err(DkimError::InvalidTag("h"));
         }
+        // RFC 6376 §6.1.1: a signature that doesn't sign From must be
+        // ignored, or the From header could be replaced on a genuinely
+        // signed message and still verify (F5, SECURITY-AUDIT.md).
+        if !signed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("from"))
+        {
+            return Err(DkimError::InvalidTag("h"));
+        }
 
         Ok(DkimSignature {
             version,
@@ -256,7 +280,7 @@ pub struct ParsedSignature<'a, 'm> {
     /// The parsed signature tags.
     pub signature: DkimSignature<'m>,
     /// The raw header the signature was parsed from. Note the two
-    /// lifetimes: the header lives inside the `ParsedMessage`, while the
+    /// lifetimes: the header lives inside the `RawMessage`, while the
     /// signature's tag values borrow from the original raw message bytes.
     pub header: &'a RawHeader<'m>,
 }
@@ -264,7 +288,7 @@ pub struct ParsedSignature<'a, 'm> {
 /// Find every `DKIM-Signature` in the message (multiple are common and all
 /// must be checked independently). Signatures that are not valid UTF-8 or
 /// fail tag parsing are skipped.
-pub fn find_signatures<'a, 'm>(msg: &'a ParsedMessage<'m>) -> Vec<ParsedSignature<'a, 'm>> {
+pub fn find_signatures<'a, 'm>(msg: &'a RawMessage<'m>) -> Vec<ParsedSignature<'a, 'm>> {
     msg.headers
         .iter()
         .filter(|h| h.name_eq("dkim-signature"))
@@ -469,7 +493,7 @@ fn dkim_sig_without_b(raw_value: &[u8]) -> Vec<u8> {
 ///
 /// Returns `Ok(base64 digest)` or `Err` for an unsupported hash
 /// algorithm.
-pub fn body_hash(msg: &ParsedMessage, sig: &DkimSignature) -> Result<String, DkimError> {
+pub fn body_hash(msg: &RawMessage, sig: &DkimSignature) -> Result<String, DkimError> {
     let mut canon = canonicalize_body(sig.body_canon, msg.body);
     if let Some(l) = sig.body_length {
         canon.truncate(l.min(canon.len()));
@@ -486,7 +510,7 @@ pub fn body_hash(msg: &ParsedMessage, sig: &DkimSignature) -> Result<String, Dki
 /// Returns `Ok(true)` on an exact match, `Ok(false)` on a mismatch
 /// (the classic DKIM `permfail` body condition), or `Err` if the body
 /// hash itself could not be computed.
-pub fn body_hash_matches(msg: &ParsedMessage, sig: &DkimSignature) -> Result<bool, DkimError> {
+pub fn body_hash_matches(msg: &RawMessage, sig: &DkimSignature) -> Result<bool, DkimError> {
     Ok(body_hash(msg, sig)? == strip_fws(sig.body_hash))
 }
 
@@ -496,7 +520,7 @@ pub fn body_hash_matches(msg: &ParsedMessage, sig: &DkimSignature) -> Result<boo
 /// Note: a passing body hash alone does NOT prove the message is authentic;
 /// cryptographic verification of `b=` against the published public key is
 /// not implemented yet.
-pub fn verify_body_hashes<'m>(msg: &'m ParsedMessage<'m>) -> Vec<(DkimSignature<'m>, bool)> {
+pub fn verify_body_hashes<'m>(msg: &'m RawMessage<'m>) -> Vec<(DkimSignature<'m>, bool)> {
     find_signatures(msg)
         .into_iter()
         .map(|parsed| {
@@ -513,24 +537,42 @@ pub fn verify_body_hashes<'m>(msg: &'m ParsedMessage<'m>) -> Vec<(DkimSignature<
 /// canonicalized `DKIM-Signature` header itself (with `b=` emptied) without
 /// a trailing CRLF.
 pub fn signed_header_data(
-    msg: &ParsedMessage,
+    msg: &RawMessage,
     sig: &DkimSignature,
     sig_header: &RawHeader,
 ) -> Result<Vec<u8>, DkimError> {
-    let mut used = vec![false; msg.headers.len()];
-    let mut selected: Vec<&RawHeader> = Vec::new();
-
-    for want in &sig.signed_headers {
-        // Bottom-up: the last unused instance of each signed header.
-        for i in (0..msg.headers.len()).rev() {
-            if !used[i] && msg.headers[i].name_eq(want) {
-                used[i] = true;
-                selected.push(&msg.headers[i]);
-                break;
-            }
+    // Index the header instances by lowercased name once, in message order,
+    // so selection is linear in h= entries + headers (S2, SECURITY.md: the
+    // old per-entry scan of the whole header list was O(h × headers) and
+    // let one message pin a worker for minutes). Only names that h= lists
+    // are indexed.
+    let wanted: HashSet<String> = sig
+        .signed_headers
+        .iter()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    let mut instances: HashMap<String, Vec<&RawHeader>> = HashMap::new();
+    for h in &msg.headers {
+        let Ok(name) = std::str::from_utf8(h.name) else {
+            continue; // h= names are ASCII; a non-UTF-8 name can't match
+        };
+        let name = name.to_ascii_lowercase();
+        if wanted.contains(&name) {
+            instances.entry(name).or_default().push(h);
         }
-        // A header listed in h= but absent from the message contributes
-        // nothing (RFC 6376 Section 5.4.2).
+    }
+
+    let mut selected: Vec<&RawHeader> = Vec::new();
+    for want in &sig.signed_headers {
+        // Bottom-up: popping takes the last unused instance of each signed
+        // header. A header listed in h= but absent (or already used)
+        // contributes nothing (RFC 6376 Section 5.4.2).
+        if let Some(h) = instances
+            .get_mut(&want.to_ascii_lowercase())
+            .and_then(Vec::pop)
+        {
+            selected.push(h);
+        }
     }
 
     let mut data = Vec::new();
@@ -552,7 +594,7 @@ pub fn signed_header_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailparse::parse_message;
+    use mailparse::parse_raw_message;
 
     // A real-world-style signed message (trimmed from an actual received
     // mail). The bh= tag below is the hash of the body as it exists in this
@@ -607,11 +649,11 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
     /// The parsed test message, borrowed for 'static (the backing bytes
     /// are intentionally leaked; fine for tests).
-    fn parsed() -> mailparse::ParsedMessage<'static> {
-        // Leaks the message bytes so the ParsedMessage can borrow them with
+    fn parsed() -> mailparse::RawMessage<'static> {
+        // Leaks the message bytes so the RawMessage can borrow them with
         // 'static; fine for tests.
         let bytes: &'static [u8] = Box::leak(message_bytes().into_boxed_slice());
-        parse_message(bytes).unwrap()
+        parse_raw_message(bytes).unwrap()
     }
 
     /// RFC 6376 Section 3.4.5's own relaxed header example, plus the
@@ -779,10 +821,10 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
     #[test]
     fn header_selection_is_bottom_up_and_single_use() {
         let raw = b"X-Test: one\r\nSubject: s\r\nX-Test: two\r\n\r\nbody\r\n";
-        let msg = parse_message(raw).unwrap();
+        let msg = parse_raw_message(raw).unwrap();
 
         let sig = DkimSignature::parse(
-            "v=1; a=rsa-sha256; b=abc; bh=abc; d=x.com; s=sel; c=relaxed/relaxed; h=x-test:x-test",
+            "v=1; a=rsa-sha256; b=abc; bh=abc; d=x.com; s=sel; c=relaxed/relaxed; h=from:x-test:x-test",
         )
         .unwrap();
         // Stand-in signature header (its own b= handling is tested above).
@@ -902,14 +944,14 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
         // 1. Compute the real body hash and splice it in (the bh= tag is
         //    itself signed, so it must be final before signing).
-        let step0 = parse_message(template.as_bytes()).unwrap();
+        let step0 = parse_raw_message(template.as_bytes()).unwrap();
         let sig0 = &find_signatures(&step0)[0].signature;
         let bh = body_hash(&step0, sig0).unwrap();
         let step1 = template.replace("PLACEHOLDER_BH", &bh);
 
         // 2. Build the signed header data. The b= value is deleted from the
         //    data, so the placeholder never enters the signature.
-        let msg1 = parse_message(step1.as_bytes()).unwrap();
+        let msg1 = parse_raw_message(step1.as_bytes()).unwrap();
         let parsed1 = &find_signatures(&msg1)[0];
         let data = signed_header_data(&msg1, &parsed1.signature, parsed1.header).unwrap();
 
@@ -921,7 +963,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
         // 4. Verify the intact message.
         let final_bytes = final_message.as_bytes().to_vec();
-        let msg = parse_message(&final_bytes).unwrap();
+        let msg = parse_raw_message(&final_bytes).unwrap();
         let parsed = &find_signatures(&msg)[0];
         let result = verify_with_key(&msg, parsed, &key, 0);
         assert!(result.body_hash_ok, "body hash should match");
@@ -931,7 +973,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         // 5. Tampered signed header: body hash still matches, signature
         //    fails.
         let tampered_hdr = final_message.replace("Sign test", "Sign test!");
-        let msg2 = parse_message(tampered_hdr.as_bytes()).unwrap();
+        let msg2 = parse_raw_message(tampered_hdr.as_bytes()).unwrap();
         let parsed2 = &find_signatures(&msg2)[0];
         let r2 = verify_with_key(&msg2, parsed2, &key, 0);
         assert!(r2.body_hash_ok);
@@ -941,7 +983,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         //    verifies — it covers the bh= tag as written, not the body.
         //    Overall DKIM verdict must require BOTH to pass.
         let tampered_body = final_message.replace("Test body.", "Test body tampered.");
-        let msg3 = parse_message(tampered_body.as_bytes()).unwrap();
+        let msg3 = parse_raw_message(tampered_body.as_bytes()).unwrap();
         let parsed3 = &find_signatures(&msg3)[0];
         let r3 = verify_with_key(&msg3, parsed3, &key, 0);
         assert!(!r3.body_hash_ok);
@@ -964,12 +1006,12 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
         let template = "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.org; s=sel1;\r\n\th=From:Subject; bh=PLACEHOLDER_BH; b=PLACEHOLDER_SIG\r\nFrom: Ed Example <ed@example.org>\r\nSubject: Ed sign test\r\n\r\nEd test body.\r\n";
 
-        let step0 = parse_message(template.as_bytes()).unwrap();
+        let step0 = parse_raw_message(template.as_bytes()).unwrap();
         let sig0 = &find_signatures(&step0)[0].signature;
         let bh = body_hash(&step0, sig0).unwrap();
         let step1 = template.replace("PLACEHOLDER_BH", &bh);
 
-        let msg1 = parse_message(step1.as_bytes()).unwrap();
+        let msg1 = parse_raw_message(step1.as_bytes()).unwrap();
         let parsed1 = &find_signatures(&msg1)[0];
         let data = signed_header_data(&msg1, &parsed1.signature, parsed1.header).unwrap();
 
@@ -983,7 +1025,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
         // Positive: intact message verifies.
         let final_bytes = final_message.as_bytes().to_vec();
-        let msg = parse_message(&final_bytes).unwrap();
+        let msg = parse_raw_message(&final_bytes).unwrap();
         let parsed = &find_signatures(&msg)[0];
         let result = verify_with_key(&msg, parsed, &key, 0);
         assert!(result.body_hash_ok, "body hash should match");
@@ -992,7 +1034,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
 
         // Negative: tampered signed header fails verification.
         let tampered = final_message.replace("Ed sign test", "Ed sign test!");
-        let msg2 = parse_message(tampered.as_bytes()).unwrap();
+        let msg2 = parse_raw_message(tampered.as_bytes()).unwrap();
         let parsed2 = &find_signatures(&msg2)[0];
         let r2 = verify_with_key(&msg2, parsed2, &key, 0);
         assert!(r2.body_hash_ok);
@@ -1060,6 +1102,120 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         assert_eq!(results.len(), MAX_SIGNATURES);
         // The topmost signatures are the ones evaluated.
         assert_eq!(results[0].signature.domain, "d0.invalid");
+    }
+
+    /// Sign `template` (with `PLACEHOLDER_BH`/`PLACEHOLDER_SIG` in its
+    /// DKIM-Signature) with a fresh Ed25519 key; returns the signed bytes
+    /// and the matching key record.
+    fn ed25519_signed(template: &[u8]) -> (Vec<u8>, DkimKeyRecord) {
+        use ed25519_dalek::{Signer as _, SigningKey};
+
+        fn replace(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+            let at = hay.windows(from.len()).position(|w| w == from).unwrap();
+            [&hay[..at], to, &hay[at + from.len()..]].concat()
+        }
+
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let key = DkimKeyRecord::parse(&format!(
+            "v=DKIM1; k=ed25519; p={}",
+            BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes())
+        ))
+        .unwrap();
+
+        let step0 = parse_raw_message(template).unwrap();
+        let bh = body_hash(&step0, &find_signatures(&step0)[0].signature).unwrap();
+        let step1 = replace(template, b"PLACEHOLDER_BH", bh.as_bytes());
+        let msg1 = parse_raw_message(&step1).unwrap();
+        let parsed1 = &find_signatures(&msg1)[0];
+        let data = signed_header_data(&msg1, &parsed1.signature, parsed1.header).unwrap();
+        let signature = signing_key.sign(Sha256::digest(&data).as_slice());
+        let signed = replace(
+            &step1,
+            b"PLACEHOLDER_SIG",
+            BASE64_STANDARD.encode(signature.to_bytes()).as_bytes(),
+        );
+        (signed, key)
+    }
+
+    /// N11 + S1 (SECURITY.md): DKIM works on the raw view, so a signed
+    /// message whose headers the typed grammar rejects — non-UTF-8 bytes,
+    /// or comments nested past mailparse's bound — still verifies, and
+    /// deep nesting never reaches the recursive grammar at all.
+    #[test]
+    fn verifies_messages_the_typed_parser_rejects() {
+        let deep = format!("{}{}", "(".repeat(100_000), ")".repeat(100_000));
+        let templates: [Vec<u8>; 2] = [
+            b"DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.org; s=sel1; h=From:Subject; bh=PLACEHOLDER_BH; b=PLACEHOLDER_SIG\r\nFrom: ed@example.org\r\nSubject: caf\xe9\r\n\r\nbody\r\n".to_vec(),
+            format!("DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.org; s=sel1; h=From:Received; bh=PLACEHOLDER_BH; b=PLACEHOLDER_SIG\r\nReceived: {deep}a@b\r\nFrom: ed@example.org\r\n\r\nbody\r\n").into_bytes(),
+        ];
+        for template in templates {
+            assert!(mailparse::parse_message(&template).is_err());
+            let (signed, key) = ed25519_signed(&template);
+            // On a worker-sized stack, as in the server.
+            let ok = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || {
+                    let msg = parse_raw_message(&signed).unwrap();
+                    let parsed = &find_signatures(&msg)[0];
+                    let r = verify_with_key(&msg, parsed, &key, 0);
+                    r.body_hash_ok && r.signature_ok
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(ok, "signature should verify");
+        }
+    }
+
+    /// Header selection with the per-name index keeps RFC 6376 §5.4.2
+    /// semantics: bottom-up, each instance used once, case-insensitive,
+    /// absent or exhausted names contribute nothing.
+    #[test]
+    fn signed_header_selection_order() {
+        let raw = b"X-A: 1\r\nx-b: 2\r\nX-A: 3\r\nDKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=d; s=s; bh=x; b=; h=x-a:X-B:X-A:X-A:missing:from\r\n\r\n";
+        let msg = parse_raw_message(raw).unwrap();
+        let parsed = &find_signatures(&msg)[0];
+        let data = signed_header_data(&msg, &parsed.signature, parsed.header).unwrap();
+        let data = String::from_utf8(data).unwrap();
+        assert!(
+            data.starts_with("X-A: 3\r\nx-b: 2\r\nX-A: 1\r\nDKIM-Signature:"),
+            "{data:?}"
+        );
+    }
+
+    /// S2 (SECURITY.md): an `h=` list over MAX_SIGNED_HEADERS is refused,
+    /// and selection is linear — a list at the cap against 200,000 headers
+    /// (the shape that used to take minutes) finishes promptly.
+    #[test]
+    fn signed_header_list_is_bounded_and_linear() {
+        let names = |n: usize| vec!["z"; n].join(":");
+        let too_long = format!(
+            "v=1; a=rsa-sha256; d=d; s=s; bh=x; b=x; h=from:{}",
+            names(MAX_SIGNED_HEADERS)
+        );
+        assert!(matches!(
+            DkimSignature::parse(&too_long),
+            Err(DkimError::InvalidTag("h"))
+        ));
+
+        let mut raw = format!(
+            "DKIM-Signature: v=1; a=rsa-sha256; d=d; s=s; bh=x; b=x; h=from:{}\r\n",
+            names(MAX_SIGNED_HEADERS - 1)
+        );
+        for i in 0..200_000 {
+            raw.push_str(&format!("X-F{i}: v\r\n"));
+        }
+        raw.push_str("\r\nbody\r\n");
+        let msg = parse_raw_message(raw.as_bytes()).unwrap();
+        let parsed = &find_signatures(&msg)[0];
+        let started = std::time::Instant::now();
+        signed_header_data(&msg, &parsed.signature, parsed.header).unwrap();
+        // The quadratic scan was ~51M comparisons here; linear is ~1 ms.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1219,6 +1375,23 @@ fn auid_matches(sig: &DkimSignature, key: &DkimKeyRecord) -> bool {
     }
 }
 
+/// RFC 8301 §3.2: the smallest RSA key a verifier may accept.
+pub const MIN_RSA_BITS: usize = 1024;
+
+/// Whether the signature covers the whole canonicalised body (F5,
+/// SECURITY-AUDIT.md). With `l=` shorter than the body, anything after it
+/// is unsigned: content appended to a genuinely signed message would still
+/// verify and pass DMARC. With `l=` longer than the body, RFC 6376 §3.5
+/// says the signature is invalid. Either way it must not count as
+/// verified. [`body_hash`] still computes the `l=`-truncated hash, for
+/// conformance.
+fn covers_whole_body(msg: &RawMessage, sig: &DkimSignature) -> bool {
+    match sig.body_length {
+        None => true,
+        Some(l) => l == canonicalize_body(sig.body_canon, msg.body).len(),
+    }
+}
+
 /// Whether the signature is expired: `x=` is in the past (RFC 6376
 /// Section 3.5). Signatures without `x=` never expire.
 fn is_expired(sig: &DkimSignature, now: u64) -> bool {
@@ -1278,6 +1451,13 @@ fn verify_rsa(
     let public_key = RsaPublicKey::from_public_key_der(&key_bytes)
         .or_else(|_| RsaPublicKey::from_pkcs1_der(&key_bytes))
         .map_err(|e| DkimError::InvalidKey(e.to_string()))?;
+    // RFC 8301 §3.2: keys under 1024 bits MUST NOT be accepted; they are
+    // cheap to factor, so anyone could forge for the domain (F5). The rsa
+    // crate already refuses keys over 4096 bits, which bounds the CPU cost.
+    let bits = public_key.n().bits();
+    if bits < MIN_RSA_BITS {
+        return Err(DkimError::WeakKey(bits));
+    }
 
     let sig_bytes = BASE64_STANDARD
         .decode(strip_fws(sig.signature))
@@ -1342,7 +1522,7 @@ pub struct DkimResult<'a> {
 /// This is the DNS-free core of the verifier and is fully testable
 /// offline.
 pub fn verify_with_key<'m>(
-    msg: &ParsedMessage<'m>,
+    msg: &RawMessage<'m>,
     parsed: &ParsedSignature<'_, 'm>,
     key: &DkimKeyRecord,
     now: u64,
@@ -1355,6 +1535,8 @@ pub fn verify_with_key<'m>(
 
     if is_expired(sig, now) {
         error = Some(DkimError::Expired);
+    } else if !covers_whole_body(msg, sig) {
+        error = Some(DkimError::PartialBody);
     } else if !key.permits_email() {
         error = Some(DkimError::ServiceNotPermitted);
     } else if !auid_matches(sig, key) {
@@ -1386,13 +1568,20 @@ pub fn verify_with_key<'m>(
 /// are ignored — an ignored signature simply contributes no pass.
 pub const MAX_SIGNATURES: usize = 5;
 
+/// The most `h=` entries a signature may list (S2, SECURITY.md). Real
+/// signatures name a few dozen headers even with heavy oversigning; a
+/// longer list is refused as an invalid `h=` tag, so the signature
+/// contributes no pass. Header selection is linear regardless, so this only
+/// bounds the work and memory one signature can ask for.
+pub const MAX_SIGNED_HEADERS: usize = 256;
+
 /// Verify every DKIM signature on a raw message: parse, check body hashes,
 /// fetch each signer's public key over DNS-over-TLS, and cryptographically
 /// verify the signed header data. Returns one result per signature; an
 /// empty result means the message had no parseable DKIM signature. At
 /// most [`MAX_SIGNATURES`] signatures (the topmost) are evaluated.
 pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimResult<'m>> {
-    let Ok(msg) = parse_message(raw) else {
+    let Ok(msg) = parse_raw_message(raw) else {
         return Vec::new();
     };
 
@@ -1415,4 +1604,104 @@ pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimRes
         results.push(result);
     }
     results
+}
+
+/// F5 (SECURITY-AUDIT.md): the three verifier gaps, each reproduced by
+/// genuinely signing a message and then attacking it.
+#[cfg(test)]
+mod f5_tests {
+    use super::*;
+    use rsa::pkcs8::EncodePublicKey as _;
+    use rsa::signature::{SignatureEncoding as _, Signer as _};
+
+    /// RSA-sign `template` (with `BH`/`SIG` placeholders) using a fresh key
+    /// of `bits`; returns the signed message and the key record.
+    fn rsa_signed(template: &str, bits: usize) -> (Vec<u8>, DkimKeyRecord) {
+        let private = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, bits).unwrap();
+        let der = private.to_public_key().to_public_key_der().unwrap();
+        let key = DkimKeyRecord::parse(&format!(
+            "v=DKIM1; k=rsa; p={}",
+            BASE64_STANDARD.encode(der.as_bytes())
+        ))
+        .unwrap();
+        let m0 = parse_raw_message(template.as_bytes()).unwrap();
+        let bh = body_hash(&m0, &find_signatures(&m0)[0].signature).unwrap();
+        let step1 = template.replace("BH", &bh);
+        let m1 = parse_raw_message(step1.as_bytes()).unwrap();
+        let p = &find_signatures(&m1)[0];
+        let data = signed_header_data(&m1, &p.signature, p.header).unwrap();
+        let signer: rsa::pkcs1v15::SigningKey<rsa::sha2::Sha256> =
+            rsa::pkcs1v15::SigningKey::new(private);
+        let sig = BASE64_STANDARD.encode(signer.sign(&data).to_vec());
+        (step1.replace("SIG", &sig).into_bytes(), key)
+    }
+
+    fn verify(msg: &[u8], key: &DkimKeyRecord) -> DkimResult<'static> {
+        let msg: &'static [u8] = Box::leak(msg.to_vec().into_boxed_slice());
+        let m: &'static RawMessage<'static> = Box::leak(Box::new(parse_raw_message(msg).unwrap()));
+        let p = &find_signatures(m)[0];
+        verify_with_key(m, p, key, 0)
+    }
+
+    const SIGNED: &str = "DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=victim.example; s=s; h=From:Subject; bh=BH; b=SIG\r\nFrom: ceo@victim.example\r\nSubject: hi\r\n\r\nhello\r\n";
+
+    /// RFC 8301: a 512-bit key never verifies; 1024 bits does.
+    #[test]
+    fn weak_rsa_keys_are_refused() {
+        let (msg, key) = rsa_signed(SIGNED, 512);
+        let r = verify(&msg, &key);
+        assert!(!r.signature_ok);
+        assert!(
+            matches!(r.error, Some(DkimError::WeakKey(512))),
+            "{:?}",
+            r.error
+        );
+
+        let (msg, key) = rsa_signed(SIGNED, 1024);
+        assert!(verify(&msg, &key).signature_ok);
+    }
+
+    /// `l=`: content appended past the signed length must not verify, and
+    /// an `l=` covering exactly the body still does.
+    #[test]
+    fn partial_body_signatures_never_verify() {
+        let template = SIGNED.replace("s=s;", "s=s; l=7;");
+        let (msg, key) = rsa_signed(&template, 1024);
+        assert!(
+            verify(&msg, &key).signature_ok,
+            "l= equal to the body length"
+        );
+
+        let mut tampered = msg.clone();
+        tampered.extend_from_slice(b"ATTACKER: wire money to 1234\r\n");
+        let r = verify(&tampered, &key);
+        assert!(!r.signature_ok, "appended content must not verify");
+        assert!(
+            matches!(r.error, Some(DkimError::PartialBody)),
+            "{:?}",
+            r.error
+        );
+
+        // l= longer than the body is invalid too (RFC 6376 §3.5).
+        let template = SIGNED
+            .replace("s=s;", "s=s; l=7;")
+            .replace("hello\r\n", "hi\r\n");
+        let m0 = parse_raw_message(template.as_bytes()).unwrap();
+        let sig = &find_signatures(&m0)[0].signature;
+        assert!(!covers_whole_body(&m0, sig));
+    }
+
+    /// RFC 6376 §6.1.1: a signature that doesn't sign From is ignored, so
+    /// swapping From on a genuinely signed message can't pass.
+    #[test]
+    fn signatures_must_sign_from() {
+        assert!(matches!(
+            DkimSignature::parse("v=1; a=rsa-sha256; d=d; s=s; bh=x; b=x; h=Subject:To"),
+            Err(DkimError::InvalidTag("h"))
+        ));
+        let swapped = b"DKIM-Signature: v=1; a=rsa-sha256; d=victim.example; s=s; h=Subject; bh=x; b=x\r\nFrom: CEO <ceo@victim.example>\r\nSubject: hi\r\n\r\nhello\r\n";
+        let m = parse_raw_message(swapped).unwrap();
+        assert!(find_signatures(&m).is_empty(), "the signature is ignored");
+        assert!(DkimSignature::parse("v=1; a=rsa-sha256; d=d; s=s; bh=x; b=x; h=FROM:to").is_ok());
+    }
 }

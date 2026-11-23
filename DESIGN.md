@@ -32,7 +32,7 @@ Design goals, in order:
 3. **Byte fidelity.** Mail is bytes: bodies, folded headers, and
    canonicalization inputs are preserved exactly where security checks
    depend on them.
-4. **Deterministic tests.** The suite (229 tests) runs offline; live
+4. **Deterministic tests.** The suite (258 tests) runs offline; live
    network behavior is behind `#[ignore]` opt-ins and fixture mocks
    (the `mailserv` integration tests exercise the real resolver path —
    see README, Testing).
@@ -200,9 +200,10 @@ enforces MAIL-before-RCPT again next time).
 | Check | What it proves | Fail result |
 |---|---|---|
 | SPF (MAIL FROM identity; HELO for the null sender) | the connecting IP is authorized by the *sender's* policy | envelope-level: `550`/`451` at MAIL time |
-| DKIM | the message (signed headers + body) is unchanged since a holder of the domain's key signed it (at most 5 signatures, the topmost, are evaluated per message) | logged per signature; feeds DMARC |
-| DMARC (From-header domain) | at least one aligned pass exists; else apply `p=` | `550 5.7.1` at end-of-data for `p=reject` |
+| DKIM | the message (signed headers + body) is unchanged since a holder of the domain's key signed it (at most 5 signatures, the topmost, are evaluated per message). A signature counts only if it signs `From`, its RSA key is at least 1024 bits (RFC 8301), and any `l=` covers the whole body | logged per signature; feeds DMARC |
+| DMARC (From-header domain) | at least one aligned pass exists; else apply `p=` (or `sp=` when the record was inherited from a parent domain). The policy is found by a bounded walk: the From domain, then each ancestor down to two labels, at most 8 queries (`dmarc::policy_candidates`), so a multi-label public suffix (`co.uk`) can't hide the organisational domain's record | `550 5.7.1` at end-of-data for `p=reject`; `451 4.4.3` when the lookup fails (fail closed, never "no policy") |
 | From header (RFC 7489 §6.6.1) | exactly one `From` header naming one author domain, read as an RFC 5322 mailbox-list from the raw bytes (comments and quoted strings never supply the domain; folding and the obsolete `From :` spelling are understood) | `550 5.7.1` when missing, duplicated, multi-domain, or unparseable |
+| Header block hygiene | no CR outside a CRLF in the header block, so every reader agrees where each header begins (a bare CR used to hide a second `From:` from the DMARC scan) | `550 5.6.0` at end-of-data, before any DNS work |
 | Alignment | SPF/DKIM identity matches the **From** header domain (relaxed/strict per record) | — |
 
 **Transport & access:**
@@ -217,13 +218,62 @@ enforces MAIL-before-RCPT again next time).
   file) — an interim design, to be replaced by hashed storage or an
   external auth backend before production submission use (PLAN.md,
   Phase 8).
-  **Requirement:** `From:` validation (constrain the authenticated user's
-  `MAIL FROM`/`From:` to domains they own; PLAN.md Phase 8) is a
-  prerequisite for enabling AUTH. The SPF/DMARC exemptions above are
-  unconditional, so without it an authenticated session is a spoofing
-  channel into hosted mailboxes — and a receive-only server has no sending
-  use for AUTH at all. Do not enable `--auth-users` until the validation
-  lands.
+  **Sender authorization (`From:` validation, `mailserv/src/auth.rs`).**
+  AUTH proves *who* the client is. *What* that identity may claim is a
+  separate policy decision, made in the policy layer: each login maps to
+  exact addresses and whole domains (`--auth-senders`). An authenticated
+  session's `MAIL FROM` must be granted (`553 5.7.1`; the null sender is
+  always refused), and so must every `From:` author, read with the same
+  tolerant raw scan DMARC uses (`550 5.7.1` at end-of-data). Both checks
+  run before the SPF skip and the DMARC exemption can apply, so those
+  exemptions only cover senders the login owns. It fails closed: a login
+  with no grants can authenticate but can't send, and a grant for an
+  unknown login is a startup error.
+  **Still required before AUTH faces the internet:** hashed credential
+  storage (above), failed-attempt limiting and constant-time comparison
+  (M16), and offering AUTH on a submission listener only, never on port
+  25. A receive-only V1 has no sending use for AUTH, so leave
+  `--auth-users` unset there.
+
+  **Credential storage decision (interim: file; later: auth backend).**
+  A file is an accepted V1 choice: for a small receive-only server it has
+  no network dependency, no new attack surface, and no failure mode that
+  can block inbound delivery — properties an external backend must earn.
+  The file is only acceptable if it is treated as a *secrets file*, not a
+  command-line argument:
+
+  - **Split secrets from policy.** The same spec currently carries both the
+    AUTH credentials (`user -> password`) and the sender grants
+    (`user -> addresses/domains`). These have different owners and
+    rotation cadences: credentials are secrets (hash with argon2id, never
+    log, never pass in argv/`ps`); grants are authorization policy (change
+    when users are added/removed, and must be reloadable without a
+    restart). Store them in separate files (or separate sections with
+    separate handling) and give each its own owner.
+  - **Hash at rest.** Even the interim file stores argon2id hashes, not
+    plaintext passwords, so a leaked file is not a password dump.
+  - **File hygiene.** `0600`, owned by the `mailserv` user; refuse to start
+    if the file is group/world-readable; never accept credentials via CLI
+    arguments (they land in shell history and `ps`).
+  - **Reload without restart.** A revoked grant or user must stop working
+    at the next SIGHUP, not at the next process restart. Today only the
+    authority is hot-reloaded; auth config is not.
+  - **Two seams, not one.** The backend integration is only credible if
+    the file impl is already behind interfaces: a `CredentialVerifier`
+    (`verify(user, pass) -> Identity`) and a `SenderAuthorizer`
+    (`permits(identity, local, domain) -> bool`). The file impl is one
+    implementation of each; a future LDAP/DB backend replaces the
+    verifier, while sender authorization normally stays in the app
+    because "which Froms may this identity claim" is application policy,
+    not directory data.
+
+  **Constraints for the future backend.** Fail closed for AUTH only — a
+  backend outage must not block inbound MX delivery. Cache credentials with
+  a TTL (no per-message network lookup), revoke without restart, and bound
+  every call with a timeout plus a circuit breaker so a slow auth backend
+  is not a submission-path DoS. Do not build the backend until submission
+  is an actual product: a receive-only V1 with AUTH disabled has no use for
+  it.
 - **Recipient policy**: owned by the **recipient authority** (Phase 12
   gap 1, now a seam): at RCPT time a `RecipientResolver` decides
   hosted-domain membership, per-domain policy (`reject` / `catch-all` /
@@ -240,8 +290,23 @@ enforces MAIL-before-RCPT again next time).
   and paths containing control characters are refused. Recipient
   local-parts must be RFC 5321 dot-atom text without `/` (they name
   maildir directories); others get `553 5.1.3`.
+- **HELO identity**: the HELO/EHLO argument must be a domain (letters,
+  digits, `-`, `_`; labels of 1–63 octets; at most 255) or an address
+  literal, else `501 5.5.2`. It is refused before it is recorded, because
+  it is copied into the delivered `Received:` header (M8: a bare CR once
+  injected a header). The delivery path also replaces any non-printable
+  byte in a stored HELO with `?` as a second line of defence.
+- **Peer address**: IPv4-mapped IPv6 peers (`::ffff:a.b.c.d`, from a
+  dual-stack `[::]` listener) are converted to plain IPv4 at accept, so
+  SPF, per-IP limits, logs and trace headers all see the real IPv4
+  address (N19).
 - **Framing DoS**: line caps, per-message size accounting, accept-loop
   backoff.
+- **Header-parse DoS**: DKIM reads headers through the iterative raw
+  view only, and the typed grammar refuses comment nesting past 64 levels
+  (§7, S1). DKIM header selection indexes headers by name once, so it is
+  linear, and a signature's `h=` list is capped at 256 entries
+  (`dkim::MAX_SIGNED_HEADERS`, S2).
 - **Message size**: the server-wide `max-data-bytes` (default 10 MiB),
   lowered per hosted domain by `max-message-bytes` in the authority file.
   A transaction carries one limit: a recipient whose domain limit differs
@@ -268,8 +333,9 @@ enforces MAIL-before-RCPT again next time).
 **Known, deliberate exemptions** (documented policy choices, not bugs):
 authenticated submissions skip SPF/DMARC rejection; `p=none` DMARC logs
 but passes; `pct=` is treated as 100. The authenticated-sender exemption
-is safe only with `From:` validation (see AUTH above); without it, it is a
-bypass of the receive-side spoofing checks.
+applies only after sender authorization (see AUTH above): an authenticated
+session can only use the `MAIL FROM`/`From:` addresses granted to its
+login.
 
 ---
 
@@ -475,16 +541,25 @@ detection already handles resolver-side idle closes.
 ## 7. Parsing (mailparse)
 
 One pest grammar (`mail.pest`) covers RFC 5322 + MIME + DKIM-Signature
-tag structure. One parse, two views:
+tag structure. Two views:
 
-- `ParsedMessage::headers` — `RawHeader`s in message order, duplicates
-  preserved, values byte-exact including folding. This is the *security*
-  view: DKIM canonicalization hashes these bytes.
-- `ParsedMessage::typed` — `MailHeaders`: addresses, dates (jiff), MIME
-  parameters, trace entries. This is the *application* view; malformed
-  headers degrade to `optional_field` rather than failing.
+- **Raw** — `parse_raw_message` → `RawMessage { headers, body }`:
+  `RawHeader`s in message order, duplicates preserved, values byte-exact
+  including folding. This is the *security* view, and it is built by an
+  iterative byte scan only: it never runs the grammar, accepts non-UTF-8
+  header bytes, and cannot fail on header syntax. DKIM uses only this view
+  (`dkim` takes `&RawMessage`), so untrusted mail never reaches the pest
+  parser in the server (S1, N11 in SECURITY.md).
+- **Typed** — `parse_message` → `ParsedMessage::typed` (`MailHeaders`):
+  addresses, dates (jiff), MIME parameters, trace entries. This is the
+  *application* view; malformed headers degrade to `optional_field`
+  rather than failing. The grammar's `comment` rule is recursive, so `parse_headers` first
+  runs a conservative nesting pre-scan and refuses a block nested deeper
+  than `MAX_COMMENT_DEPTH` (64) with `TooDeeplyNested`: unbounded nesting
+  overflowed the stack and aborted the process (S1). A stack overflow is
+  an abort, not a panic, so no caller-side handling could contain it.
 
-The body is a raw byte slice after the blank line (`ParsedMessage::body`)
+The body is a raw byte slice after the blank line (`RawMessage::body`)
 — DKIM's `bh=` hashes exactly those bytes.
 
 ---
@@ -520,7 +595,7 @@ The body is a raw byte slice after the blank line (`ParsedMessage::body`)
 
 ## 9. Testing strategy
 
-229 tests, four layers:
+258 tests, four layers:
 
 1. **Unit** — pure logic per crate (canonicalization RFC examples, DMARC
    alignment, config resolution, SASL decoding).

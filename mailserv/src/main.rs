@@ -22,6 +22,7 @@ use authority::{RecipientResolver as _, Resolution};
 use smtp::SmtpSession;
 use spf::SpfResult;
 
+mod auth;
 mod authority;
 mod delivery;
 mod fsutil;
@@ -97,6 +98,13 @@ struct Args {
     /// --auth-users alice:secret,bob:hunter2
     #[arg(long)]
     auth_users: Option<String>,
+
+    /// Addresses each AUTH login may send as (MAIL FROM and every From:
+    /// author), as user=grant|grant entries (comma-separated); a grant is an
+    /// exact address or @domain. A login without an entry can't send.
+    /// Example: --auth-senders 'alice=alice@example.org|@example.net'
+    #[arg(long)]
+    auth_senders: Option<String>,
 
     /// DNS resolver address (DNS-over-TLS on port 853) used for SPF,
     /// DKIM key, and DMARC lookups.
@@ -188,6 +196,7 @@ struct FileConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
+    auth_senders: Option<String>,
     resolver: Option<Ipv4Addr>,
     resolver_ca: Option<String>,
     dns_connections: Option<usize>,
@@ -218,6 +227,8 @@ struct Config {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     auth_users: Option<String>,
+    /// Sender grants for AUTH logins (`auth::SenderGrants` spec).
+    auth_senders: Option<String>,
     /// DNS-over-TLS resolver address; always resolved (default 1.1.1.1).
     resolver: Ipv4Addr,
     /// Extra CA certificates (PEM file) trusted for the resolver, on top
@@ -350,6 +361,7 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         tls_cert: cli.tls_cert.or(file.tls_cert),
         tls_key: cli.tls_key.or(file.tls_key),
         auth_users: cli.auth_users.or(file.auth_users),
+        auth_senders: cli.auth_senders.or(file.auth_senders),
         resolver: cli.resolver.or(file.resolver).unwrap_or_else(|| {
             DEFAULT_RESOLVER
                 .parse()
@@ -393,6 +405,15 @@ const SPF_FAILED: &[u8] = b"550 5.7.23 SPF validation failed\r\n";
 const SPF_TEMPFAIL: &[u8] = b"451 4.4.3 Temporary SPF failure\r\n";
 /// RFC 7208 Section 8: the domain's SPF record is unusable.
 const SPF_PERMERROR: &[u8] = b"550 5.7.7 SPF policy error\r\n";
+/// RFC 5321 §4.1.1.1: the HELO/EHLO argument is not a domain or address
+/// literal (M8: it would be copied into `Received:`).
+const BAD_HELO: &[u8] = b"501 5.5.2 Invalid HELO/EHLO domain\r\n";
+/// An authenticated user's MAIL FROM is not one their login may use
+/// (`--auth-senders`; RFC 3463 5.7.1, delivery not authorized).
+const SENDER_NOT_OWNED: &[u8] = b"553 5.7.1 Sender address not owned by authenticated user\r\n";
+/// An authenticated user's message has a `From:` author their login may
+/// not use (RFC 3463 5.7.1).
+const FROM_NOT_OWNED: &[u8] = b"550 5.7.1 From address not owned by authenticated user\r\n";
 /// Malformed address in a MAIL FROM path.
 const BAD_ADDRESS: &[u8] = b"501 5.1.7 Bad sender address syntax\r\n";
 /// Malformed or unacceptable address in a RCPT TO path (RFC 3463: 5.1.3
@@ -404,6 +425,12 @@ const DNS_BUSY: &[u8] =
     b"451 4.7.0 Too many concurrent DNS checks from your address, try again later\r\n";
 /// The end-of-data DNS work (DKIM key lookups plus the DMARC policy
 /// fetch) didn't finish within [`END_OF_DATA_DNS_DEADLINE`]; retryable.
+/// The header block has a bare CR (F3, SECURITY-AUDIT.md; RFC 5322 §2.2).
+const BARE_CR_IN_HEADER: &[u8] = b"550 5.6.0 Message header contains a bare CR\r\n";
+/// The DMARC policy lookup failed (SERVFAIL, query timeout): deferred,
+/// never treated as "no policy" (F1, SECURITY-AUDIT.md).
+const DMARC_TEMPFAIL: &[u8] =
+    b"451 4.4.3 Temporary failure looking up the sender's DMARC policy, try again later\r\n";
 const EOD_DNS_TIMEOUT: &[u8] =
     b"451 4.4.3 Message checks timed out waiting for DNS, try again later\r\n";
 /// The overall time limit for end-of-data DNS work: every DKIM key lookup
@@ -495,6 +522,36 @@ fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     None
 }
 
+/// Is `h` an acceptable HELO/EHLO identity (M8, SECURITY.md)?
+///
+/// RFC 5321 §4.1.1.1: the argument is a `Domain` or an `address-literal`.
+/// It is copied into the delivered `Received:` header, so anything else —
+/// above all a bare CR or another control character, which once injected a
+/// header — is refused before it is stored. The domain form is deliberately
+/// a little liberal (underscores, a trailing dot, single-label names such
+/// as `localhost`) because misconfigured but legitimate senders use them.
+fn valid_helo(h: &str) -> bool {
+    if h.is_empty() || h.len() > 255 {
+        return false;
+    }
+    if let Some(inner) = h.strip_prefix('[') {
+        // address-literal: "[" 1*dcontent "]", dcontent = %d33-90 / %d94-126
+        // (covers IPv4, "IPv6:..." and general literals).
+        let Some(inner) = inner.strip_suffix(']') else {
+            return false;
+        };
+        return !inner.is_empty() && inner.bytes().all(|b| matches!(b, 33..=90 | 94..=126));
+    }
+    let name = h.strip_suffix('.').unwrap_or(h);
+    !name.is_empty()
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
 /// RFC 5321 `atext` plus `.`, excluding `/` (see [`unsafe_local_part`]).
 fn is_mailbox_safe(b: u8) -> bool {
     b.is_ascii_alphanumeric()
@@ -546,6 +603,16 @@ enum FromHeader {
 /// continuation lines are unfolded into the value, and the value is read
 /// as an RFC 5322 mailbox-list (see [`from_domain_of`]).
 fn from_header_domain(raw: &[u8]) -> FromHeader {
+    match single_from_value(raw) {
+        Ok(value) => from_domain_of(&value),
+        Err(problem) => problem,
+    }
+}
+
+/// The unfolded value of the message's one `From:` header, or the
+/// problem ([`FromHeader::None`] / [`FromHeader::Multiple`]). The scan
+/// rules are those of [`from_header_domain`].
+fn single_from_value(raw: &[u8]) -> Result<Vec<u8>, FromHeader> {
     // The header block ends at the first empty line.
     let end = header_block_end(raw);
     let header_block = &raw[..end];
@@ -576,10 +643,20 @@ fn from_header_domain(raw: &[u8]) -> FromHeader {
     }
 
     match from_values.len() {
-        0 => FromHeader::None,
-        1 => from_domain_of(&from_values[0]),
-        _ => FromHeader::Multiple,
+        0 => Err(FromHeader::None),
+        1 => Ok(from_values.swap_remove(0)),
+        _ => Err(FromHeader::Multiple),
     }
+}
+
+/// Whether the header block (up to the first empty line) contains a CR
+/// that is not part of a CRLF (F3, SECURITY-AUDIT.md).
+fn header_has_bare_cr(raw: &[u8]) -> bool {
+    let block = &raw[..header_block_end(raw)];
+    block
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\r' && block.get(i + 1) != Some(&b'\n'))
 }
 
 /// The offset of the first empty line in the raw message (the header
@@ -663,6 +740,31 @@ fn trim_header_fws(value: &[u8]) -> &[u8] {
 /// whose mailboxes name more than one domain is `Multiple`: RFC 7489
 /// Section 6.6.1 lets the receiver reject rather than pick one author.
 fn from_domain_of(value: &[u8]) -> FromHeader {
+    let Some(authors) = from_authors(value) else {
+        return FromHeader::Unparseable;
+    };
+    let mut domain: Option<String> = None;
+    for (_, found) in authors {
+        match &domain {
+            Some(d) if *d != found => return FromHeader::Multiple,
+            _ => domain = Some(found),
+        }
+    }
+    match domain {
+        Some(d) => FromHeader::Parsed(d),
+        None => FromHeader::Unparseable,
+    }
+}
+
+/// Every author `(local-part, domain)` of a From header value, read as an
+/// RFC 5322 mailbox-list with the rules of [`from_domain_of`]. `None` when
+/// any mailbox is unparseable or there are none.
+///
+/// The local-part comes from the cleaned value: comments are removed and
+/// quoted-string contents are blanked, so a quoted local-part never matches
+/// a real address. For the authenticated-sender check that is fail-closed:
+/// such an author is only accepted under a whole-domain grant.
+fn from_authors(value: &[u8]) -> Option<Vec<(String, String)>> {
     // Pass 1: drop comments, blank out quoted-string contents.
     let mut clean: Vec<u8> = Vec::with_capacity(value.len());
     let (mut depth, mut in_quote, mut escaped) = (0usize, false, false);
@@ -693,7 +795,7 @@ fn from_domain_of(value: &[u8]) -> FromHeader {
         }
     }
     if depth > 0 || in_quote || escaped {
-        return FromHeader::Unparseable;
+        return None;
     }
 
     // Pass 2: split into mailboxes at top-level commas (commas inside
@@ -709,36 +811,28 @@ fn from_domain_of(value: &[u8]) -> FromHeader {
                 start = i + 1;
             }
             // From is a mailbox-list: group syntax is not allowed.
-            b':' | b';' if angle == 0 => return FromHeader::Unparseable,
+            b':' | b';' if angle == 0 => return None,
             _ => {}
         }
     }
     mailboxes.push(&clean[start..]);
 
-    let mut domain: Option<String> = None;
+    let mut authors = Vec::new();
     for mailbox in mailboxes {
         let mailbox = trim_header_fws(mailbox);
         if mailbox.is_empty() {
             continue; // obs-mbox-list permits empty elements
         }
-        let Some(found) = mailbox_domain(mailbox) else {
-            return FromHeader::Unparseable;
-        };
-        match &domain {
-            Some(d) if *d != found => return FromHeader::Multiple,
-            _ => domain = Some(found),
-        }
+        authors.push(mailbox_address(mailbox)?);
     }
-    match domain {
-        Some(d) => FromHeader::Parsed(d),
-        None => FromHeader::Unparseable,
-    }
+    (!authors.is_empty()).then_some(authors)
 }
 
-/// The domain of one cleaned mailbox (comments removed, quoted strings
-/// blanked): the addr-spec inside `<...>` when present, otherwise the
-/// whole mailbox. Returns `None` unless it is a plausible domain.
-fn mailbox_domain(mailbox: &[u8]) -> Option<String> {
+/// The `(local-part, domain)` of one cleaned mailbox (comments removed,
+/// quoted strings blanked): the addr-spec inside `<...>` when present,
+/// otherwise the whole mailbox. Returns `None` unless the local-part is
+/// non-empty and the domain is plausible. The domain is lowercased.
+fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     let addr = match mailbox.iter().position(|&b| b == b'<') {
         Some(open) => {
             let rest = &mailbox[open + 1..];
@@ -757,7 +851,8 @@ fn mailbox_domain(mailbox: &[u8]) -> Option<String> {
     };
     let addr = trim_header_fws(addr);
     let at = addr.iter().rposition(|&b| b == b'@')?;
-    if at == 0 {
+    let local = trim_header_fws(&addr[..at]);
+    if local.is_empty() {
         return None; // empty local-part
     }
     let domain = trim_header_fws(&addr[at + 1..]);
@@ -770,7 +865,10 @@ fn mailbox_domain(mailbox: &[u8]) -> Option<String> {
     {
         return None;
     }
-    Some(String::from_utf8_lossy(domain).to_ascii_lowercase())
+    Some((
+        String::from_utf8_lossy(local).into_owned(),
+        String::from_utf8_lossy(domain).to_ascii_lowercase(),
+    ))
 }
 
 /// The MAIL FROM verdict for an SPF evaluation of the sender identity
@@ -930,7 +1028,7 @@ struct UserSession<'session> {
     starttls_available: bool,
     /// Accepted SASL credentials, from `--auth-users user:pass[,user:pass]`.
     #[serde(skip_serializing)]
-    auth_users: Option<Arc<HashMap<String, String>>>,
+    auth: Option<Arc<auth::AuthConfig>>,
     /// The authenticated identity for this connection, if any.
     authenticated: Option<String>,
     /// LOGIN continuation state.
@@ -986,7 +1084,7 @@ impl<'session> UserSession<'session> {
             message_count: 0,
             tls_active: false,
             starttls_available,
-            auth_users: cfg.auth_users.clone(),
+            auth: cfg.auth.clone(),
             authenticated: None,
             auth_login_user: None,
             auth_pending: None,
@@ -1088,6 +1186,12 @@ impl smtp::SmtpSession for UserSession<'_> {
     #[instrument(skip(self, arg), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     async fn helo(&mut self, ehlo: bool, arg: &str) -> smtp::Control {
         let h = arg.trim();
+        if !valid_helo(h) {
+            // Refused before it is recorded: the rejected HELO leaves the
+            // session Idle, so nothing reaches the spool or `Received:`.
+            info!(helo = ?h, "helo refused: invalid identity");
+            return smtp::Control::reject(BAD_HELO);
+        }
         self.helo = Some(h.to_string());
 
         // RFC 7208 Section 2.4: evaluate the HELO identity against the
@@ -1156,7 +1260,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         }
         // RFC 8310 Section 2: only advertise (and accept) AUTH on an
         // encrypted session — credentials must not traverse plaintext.
-        if self.tls_active && self.auth_users.is_some() {
+        if self.tls_active && self.auth.is_some() {
             reply.push_str("250-AUTH PLAIN LOGIN\r\n");
         }
         reply.push_str("250 HELP\r\n");
@@ -1200,7 +1304,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         if self.authenticated.is_some() {
             return smtp::Control::reject(b"503 5.5.1 Already authenticated\r\n");
         }
-        let Some(users) = self.auth_users.clone() else {
+        let Some(users) = self.auth.clone() else {
             return smtp::Control::reject(b"502 5.5.1 Authentication not supported\r\n");
         };
 
@@ -1214,7 +1318,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                     .as_deref()
                     .and_then(smtp::decode_plain)
                 {
-                    Some((user, pass)) => self.verify_credentials(&users, &user, &pass),
+                    Some((user, pass)) => self.verify_credentials(&users.credentials, &user, &pass),
                     None => smtp::Control::reject(b"501 5.5.2 Invalid base64 data\r\n"),
                 }
             }
@@ -1241,18 +1345,18 @@ impl smtp::SmtpSession for UserSession<'_> {
         let Some(data) = smtp::decode_b64(line) else {
             return smtp::Control::reject(b"501 5.5.2 Invalid base64 data\r\n");
         };
-        let Some(users) = self.auth_users.clone() else {
+        let Some(users) = self.auth.clone() else {
             return smtp::Control::reject(b"502 5.5.1 Authentication not supported\r\n");
         };
         match self.auth_pending.take() {
             Some("PLAIN") => match smtp::decode_plain(&data) {
-                Some((user, pass)) => self.verify_credentials(&users, &user, &pass),
+                Some((user, pass)) => self.verify_credentials(&users.credentials, &user, &pass),
                 None => smtp::Control::reject(b"501 5.5.2 Invalid PLAIN response\r\n"),
             },
             Some("LOGIN") => {
                 if let Some(user) = self.auth_login_user.take() {
                     let pass = String::from_utf8_lossy(&data).into_owned();
-                    self.verify_credentials(&users, &user, &pass)
+                    self.verify_credentials(&users.credentials, &user, &pass)
                 } else {
                     self.auth_login_user = Some(String::from_utf8_lossy(&data).into_owned());
                     self.auth_pending = Some("LOGIN");
@@ -1303,9 +1407,24 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         // An authenticated submission (MUA -> MSA) is not subject to SPF:
         // the client's IP is the user's home network, which the sender
-        // domain's SPF record will not authorize. Envelope policy for
-        // authenticated users is the user's business (still logged).
-        if self.authenticated.is_some() {
+        // domain's SPF record will not authorize. That skip is only safe
+        // because the authenticated identity must own the address: it is
+        // checked against the login's `--auth-senders` grants first, and
+        // the null sender is refused (an MUA never sends a bounce). Being
+        // authenticated never means "may use any sender".
+        if let Some(user) = self.authenticated.as_deref() {
+            let permitted = match (auth::split_address(&addr), self.auth.as_deref()) {
+                (Some((local, domain)), Some(auth)) => auth.senders.permits(user, local, domain),
+                _ => false,
+            };
+            if !permitted {
+                warn!(
+                    auth_user = %user,
+                    mail_from = %addr,
+                    "authenticated sender refused: address not granted to this user"
+                );
+                return smtp::Control::reject(SENDER_NOT_OWNED);
+            }
             self.spf_result = None;
             info!(
                 auth_user = self.authenticated.as_deref().unwrap_or("?"),
@@ -1579,6 +1698,20 @@ impl smtp::SmtpSession for UserSession<'_> {
         // line endings exactly as the client sent them.
         let raw = self.data.clone();
 
+        // F3 (SECURITY-AUDIT.md): a CR not followed by LF is never valid in
+        // an RFC 5322 header block, and readers disagree on it. This
+        // server's scanner treats it as ordinary text, while others
+        // (Python's `email`, many webmail pipelines) treat it as a line
+        // break, so `Subject: x\rFrom: ceo@victim` would hide a second
+        // From from the DMARC check while a mail reader shows it. Refuse
+        // the message before any other work. The body is not checked.
+        if header_has_bare_cr(&raw) {
+            warn!("message refused: bare CR in the header block");
+            self.clear_envelope();
+            self.message_count += 1;
+            return smtp::Control::reject(BARE_CR_IN_HEADER);
+        }
+
         // DKIM key lookups and the DMARC policy fetch hold one of this
         // source IP's DNS permits (DESIGN §6.1). If none frees up in
         // time, the message is refused *temporarily*: skipping the checks
@@ -1622,10 +1755,12 @@ impl smtp::SmtpSession for UserSession<'_> {
 
         // DMARC (RFC 7489): evaluate the From-header domain against the
         // SPF and DKIM results, and apply the published policy. Authenticated
-        // submissions (our own MSA users) are exempt from rejection — they
-        // already passed local authentication; their mail is logged but
-        // trusted (an MSA that rejects its own users' mail on DMARC would
-        // reject legitimate submissions from networks no SPF record covers).
+        // submissions (our own MSA users) are exempt from rejection: an MSA
+        // that rejected its own users' mail on DMARC would reject legitimate
+        // submissions from networks no SPF record covers. The exemption is
+        // conditional by construction: an authenticated message only gets
+        // here once its MAIL FROM and every From author passed the login's
+        // `--auth-senders` grants (above and in `mail_from`).
         //
         // C4 (security report): the From domain is extracted from the raw
         // header bytes, never from the typed parser — a duplicate `From:`,
@@ -1647,26 +1782,68 @@ impl smtp::SmtpSession for UserSession<'_> {
                 );
             }
         };
+
+        // An authenticated session is exempt from DMARC rejection below,
+        // which is only safe because every From author must be an address
+        // the login owns (`--auth-senders`). Checked on the same tolerant
+        // raw scan DMARC uses, so the author checked is the one a mail
+        // client displays.
+        if let Some(user) = self.authenticated.as_deref() {
+            let authors = single_from_value(&raw)
+                .ok()
+                .and_then(|value| from_authors(&value));
+            let permitted = match (&authors, self.auth.as_deref()) {
+                (Some(authors), Some(auth)) => authors
+                    .iter()
+                    .all(|(local, domain)| auth.senders.permits(user, local, domain)),
+                _ => false,
+            };
+            if !permitted {
+                warn!(
+                    auth_user = %user,
+                    from_authors = ?authors,
+                    "authenticated message refused: From author not granted to this user"
+                );
+                self.clear_envelope();
+                self.message_count += 1;
+                return smtp::Control::reject(FROM_NOT_OWNED);
+            }
+        }
         let mut dmarc_summary: Option<DmarcSummary> = None;
 
         if let Some(from_domain) = from_domain {
             let resolver = spf::DotResolver::shared(self.dns.clone());
-            let record = match timeout_at(
-                dns_deadline,
-                dmarc::fetch_policy(&resolver, &from_domain),
-            )
-            .await
+            let found = match timeout_at(dns_deadline, dmarc::fetch_policy(&resolver, &from_domain))
+                .await
             {
                 Err(_) => return self.eod_dns_timed_out("dmarc"),
-                Ok(Ok(Some(record))) => Some(record),
-                Ok(Ok(None)) => None,
-                Ok(Err(e)) => {
-                    info!(from_domain = %from_domain, error = %e, "dmarc lookup failed");
+                Ok(Ok(found)) => found,
+                // RFC 7489 §6.6.3: several records at one name means DMARC
+                // is not applied. The domain owner's misconfiguration, so
+                // loud, but not a reason to defer.
+                Ok(Err(dmarc::DmarcError::MultipleRecords)) => {
+                    warn!(from_domain = %from_domain, "multiple DMARC records; DMARC not applied");
                     None
+                }
+                // F1 (SECURITY-AUDIT.md): a failed lookup (SERVFAIL, query
+                // timeout) used to count as "no policy", so a spoof of a
+                // p=reject domain was delivered whenever its policy couldn't
+                // be fetched — which an attacker can provoke by loading the
+                // shared resolver. Fail closed: defer, the sender retries.
+                Ok(Err(e)) => {
+                    warn!(
+                        from_domain = %from_domain,
+                        error = %e,
+                        "dmarc policy lookup failed; temporary failure"
+                    );
+                    self.clear_envelope();
+                    self.message_count += 1;
+                    return smtp::Control::tempfail(DMARC_TEMPFAIL);
                 }
             };
 
-            if let Some(record) = record {
+            if let Some(found) = found {
+                let record = &found.record;
                 let spf_passed = matches!(self.spf_result, Some(SpfResult::Pass));
                 let spf_domain = self.mail_from.as_deref().and_then(path_domain);
                 // C3 (security report): DMARC consumes ONLY this
@@ -1680,12 +1857,14 @@ impl smtp::SmtpSession for UserSession<'_> {
                     .collect();
 
                 let evaluation = dmarc::evaluate(
-                    &record,
+                    record,
                     spf_domain.map(|d| (d, spf_passed)),
                     &dkim,
                     &from_domain,
                 );
-                let policy = record.policy_for(&from_domain, &from_domain);
+                // `sp=` governs a subdomain whose record was inherited
+                // from an ancestor (RFC 7489 §6.3; M4).
+                let policy = found.policy_for(&from_domain);
                 let action = dmarc::apply(&evaluation, policy);
 
                 let summary = DmarcSummary {
@@ -1907,19 +2086,32 @@ async fn main() -> Result<()> {
         None => dns_client,
     });
 
-    let auth_users = match &config.auth_users {
+    let auth = match &config.auth_users {
         Some(spec) if !spec.is_empty() => {
-            let mut map = HashMap::new();
-            for pair in spec.split(',') {
-                let Some((user, pass)) = pair.split_once(':') else {
-                    anyhow::bail!("--auth-users entries must be user:password, got {pair:?}");
-                };
-                map.insert(user.trim().to_string(), pass.to_string());
+            let auth = auth::AuthConfig::parse(spec, config.auth_senders.as_deref())?;
+            info!(
+                "AUTH PLAIN/LOGIN available ({} user(s))",
+                auth.credentials.len()
+            );
+            let unable = auth.users_without_grants();
+            if !unable.is_empty() {
+                warn!(
+                    users = ?unable,
+                    "AUTH users without --auth-senders grants can authenticate but not send"
+                );
             }
-            info!("AUTH PLAIN/LOGIN available ({} user(s))", map.len());
-            Some(Arc::new(map))
+            Some(Arc::new(auth))
         }
-        _ => None,
+        _ => {
+            if config
+                .auth_senders
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            {
+                anyhow::bail!("--auth-senders needs --auth-users");
+            }
+            None
+        }
     };
 
     let mut local_domains: HashSet<String> = match &config.local_domains {
@@ -2131,6 +2323,7 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        let peer = canonical_peer(peer);
 
         let ip = peer.ip();
 
@@ -2164,7 +2357,7 @@ async fn main() -> Result<()> {
         let session_cfg = SessionConfig {
             domain: config.domain.clone(),
             max_data: config.max_data_bytes,
-            auth_users: auth_users.clone(),
+            auth: auth.clone(),
             authority: authority.clone(),
             dns: dns_client.clone(),
             dns_limit: dns_limit.clone(),
@@ -2311,7 +2504,7 @@ async fn refuse(stream: TcpStream, reply: &[u8]) {
 struct SessionConfig {
     domain: String,
     max_data: usize,
-    auth_users: Option<Arc<HashMap<String, String>>>,
+    auth: Option<Arc<auth::AuthConfig>>,
     /// Recipient authority: hosted domains, policy modes, and the
     /// address-to-mailbox mapping (Phase 12 gap 1).
     authority: Arc<dyn authority::RecipientResolver>,
@@ -2332,6 +2525,15 @@ struct SessionConfig {
     sink: Option<Arc<dyn delivery::DeliverySink>>,
 }
 
+/// The peer address with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
+/// what a dual-stack `[::]` listener reports for IPv4 clients) turned back
+/// into plain IPv4 (N19, SECURITY.md). Without this, SPF `ip4:`/`a`/`mx`
+/// never match IPv4 senders, and an IPv4 client's per-IP limits, logs and
+/// `Received:` show the mapped form.
+fn canonical_peer(peer: SocketAddr) -> SocketAddr {
+    SocketAddr::new(peer.ip().to_canonical(), peer.port())
+}
+
 /// Serve one connection, including a possible STARTTLS upgrade: the
 /// protocol loop runs over the plaintext stream, pauses for the TLS
 /// handshake when the policy upgrades, and resumes over the TLS stream.
@@ -2341,7 +2543,7 @@ async fn handle_connection(
     max_read_ms: u64,
     cfg: SessionConfig,
 ) -> Result<()> {
-    let peer = stream.peer_addr()?;
+    let peer = canonical_peer(stream.peer_addr()?);
     let mut session = UserSession::new(peer, acceptor.is_some(), &cfg);
     let mut session_state = smtp::SessionState::default();
     let mut stream = BufReader::new(stream);
@@ -2740,7 +2942,7 @@ mod tests {
         let cfg = SessionConfig {
             domain: "mail.test".to_string(),
             max_data: 1024 * 1024,
-            auth_users: None,
+            auth: None,
             authority: Arc::new(authority::StaticAuthority::new(vec![
                 "mail.test".to_string()
             ])),
@@ -2961,7 +3163,7 @@ mod tests {
     /// local-part at a hosted domain accepts).
     async fn spawn_server(
         acceptor: Option<Arc<TlsAcceptor>>,
-        auth_users: Option<Arc<HashMap<String, String>>>,
+        auth: Option<Arc<auth::AuthConfig>>,
         local_domains: Option<Vec<String>>,
         spool: Option<Arc<dyn spool::SpoolWriter>>,
         sink: Option<Arc<dyn delivery::DeliverySink>>,
@@ -2988,7 +3190,7 @@ mod tests {
                     SessionConfig {
                         domain: "mail.example.org".to_string(),
                         max_data: 1024 * 1024,
-                        auth_users,
+                        auth,
                         authority,
                         // The integration tests exercise the real resolver
                         // path: the sender domains used below
@@ -3159,17 +3361,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut users = HashMap::new();
-        users.insert("alice".to_string(), "secret".to_string());
-        let addr = spawn_server(
-            Some(acceptor),
-            Some(Arc::new(users)),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
+        let auth =
+            auth::AuthConfig::parse("alice:secret", Some("alice=alice@spfless-domain-xyz.test"))
+                .unwrap();
+        let addr = spawn_server(Some(acceptor), Some(Arc::new(auth)), None, None, None, None).await;
 
         // --- Plaintext: AUTH is neither advertised nor accepted.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -3248,10 +3443,48 @@ mod tests {
             "503 5.5.1 Already authenticated\r\n"
         );
 
+        // From validation: an authenticated user may only use the
+        // addresses granted to their login. A spoofed envelope sender and
+        // the null sender are refused, and nothing is recorded.
+        for spoof in [
+            &b"MAIL FROM:<ceo@victim.example>\r\n"[..],
+            b"MAIL FROM:<bob@spfless-domain-xyz.test>\r\n",
+            b"MAIL FROM:<>\r\n",
+        ] {
+            client.write_all(spoof).await.unwrap();
+            assert_eq!(
+                read_reply(&mut client).await[0],
+                "553 5.7.1 Sender address not owned by authenticated user\r\n"
+            );
+        }
+
+        // A granted envelope sender with a spoofed From header: refused at
+        // end-of-data, and the next transaction starts clean.
+        client
+            .write_all(b"MAIL FROM:<alice@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client
+            .write_all(b"RCPT TO:<user@example.org>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+        client.write_all(b"DATA\r\n").await.unwrap();
+        read_reply(&mut client).await;
+        client
+            .write_all(b"From: CEO <ceo@victim.example>\r\n\r\nwire the money\r\n.\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "550 5.7.1 From address not owned by authenticated user\r\n"
+        );
+
         // Authenticated sender: SPF is skipped (the MUA's home IP is not
         // authorized by the sender domain's SPF record).
         client
-            .write_all(b"MAIL FROM:<alice@spfless-domain-xyz.test>\r\n")
+            .write_all(b"MAIL FROM:<Alice@SPFLESS-domain-xyz.test>\r\n")
             .await
             .unwrap();
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
@@ -3745,6 +3978,12 @@ mod tests {
     /// `_dmarc.*` TXT query is answered `v=DMARC1; p=reject`, everything
     /// else with an empty NOERROR answer. Returns a client wired to it.
     async fn spawn_mock_dmarc_resolver() -> Arc<dns::DnsClient> {
+        spawn_mock_dmarc_resolver_with(0).await
+    }
+
+    /// Like [`spawn_mock_dmarc_resolver`], but `_dmarc.*` TXT queries get
+    /// `dmarc_rcode` (e.g. 2, SERVFAIL) with no answer when it is non-zero.
+    async fn spawn_mock_dmarc_resolver_with(dmarc_rcode: u8) -> Arc<dns::DnsClient> {
         use dns::proto::{DnsMessage, DnsResourceRecord, QType};
         use tokio::io::AsyncReadExt as _;
         use tokio_rustls::rustls::pki_types::PrivateKeyDer;
@@ -3779,14 +4018,18 @@ mod tests {
                         resp.header.qr = 1;
                         if let Some(q) = query.questions.first() {
                             if String::from(&q.name).starts_with("_dmarc.") && q.record_type == 16 {
-                                resp.answers.push(DnsResourceRecord {
-                                    name: q.name.clone(),
-                                    record_type: 16,
-                                    record_class: 1,
-                                    ttl: 60,
-                                    rdlength: 0,
-                                    rdata: QType::TXT("v=DMARC1; p=reject".to_string()),
-                                });
+                                if dmarc_rcode != 0 {
+                                    resp.header.rcode = dmarc_rcode;
+                                } else {
+                                    resp.answers.push(DnsResourceRecord {
+                                        name: q.name.clone(),
+                                        record_type: 16,
+                                        record_class: 1,
+                                        ttl: 60,
+                                        rdlength: 0,
+                                        rdata: QType::TXT("v=DMARC1; p=reject".to_string()),
+                                    });
+                                }
                             }
                         }
                         let bytes = resp.to_vec().unwrap();
@@ -3866,7 +4109,7 @@ mod tests {
     /// (`small.example`, 2 KiB) and one without a limit (`big.example`),
     /// under a 1 MiB server limit. No DNS is used: SPF is skipped because
     /// the tests set the envelope sender directly.
-    fn size_limit_session(dir: &std::path::Path) -> SessionConfig {
+    pub(super) fn size_limit_session(dir: &std::path::Path) -> SessionConfig {
         let path = dir.join("authority.json");
         std::fs::write(
             &path,
@@ -3887,7 +4130,7 @@ mod tests {
         SessionConfig {
             domain: "mail.test".to_string(),
             max_data: 1024 * 1024,
-            auth_users: None,
+            auth: None,
             authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
             dns: Arc::new(dns::DnsClient::with_timeout(
                 "127.0.0.1".parse().unwrap(),
@@ -4024,7 +4267,7 @@ mod tests {
         let cfg = SessionConfig {
             domain: "mail.test".to_string(),
             max_data: 1024 * 1024,
-            auth_users: None,
+            auth: None,
             authority: Arc::new(authority::StaticAuthority::new(vec![
                 "mail.test".to_string()
             ])),
@@ -4093,7 +4336,7 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
         let cfg = SessionConfig {
             domain: "mail.test".to_string(),
             max_data: 1024 * 1024,
-            auth_users: None,
+            auth: None,
             authority: Arc::new(authority::StaticAuthority::new(vec![
                 "mail.test".to_string()
             ])),
@@ -4133,6 +4376,37 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
             Some(false),
             "the stale verified verdict must not count for alignment"
         );
+    }
+
+    /// F1 (SECURITY-AUDIT.md): when the DMARC policy can't be fetched
+    /// (SERVFAIL), an unsigned spoof is deferred with 451, never delivered
+    /// as if the domain published no policy.
+    #[tokio::test]
+    async fn dmarc_lookup_failure_defers_instead_of_delivering() {
+        let cfg = SessionConfig {
+            domain: "mail.test".to_string(),
+            max_data: 1024 * 1024,
+            auth: None,
+            authority: Arc::new(authority::StaticAuthority::new(vec![
+                "mail.test".to_string()
+            ])),
+            dns: spawn_mock_dmarc_resolver_with(2).await,
+            dns_limit: Arc::new(limit::DnsLimiter::new(
+                limit::DEFAULT_DNS_PER_IP,
+                limit::DNS_LIMIT_WAIT,
+            )),
+            eod_dns_deadline: END_OF_DATA_DNS_DEADLINE,
+            shutdown: no_shutdown(),
+            spool: None,
+            sink: None,
+        };
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        session.mail_from = Some("x@attacker.example".into());
+        session.data = b"From: ceo@victim.example\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
+        let control = session.end_data().await;
+        assert_eq!(control, smtp::Control::tempfail(DMARC_TEMPFAIL));
+        assert_eq!(session.mail_from, None, "the transaction is over");
+        assert_eq!(session.message_count, 1);
     }
 
     /// Grace mode: an address expired within the grace window still
@@ -4187,5 +4461,250 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
             "550 5.1.1 No such mailbox\r\n"
         );
         client.write_all(b"QUIT\r\n").await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod helo_and_peer_tests {
+    use super::*;
+
+    /// M8 (SECURITY.md): the HELO identity must be a domain or an address
+    /// literal; control characters (the bare-CR `Received:` injection),
+    /// whitespace and other junk are refused.
+    #[test]
+    fn helo_validation() {
+        for ok in [
+            "mail.example.org",
+            "mail.example.org.",
+            "localhost",
+            "host_name.example",
+            "a-b.example",
+            "[192.0.2.1]",
+            "[IPv6:2001:db8::1]",
+        ] {
+            assert!(valid_helo(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "evil.example\rX-Injected: yes",
+            "evil.example\nX-Injected: yes",
+            "evil.example\x00",
+            "two words",
+            "a..b",
+            ".",
+            "[]",
+            "[192.0.2.1",
+            "[a]b]",
+            "[a\\b]",
+            "caf\u{e9}.example",
+            "x(y).example",
+            &format!("{}.example", "a".repeat(64)),
+            &"a.".repeat(130),
+        ] {
+            assert!(!valid_helo(bad), "{bad:?} should be refused");
+        }
+    }
+
+    /// A refused HELO is rejected with 501 before it is recorded — and
+    /// before any SPF lookup, so this needs no DNS.
+    #[tokio::test]
+    async fn invalid_helo_is_rejected_and_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tests::size_limit_session(dir.path());
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        let state = smtp::SmtpState::Idle;
+        let (reply, next) = session
+            .handler(&state, b"EHLO evil.example\rX-Injected: yes\r\n")
+            .await;
+        assert_eq!(reply, BAD_HELO);
+        assert_eq!(next, smtp::SmtpState::Idle);
+        assert_eq!(session.helo, None);
+    }
+
+    /// N19 (SECURITY.md): an IPv4 client on a dual-stack listener is seen
+    /// as plain IPv4; real IPv6 peers are untouched.
+    #[test]
+    fn mapped_peers_are_canonical() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.7]:2525".parse().unwrap();
+        assert_eq!(canonical_peer(mapped), "192.0.2.7:2525".parse().unwrap());
+        let v6: SocketAddr = "[2001:db8::7]:25".parse().unwrap();
+        assert_eq!(canonical_peer(v6), v6);
+        let v4: SocketAddr = "192.0.2.7:25".parse().unwrap();
+        assert_eq!(canonical_peer(v4), v4);
+    }
+}
+
+#[cfg(test)]
+mod from_validation_tests {
+    use super::*;
+
+    fn authors(value: &str) -> Option<Vec<(String, String)>> {
+        from_authors(value.as_bytes())
+    }
+
+    /// The author addresses are the ones a mail client displays: comments
+    /// and display names never supply them, every mailbox in the list is
+    /// returned, and groups are refused.
+    #[test]
+    fn from_authors_extracts_displayed_addresses() {
+        let own = |l: &str, d: &str| (l.to_string(), d.to_string());
+        assert_eq!(
+            authors("Alice <Alice@Example.ORG.>"),
+            Some(vec![own("Alice", "example.org")])
+        );
+        assert_eq!(
+            authors("\"ceo@victim.example\" (ceo@victim.example) <a@b.example>"),
+            Some(vec![own("a", "b.example")])
+        );
+        assert_eq!(
+            authors("a@b.example, Mallory <m@evil.example>"),
+            Some(vec![own("a", "b.example"), own("m", "evil.example")])
+        );
+        // A quoted local-part is blanked, so it can't match an exact grant.
+        assert_eq!(
+            authors("\"alice\"@b.example"),
+            Some(vec![own("\"xxxxx\"", "b.example")])
+        );
+        assert_eq!(authors("undisclosed: a@b.example;"), None);
+        assert_eq!(authors("no address here"), None);
+        assert_eq!(authors(""), None);
+    }
+
+    fn session_cfg(dir: &std::path::Path) -> SessionConfig {
+        let mut cfg = tests::size_limit_session(dir);
+        cfg.auth = Some(Arc::new(
+            auth::AuthConfig::parse(
+                "alice:pw,carol:pw",
+                Some("alice=alice@example.org|@alice.example"),
+            )
+            .unwrap(),
+        ));
+        cfg
+    }
+
+    /// MAIL FROM of an authenticated session is limited to the login's
+    /// grants; the null sender and logins without grants are refused.
+    /// Refusals happen before any DNS.
+    #[tokio::test]
+    async fn authenticated_mail_from_must_be_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg(dir.path());
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+        s.authenticated = Some("alice".into());
+        for refused in [
+            "<ceo@victim.example>",
+            "<bob@example.org>",
+            "<alice@sub.alice.example>",
+            "<>",
+        ] {
+            assert_eq!(
+                s.mail_from(refused).await.into_reply(),
+                SENDER_NOT_OWNED,
+                "{refused}"
+            );
+            assert_eq!(s.mail_from, None);
+        }
+        assert!(s.mail_from("<ALICE@example.org>").await.is_accept());
+        s.clear_envelope();
+        assert!(s
+            .mail_from("<anything@alice.example> SIZE=10")
+            .await
+            .is_accept());
+        s.clear_envelope();
+
+        // carol can authenticate but has no grants: fail closed.
+        s.authenticated = Some("carol".into());
+        assert_eq!(
+            s.mail_from("<carol@example.org>").await.into_reply(),
+            SENDER_NOT_OWNED
+        );
+    }
+
+    /// Every From author of an authenticated message must be granted, even
+    /// when the envelope sender is; the refused transaction is cleared.
+    #[tokio::test]
+    async fn authenticated_from_authors_must_be_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg(dir.path());
+        // Authors spanning several domains, and group syntax, are already
+        // refused by the RFC 7489 malformed-From check, before this one.
+        let malformed: &[u8] = b"550 5.7.1 Message rejected: missing or malformed From header\r\n";
+        for (from, expected) in [
+            ("From: CEO <ceo@victim.example>", FROM_NOT_OWNED),
+            (
+                "From: \"alice@example.org\" <ceo@victim.example>",
+                FROM_NOT_OWNED,
+            ),
+            ("From: alice@example.org, bob@example.org", FROM_NOT_OWNED),
+            ("From: alice@example.org, ceo@victim.example", malformed),
+            ("From: undisclosed:;", malformed),
+        ] {
+            let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+            s.authenticated = Some("alice".into());
+            assert!(s.mail_from("<alice@example.org>").await.is_accept());
+            assert!(s.rcpt_to("<a@small.example>").await.is_accept());
+            for line in [format!("{from}\r\n"), "\r\n".into(), "body\r\n".into()] {
+                assert!(matches!(
+                    s.recv_data(line.as_bytes()).await,
+                    smtp::DataControl::Continue
+                ));
+            }
+            let reply = s.end_data().await.into_reply();
+            assert_eq!(reply, expected, "{from}");
+            assert_eq!(s.mail_from, None, "transaction cleared");
+            assert!(s.rcpt_to.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod bare_cr_tests {
+    use super::*;
+
+    /// F3 (SECURITY-AUDIT.md): the confirmed attack shape and its
+    /// variants are detected; CRLF, bare LF, and CRs in the body are not.
+    #[test]
+    fn bare_cr_in_header_block_is_detected() {
+        for bad in [
+            &b"Subject: x\rFrom: CEO <ceo@victim.example>\r\nFrom: a@evil.example\r\n\r\nbody"[..],
+            b"From: a@evil.example\rFrom: ceo@victim.example\r\n\r\nbody",
+            b"X-A: 1\r\r\nFrom: a@b.example\r\n\r\nbody",
+            b"From: a@b.example\r\n\tfolded\rFrom: c@d.example\r\n\r\nbody",
+        ] {
+            assert!(
+                header_has_bare_cr(bad),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        for ok in [
+            &b"From: a@b.example\r\nSubject: x\r\n\r\nbody\rwith bare CR\r\n"[..],
+            b"From: a@b.example\nSubject: x\n\nbody\n",
+            b"From: a@b.example\r\n\r\n",
+        ] {
+            assert!(!header_has_bare_cr(ok), "{:?}", String::from_utf8_lossy(ok));
+        }
+    }
+
+    /// The message is refused at end-of-data with 550 before any DNS
+    /// work, and the transaction is cleared.
+    #[tokio::test]
+    async fn bare_cr_message_is_refused_before_dns() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tests::size_limit_session(dir.path());
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.mail_from = Some("a@evil.example".into());
+        s.data =
+            b"Subject: x\rFrom: CEO <ceo@victim.example>\r\nFrom: a@evil.example\r\n\r\nbody\r\n"
+                .to_vec();
+        assert_eq!(s.end_data().await.into_reply(), BARE_CR_IN_HEADER);
+        assert_eq!(s.mail_from, None);
+        assert!(s.data.is_empty());
+        assert_eq!(
+            cfg.dns.stats().queries,
+            0,
+            "no DNS work for a refused message"
+        );
     }
 }

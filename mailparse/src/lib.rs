@@ -60,6 +60,57 @@ pub enum MailHeaderError {
     /// ([`split_message`] + [`extract_raw_headers`]) instead.
     #[error("Header block is not valid UTF-8")]
     InvalidUtf8,
+
+    /// The header block nests comments deeper than
+    /// [`MAX_COMMENT_DEPTH`]. The typed parse is refused rather than
+    /// attempted: the grammar's `comment` rule is recursive, and unbounded
+    /// nesting would overflow the stack and abort the process (S1,
+    /// SECURITY.md). The raw view ([`parse_raw_message`]) is unaffected.
+    #[error("Header comments nested too deeply")]
+    TooDeeplyNested,
+}
+
+/// The deepest comment nesting the typed parse accepts (S1, SECURITY.md).
+///
+/// Real mail nests comments at most two or three levels deep. Each level
+/// costs several recursive pest frames, so the bound keeps the parse far
+/// below a 2 MiB thread stack (a tokio worker's default) even in debug
+/// builds; `deep_nesting_is_refused_not_overflowed` pins that.
+pub const MAX_COMMENT_DEPTH: usize = 64;
+
+/// Does `src` possibly nest comments deeper than `limit`?
+///
+/// A cheap, conservative pre-scan run before the pest parse: the depth it
+/// computes is never below the depth the grammar could reach, so a `false`
+/// here guarantees the recursive `comment` rule stays within `limit`.
+///
+/// - Every `(` counts and every `)` decrements (saturating), whether or
+///   not it sits in a quoted string or an unstructured header, which can
+///   only over-count.
+/// - A `\` skips the next byte, matching `quoted_pair` (the only grammar
+///   rule that consumes a backslash where a comment can follow). Without
+///   that skip, `\)` would undercount and hide real nesting.
+/// - Depth is never reset at line ends: the grammar's `ctext` admits CR
+///   and LF, so one comment can run across several header lines.
+fn comment_depth_exceeds(src: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut bytes = src.iter();
+    while let Some(&b) = bytes.next() {
+        match b {
+            b'\\' => {
+                bytes.next();
+            }
+            b'(' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -134,12 +185,50 @@ pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage<'_>, MailHeaderError> {
     })
 }
 
+/// A message split into its raw headers and body, with no typed parse.
+///
+/// This is the view for security checks on untrusted bytes (DKIM
+/// canonicalization, header scanning): it is built by iterative byte
+/// scanning only, so it never runs the recursive pest grammar, accepts
+/// non-UTF-8 header bytes, and cannot fail on header syntax (S1 and N11,
+/// SECURITY.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawMessage<'m> {
+    /// All headers in their original order, duplicates preserved.
+    pub headers: Vec<RawHeader<'m>>,
+    /// Raw body bytes: everything after the blank line separating headers
+    /// from the body. Line terminators are preserved verbatim.
+    pub body: &'m [u8],
+}
+
+/// Split a message into a [`RawMessage`]: byte-exact headers and the body,
+/// with no typed parse. Fails only when there is no header/body separator.
+///
+/// ```
+/// let raw = b"From: Alice <alice@example.com>\r\nSubject: \xff\r\n\r\nHello\r\n";
+/// let msg = mailparse::parse_raw_message(raw).unwrap();
+/// assert_eq!(msg.headers.len(), 2);
+/// assert_eq!(msg.body, b"Hello\r\n");
+/// ```
+pub fn parse_raw_message(raw: &[u8]) -> Result<RawMessage<'_>, MailHeaderError> {
+    let (header_block, body) = split_message(raw)?;
+    Ok(RawMessage {
+        headers: extract_raw_headers(header_block),
+        body,
+    })
+}
+
 /// Parse a header block (each header terminated by CRLF or LF) into the
 /// typed [`MailHeaders`] view.
 ///
 /// Lenient: unknown or malformed headers fall back to `optional_field` or are
-/// skipped, so a best-effort typed view is returned for most inputs.
+/// skipped, so a best-effort typed view is returned for most inputs. A block
+/// that nests comments deeper than [`MAX_COMMENT_DEPTH`] is refused with
+/// [`MailHeaderError::TooDeeplyNested`] before the grammar runs.
 pub fn parse_headers(src: &str) -> Result<MailHeaders<'_>, MailHeaderError> {
+    if comment_depth_exceeds(src.as_bytes(), MAX_COMMENT_DEPTH) {
+        return Err(MailHeaderError::TooDeeplyNested);
+    }
     let pairs = MailParser::parse(Rule::fields, src).map_err(|_| MailHeaderError::InvalidHeader)?;
     pairs.try_into()
 }
@@ -1626,5 +1715,100 @@ VGVzdA==
 
         // No separator
         assert!(split_message(b"A: 1\r\nB: 2\r\n").is_err());
+    }
+
+    /// `n` comments nested inside each other, e.g. `((()))` for 3.
+    fn nested(n: usize) -> String {
+        format!("{}{}", "(".repeat(n), ")".repeat(n))
+    }
+
+    /// Run `f` on a thread with a 2 MiB stack — the size of a tokio
+    /// worker's — so an overflow would show up here as an abort.
+    fn on_worker_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// S1 (SECURITY.md): deeply nested comments in a parsed header used to
+    /// overflow the stack and abort the whole process. They are now
+    /// refused before the grammar runs; the raw view still works.
+    #[test]
+    fn deep_nesting_is_refused_not_overflowed() {
+        for header in ["Received", "From", "To", "Message-ID"] {
+            for depth in [MAX_COMMENT_DEPTH + 1, 1_000, 100_000] {
+                let msg = format!(
+                    "{header}: {}a@b\r\nSubject: x\r\n\r\nbody\r\n",
+                    nested(depth)
+                );
+                let (typed, raw) = on_worker_stack(move || {
+                    let typed = parse_message(msg.as_bytes()).map(|_| ());
+                    let raw = parse_raw_message(msg.as_bytes()).map(|m| m.headers.len());
+                    (typed, raw)
+                });
+                assert!(
+                    matches!(typed, Err(MailHeaderError::TooDeeplyNested)),
+                    "{header} at depth {depth}: {typed:?}"
+                );
+                assert_eq!(raw.unwrap(), 2, "raw view unaffected");
+            }
+        }
+    }
+
+    /// Nesting folded across lines (the grammar's `ctext` admits CR/LF, so
+    /// a comment can span lines) is counted across the whole block.
+    #[test]
+    fn deep_nesting_across_lines_is_refused() {
+        let folded = "(\r\n ".repeat(10_000);
+        let msg = format!("From: {folded}{}a@b\r\n\r\n", ")".repeat(10_000));
+        let r = on_worker_stack(move || parse_message(msg.as_bytes()).map(|_| ()));
+        assert!(matches!(r, Err(MailHeaderError::TooDeeplyNested)));
+    }
+
+    /// Escaped parentheses can't hide real nesting from the pre-scan:
+    /// in `(\)` the `\)` is a quoted-pair, not a close.
+    #[test]
+    fn escaped_parens_do_not_hide_nesting() {
+        let evasive = "(\\)".repeat(10_000);
+        assert!(comment_depth_exceeds(evasive.as_bytes(), MAX_COMMENT_DEPTH));
+        let msg = format!("From: {evasive}{}a@b\r\n\r\n", ")".repeat(10_000));
+        let r = on_worker_stack(move || parse_message(msg.as_bytes()).map(|_| ()));
+        assert!(matches!(r, Err(MailHeaderError::TooDeeplyNested)));
+    }
+
+    /// Nesting up to the bound still parses, on a worker-sized stack, in
+    /// whatever build profile the tests run under.
+    #[test]
+    fn nesting_at_the_bound_parses() {
+        for header in ["Received", "From"] {
+            let msg = format!(
+                "{header}: {}a@b\r\nSubject: x\r\n\r\nbody\r\n",
+                nested(MAX_COMMENT_DEPTH)
+            );
+            let r = on_worker_stack(move || parse_message(msg.as_bytes()).map(|_| ()));
+            assert!(
+                !matches!(r, Err(MailHeaderError::TooDeeplyNested)),
+                "{header}: {r:?}"
+            );
+        }
+        // Ordinary comments are untouched.
+        let msg = b"From: Alice (the (real) one) <alice@example.com>\r\n\r\n";
+        let parsed = parse_message(msg).unwrap();
+        assert_eq!(parsed.typed.from.as_ref().unwrap()[0].local_part, "alice");
+    }
+
+    #[test]
+    fn raw_message_accepts_non_utf8_headers() {
+        let raw = b"Subject: \xff\xfe\r\nFrom: a@b\r\n\r\nbody";
+        assert!(matches!(
+            parse_message(raw),
+            Err(MailHeaderError::InvalidUtf8)
+        ));
+        let msg = parse_raw_message(raw).unwrap();
+        assert_eq!(msg.headers.len(), 2);
+        assert_eq!(msg.body, b"body");
     }
 }

@@ -116,6 +116,7 @@ file — there is no default, and its absence is a hard error at startup.
 | `--tls-cert <FILE>` | `tls-cert` | *(none)* | PEM certificate enabling STARTTLS (RFC 3207). Must be given together with `--tls-key`. When absent, STARTTLS is refused with `454` and never advertised. |
 | `--tls-key <FILE>` | `tls-key` | *(none)* | PEM private key for STARTTLS. |
 | `--auth-users <SPEC>` | `auth-users` | *(none)* | SASL credentials for AUTH PLAIN/LOGIN, as comma-separated `user:password` pairs (e.g. `alice:secret,bob:hunter2`). When set, `AUTH PLAIN LOGIN` is advertised **only over TLS** (RFC 8310); AUTH on a plaintext session is refused with `538`. ⚠️ Credentials are stored **in plaintext** in the process arguments/config file (shell history, `ps` output) — acceptable for testing only, not for production (see PLAN.md, Phase 8). |
+| `--auth-senders <SPEC>` | `auth-senders` | *(none)* | The addresses each AUTH login may send as: comma-separated `user=grant\|grant` entries, where a grant is an exact address (`alice@example.org`) or a whole domain (`@example.net`). Example: `alice=alice@example.org\|@example.net,bob=bob@example.org`. An authenticated session's `MAIL FROM` must be granted (else `553 5.7.1`; the null sender is always refused), and so must every `From:` author (else `550 5.7.1` at end-of-data). A login with no entry can authenticate but not send; it is listed in a startup warning. A grant for a login not in `--auth-users`, or this flag without `--auth-users`, is a startup error. Local-parts and domains are compared case-insensitively; a quoted local-part in `From:` only matches a whole-domain grant. |
 | `--resolver <IP>` | `resolver` | `1.1.1.1` | DNS resolver address used for SPF, DKIM key, and DMARC lookups, over **DNS-over-TLS (port 853)**. Logged at startup. IPv4 addresses only. | The resolver's certificate is verified against this IP address using the public web PKI roots, so public DoT services (`1.1.1.1`, `9.9.9.9`, `8.8.8.8`) work as-is; a local resolver needs `--resolver-ca`. |
 | `--resolver-ca <FILE>` | `resolver-ca` | *(none)* | PEM file of extra CA certificates (one or more; a self-signed resolver certificate also works) to trust for the resolver's DNS-over-TLS certificate, so a **local resolver** (unbound, knot-resolver, ...) with a private certificate can be used. The certificates are **added to** the public roots, never substituted, so public resolvers keep working with it set; they are trusted only for resolver connections. The resolver's certificate must carry the `--resolver` address as an IP subject alternative name (e.g. `IP:127.0.0.1`). A missing, empty or invalid file is a startup error. |
 | `--dns-connections <N>` | `dns-connections` | `2` | Pipelined DNS-over-TLS connections to the resolver (1–16; out of range is a startup error). Each carries up to 64 queries in flight, so slow lookups for one domain don't stall others. Size it from the periodic `dns stats` log line: sustained `waits` mean every connection is at its in-flight limit. |
@@ -149,7 +150,9 @@ max-dns-per-ip = 4
 
 tls-cert = "/etc/mailserv/cert.pem"
 tls-key = "/etc/mailserv/key.pem"
-# auth-users: leave unset (receive-only V1; AUTH exempts senders from SPF/DMARC)
+# auth-users / auth-senders: leave unset (receive-only V1). If set, every login
+# needs auth-senders grants; AUTH exempts granted senders from SPF/DMARC.
+# auth-senders = "alice=alice@example.org|@example.net"
 
 resolver = "1.1.1.1"
 # resolver-ca = "/etc/mailserv/resolver-ca.pem"   # only for a local resolver (e.g. resolver = "127.0.0.1")
@@ -182,12 +185,23 @@ shutdown-grace-ms = 60000
 - **SPF** (RFC 7208) is evaluated for the MAIL FROM identity at MAIL time
   (HELO identity for the null sender): `Fail`/`PermError` → `550`,
   `TempError` → `451`. DNS lookups go over DNS-over-TLS to the configured
-  `--resolver`, with a lookup budget and per-query timeout.
+  `--resolver`, with a lookup budget and per-query timeout. Records
+  are parsed strictly: names are case-insensitive, `a`/`mx` take
+  CIDR suffixes (`a/24`), and any term that can't be parsed is a
+  `PermError`, never silently skipped.
 - **DKIM** (RFC 6376/8463, RSA + Ed25519) signatures are verified at
-  end-of-data; results are logged and feed DMARC.
+  end-of-data; results are logged and feed DMARC. A signature never
+  verifies if it uses an RSA key under 1024 bits (RFC 8301), doesn't
+  sign `From`, or has an `l=` that doesn't cover the whole body.
 - **DMARC** (RFC 7489): a published `p=reject` policy that the message
-  fails → `550 5.7.1` at end-of-data. Authenticated submitters are exempt
-  (and skip SPF) — they already passed local authentication.
+  fails → `550 5.7.1` at end-of-data. The policy is looked up at the
+  `From` domain, then each parent domain in turn (at most 8 lookups), and
+  `sp=` applies to subdomains. If the policy can't be fetched, the reply is
+  `451 4.4.3`: a lookup failure never counts as "no policy". A header
+  block with a bare CR is refused (`550 5.6.0`). Authenticated submitters are exempt
+  (and skip SPF), but only for senders their login owns: `MAIL FROM` and
+  every `From:` author must be granted by `--auth-senders`, so being
+  authenticated never means "may use any From".
 - **STARTTLS** is advertised on plaintext only; a second STARTTLS on a
   TLS session gets `503`. Session state is reset on upgrade (RFC 3207
   §4.2).
@@ -291,7 +305,7 @@ cargo doc --workspace --no-deps  # rustdoc (missing_docs is warn-by-default)
 cargo test --workspace
 ```
 
-This runs ~229 tests across the workspace in four layers (see DESIGN.md
+This runs ~258 tests across the workspace in four layers (see DESIGN.md
 §9 for the rationale):
 
 1. **Unit** — pure logic per crate (DKIM canonicalization, DMARC

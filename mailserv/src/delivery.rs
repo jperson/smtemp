@@ -225,7 +225,16 @@ pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Ve
         .map(|(ip, _)| ip)
         .unwrap_or(&meta.peer);
     let protocol = if meta.tls_active { "ESMTPS" } else { "ESMTP" };
-    let helo = meta.helo.as_deref().unwrap_or("unknown");
+    // HELO is validated at the SMTP layer (M8); this is defense in depth
+    // for spooled metadata written before that check existed. Anything but
+    // printable ASCII becomes `?`, so no CR/LF can split the header.
+    let helo: String = meta
+        .helo
+        .as_deref()
+        .unwrap_or("unknown")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect();
     let date = rfc5322_date(
         meta.received_at
             .parse()
@@ -383,6 +392,18 @@ mod tests {
         assert!(String::from_utf8(copy)
             .unwrap()
             .contains(" with ESMTPS id "));
+    }
+
+    /// M8 (SECURITY.md), defense in depth: a HELO with a bare CR stored by
+    /// an older build can't inject a header into the delivered copy.
+    #[test]
+    fn delivery_copy_neutralises_control_characters_in_helo() {
+        let mut meta = sample_meta();
+        meta.helo = Some("evil.example\rX-Injected: yes".into());
+        let copy = prepare_for_delivery(&meta, "user@example.org", b"\r\nbody\r\n");
+        let text = String::from_utf8(copy).unwrap();
+        assert!(text.contains("Received: from evil.example?X-Injected:?yes (127.0.0.1)\r\n"));
+        assert_eq!(text.matches('\r').count(), text.matches("\r\n").count());
     }
 
     /// The maildir sink writes one copy per recipient under

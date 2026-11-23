@@ -12,8 +12,9 @@
 //! resolver abstraction (and its fixture mocks) from the SPF crate.
 //!
 //! Not implemented: `rua=`/`ruf=` reporting, `pct=` gradual sampling
-//! (treated as 100), and PSL-based organizational-domain discovery (a
-//! simple last-two-labels heuristic is used instead).
+//! (treated as 100), and PSL-based organizational-domain discovery. Policy
+//! discovery walks the From domain's ancestors instead (see
+//! [`fetch_policy`]); relaxed alignment is a suffix test.
 
 use spf::SpfResolver;
 use thiserror::Error;
@@ -229,30 +230,79 @@ pub fn apply(evaluation: &Evaluation, policy: DmarcPolicy) -> Action {
     }
 }
 
-/// Fetch the DMARC record for a From-header domain: TXT at
-/// `_dmarc.<from_domain>`, falling back to the organizational domain
-/// (RFC 7489 Section 3.6.2.1) using a last-two-labels heuristic in place
-/// of the Public Suffix List.
+/// A DMARC record together with the domain it was published at (needed to
+/// choose between `p=` and `sp=`, RFC 7489 Section 6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundPolicy {
+    /// The parsed record.
+    pub record: DmarcRecord,
+    /// The domain whose `_dmarc.` name carried the record (lowercase, no
+    /// trailing dot).
+    pub domain: String,
+}
+
+impl FoundPolicy {
+    /// The policy that governs `from_domain`: `sp=` when the record was
+    /// found at an ancestor of it, `p=` when at the domain itself.
+    pub fn policy_for(&self, from_domain: &str) -> DmarcPolicy {
+        self.record.policy_for(&self.domain, from_domain)
+    }
+}
+
+/// The most `_dmarc.` lookups one policy discovery may make (the DMARCbis
+/// tree-walk bound): a long, attacker-chosen From domain can't turn one
+/// message into dozens of queries.
+pub const MAX_POLICY_QUERIES: usize = 8;
+
+/// The names [`fetch_policy`] queries, in order: the From domain itself,
+/// then its ancestors down to two labels (F2, SECURITY-AUDIT.md). A domain
+/// with more labels than the bound skips straight from the full name to
+/// its 7-label suffix (as DMARCbis's tree walk does), so at most
+/// [`MAX_POLICY_QUERIES`] names are returned.
+pub fn policy_candidates(from_domain: &str) -> Vec<String> {
+    let domain = from_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let labels: Vec<&str> = domain.split('.').collect();
+    let mut names = vec![domain.clone()];
+    let first_ancestor = if labels.len() > MAX_POLICY_QUERIES {
+        labels.len() - (MAX_POLICY_QUERIES - 1)
+    } else {
+        1
+    };
+    for start in first_ancestor..labels.len().saturating_sub(1) {
+        names.push(labels[start..].join("."));
+    }
+    names
+}
+
+/// Discover the DMARC policy for a From-header domain.
+///
+/// Queries `_dmarc.<domain>` for the From domain and then each ancestor
+/// (see [`policy_candidates`]), stopping at the first that publishes a
+/// record. This replaces the old "last two labels" organisational-domain
+/// guess, which skipped the real organisational domain under multi-label
+/// public suffixes: for `x.victim.co.uk` it asked `co.uk` and never
+/// `victim.co.uk`, so spoofs of any non-existent subdomain found no policy
+/// (F2). Walking every ancestor can't skip the organisational domain,
+/// whatever the suffix structure, and needs no Public Suffix List.
+///
+/// Errors fail closed (F1): a transient DNS failure at any step is
+/// [`DmarcError::Temp`], because skipping that name could skip the policy
+/// that applies, and the caller must defer the message, not deliver it.
+/// [`DmarcError::MultipleRecords`] ends discovery (RFC 7489 §6.6.3: DMARC
+/// is then not applied).
 pub async fn fetch_policy<R: SpfResolver + Sync>(
     resolver: &R,
     from_domain: &str,
-) -> Result<Option<DmarcRecord>, DmarcError> {
-    let name = format!("_dmarc.{from_domain}");
-    match fetch_one(resolver, &name).await {
-        Ok(Some(record)) => Ok(Some(record)),
-        Ok(None) => {
-            // Organizational-domain fallback: strip leading labels until
-            // two remain.
-            let labels: Vec<&str> = from_domain.split('.').collect();
-            if labels.len() > 2 {
-                let org = labels[labels.len() - 2..].join(".");
-                fetch_one(resolver, &format!("_dmarc.{org}")).await
-            } else {
-                Ok(None)
-            }
+) -> Result<Option<FoundPolicy>, DmarcError> {
+    for domain in policy_candidates(from_domain) {
+        if let Some(record) = fetch_one(resolver, &format!("_dmarc.{domain}")).await? {
+            return Ok(Some(FoundPolicy { record, domain }));
         }
-        Err(e) => Err(e),
     }
+    Ok(None)
 }
 
 async fn fetch_one<R: SpfResolver + Sync>(
@@ -405,10 +455,18 @@ mod tests {
     #[derive(Default, Clone)]
     struct MockResolver {
         txt: HashMap<String, Vec<String>>,
+        /// Names whose TXT lookup fails (SERVFAIL, timeout).
+        fail: std::collections::HashSet<String>,
+        /// Every TXT name queried, in order.
+        queried: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl SpfResolver for MockResolver {
         async fn txt(&self, domain: &str) -> anyhow::Result<Vec<String>> {
+            self.queried.lock().unwrap().push(domain.to_string());
+            if self.fail.contains(domain) {
+                anyhow::bail!("SERVFAIL");
+            }
             Ok(self.txt.get(domain).cloned().unwrap_or_default())
         }
         async fn a(&self, _domain: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
@@ -434,7 +492,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r.policy, DmarcPolicy::Reject);
+        assert_eq!(r.record.policy, DmarcPolicy::Reject);
+        assert_eq!(r.domain, "example.org");
 
         // A subdomain with no own record falls back to the organizational
         // domain's record.
@@ -442,7 +501,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r.policy, DmarcPolicy::Reject);
+        assert_eq!(r.record.policy, DmarcPolicy::Reject);
+        assert_eq!(r.domain, "example.org", "found at the ancestor");
 
         // Unrelated TXT records are ignored.
         let mut resolver = MockResolver::default();
@@ -454,5 +514,147 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Dns {
+        txt: HashMap<String, Vec<String>>,
+        fail: HashSet<String>,
+        queried: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SpfResolver for Dns {
+        async fn txt(&self, domain: &str) -> anyhow::Result<Vec<String>> {
+            self.queried.lock().unwrap().push(domain.to_string());
+            if self.fail.contains(domain) {
+                anyhow::bail!("SERVFAIL");
+            }
+            Ok(self.txt.get(domain).cloned().unwrap_or_default())
+        }
+        async fn a(&self, _: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
+            Ok(vec![])
+        }
+        async fn mx(&self, _: &str) -> anyhow::Result<Vec<(u16, String)>> {
+            Ok(vec![])
+        }
+        async fn ptr(&self, _: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    fn with(records: &[(&str, &str)]) -> Dns {
+        let mut dns = Dns::default();
+        for (name, txt) in records {
+            dns.txt
+                .entry(name.to_string())
+                .or_default()
+                .push(txt.to_string());
+        }
+        dns
+    }
+
+    /// F2 (SECURITY-AUDIT.md): a spoof from a non-existent subdomain of a
+    /// domain under a multi-label public suffix must find the victim's
+    /// policy. The old fallback asked `_dmarc.co.uk` and delivered.
+    #[tokio::test]
+    async fn multi_label_suffix_subdomain_finds_the_victims_policy() {
+        let dns = with(&[("_dmarc.victim.co.uk", "v=DMARC1; p=reject")]);
+        let found = fetch_policy(&dns, "anything.victim.co.uk")
+            .await
+            .unwrap()
+            .expect("victim policy found");
+        assert_eq!(found.domain, "victim.co.uk");
+        assert_eq!(
+            found.policy_for("anything.victim.co.uk"),
+            DmarcPolicy::Reject
+        );
+        assert_eq!(
+            *dns.queried.lock().unwrap(),
+            ["_dmarc.anything.victim.co.uk", "_dmarc.victim.co.uk"]
+        );
+    }
+
+    /// The walk stops at the nearest record, so an intermediate domain's
+    /// own policy wins over its parent's.
+    #[tokio::test]
+    async fn nearest_ancestor_record_wins() {
+        let dns = with(&[
+            ("_dmarc.example.com", "v=DMARC1; p=none"),
+            ("_dmarc.corp.example.com", "v=DMARC1; p=reject"),
+        ]);
+        let found = fetch_policy(&dns, "a.b.corp.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.domain, "corp.example.com");
+    }
+
+    /// F1 (SECURITY-AUDIT.md): a DNS failure anywhere in the walk is a
+    /// temporary error, never "no policy" — the policy might be at the
+    /// name that failed.
+    #[tokio::test]
+    async fn dns_failure_is_temp_not_no_policy() {
+        let mut dns = with(&[("_dmarc.victim.example", "v=DMARC1; p=reject")]);
+        dns.fail.insert("_dmarc.victim.example".into());
+        assert!(matches!(
+            fetch_policy(&dns, "victim.example").await,
+            Err(DmarcError::Temp)
+        ));
+        // A failure at the subdomain must not be skipped over either.
+        let mut dns = with(&[("_dmarc.victim.example", "v=DMARC1; p=reject")]);
+        dns.fail.insert("_dmarc.x.victim.example".into());
+        assert!(matches!(
+            fetch_policy(&dns, "x.victim.example").await,
+            Err(DmarcError::Temp)
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiple_records_end_discovery() {
+        let dns = with(&[
+            ("_dmarc.victim.example", "v=DMARC1; p=reject"),
+            ("_dmarc.victim.example", "v=DMARC1; p=none"),
+        ]);
+        assert!(matches!(
+            fetch_policy(&dns, "victim.example").await,
+            Err(DmarcError::MultipleRecords)
+        ));
+    }
+
+    /// M4: `sp=` governs a subdomain whose policy came from an ancestor;
+    /// `p=` governs the domain that published the record.
+    #[tokio::test]
+    async fn subdomain_policy_applies_to_inherited_records() {
+        let dns = with(&[("_dmarc.example.org", "v=DMARC1; p=none; sp=reject")]);
+        let sub = fetch_policy(&dns, "mail.example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sub.policy_for("mail.example.org"), DmarcPolicy::Reject);
+        let own = fetch_policy(&dns, "example.org").await.unwrap().unwrap();
+        assert_eq!(own.policy_for("example.org"), DmarcPolicy::None);
+    }
+
+    #[test]
+    fn candidate_walk_is_bounded() {
+        assert_eq!(policy_candidates("Example.ORG."), ["example.org"]);
+        assert_eq!(
+            policy_candidates("x.victim.co.uk"),
+            ["x.victim.co.uk", "victim.co.uk", "co.uk"]
+        );
+        assert_eq!(policy_candidates("localhost"), ["localhost"]);
+        let long = "a.b.c.d.e.f.g.h.i.j.k.l.example.com";
+        let names = policy_candidates(long);
+        assert!(names.len() <= MAX_POLICY_QUERIES, "{names:?}");
+        assert_eq!(names[0], long);
+        assert_eq!(names[1], "h.i.j.k.l.example.com", "skips to 7 labels");
+        assert_eq!(names.last().unwrap(), "example.com");
     }
 }

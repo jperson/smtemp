@@ -22,7 +22,8 @@ use dns::DnsClient;
 /// The public module for the lexer and AST parser.
 pub mod parser;
 use crate::parser::parser::{
-    parse, Spf, SpfDirective, SpfMacroSubs, SpfMechanism, SpfModifier, SpfQualifier, SpfTerm,
+    is_spf_record, parse, DualCidr, Spf, SpfDirective, SpfMacroSubs, SpfMechanism, SpfModifier,
+    SpfQualifier, SpfTerm,
 };
 
 /// The result of an SPF evaluation (RFC 7208 Section 2.6).
@@ -275,7 +276,7 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
     // permanent error, and a record that does not parse is one too.
     let mut found: Option<Spf> = None;
     for txt in txts {
-        if txt.starts_with("v=spf1") {
+        if is_spf_record(&txt) {
             if found.is_some() {
                 return Err(SpfError::Perm);
             }
@@ -448,6 +449,7 @@ async fn check_a_record<R: SpfResolver + Sync>(
     resolver: &R,
     peer: IpAddr,
     d: &str,
+    cidr: DualCidr,
     m: &SpfResult,
     budget: &mut Budget,
 ) -> std::result::Result<Option<SpfResult>, SpfError> {
@@ -458,7 +460,9 @@ async fn check_a_record<R: SpfResolver + Sync>(
     }
 
     for ip in ips {
-        let ipn = Ipv4Net::from(ip);
+        // The mechanism's ip4-cidr-length applies to every address (F4:
+        // `a/24` used to be ignored or folded into the domain).
+        let ipn = Ipv4Net::new(ip, cidr.v4).map_err(|_| SpfError::Perm)?;
         if let Some(r) = check_ipv4(peer, &ipn, m) {
             return Ok(Some(r));
         }
@@ -474,6 +478,7 @@ async fn check_mx_record<R: SpfResolver + Sync>(
     resolver: &R,
     peer: IpAddr,
     d: &str,
+    cidr: DualCidr,
     m: &SpfResult,
     budget: &mut Budget,
 ) -> std::result::Result<Option<SpfResult>, SpfError> {
@@ -490,7 +495,7 @@ async fn check_mx_record<R: SpfResolver + Sync>(
             budget.record_void()?;
         }
         for ip in ips {
-            let ipn = Ipv4Net::from(ip);
+            let ipn = Ipv4Net::new(ip, cidr.v4).map_err(|_| SpfError::Perm)?;
             if let Some(r) = check_ipv4(peer, &ipn, m) {
                 return Ok(Some(r));
             }
@@ -601,20 +606,20 @@ async fn check_directive<R: SpfResolver + Sync>(
             }
         }
 
-        SpfMechanism::A(s) => {
+        SpfMechanism::A(s, cidr) => {
             // An empty domain-spec means the current domain (RFC 7208
             // Section 5.2).
             let target = if s.is_empty() { domain } else { s };
-            match check_a_record(resolver, peer, target, &qualify(q), budget).await {
+            match check_a_record(resolver, peer, target, *cidr, &qualify(q), budget).await {
                 Ok(r) => r,
                 Err(e) => Some(e.to_result()),
             }
         }
-        SpfMechanism::Mx(s) => {
+        SpfMechanism::Mx(s, cidr) => {
             // An empty domain-spec means the current domain (RFC 7208
             // Section 5.3).
             let target = if s.is_empty() { domain } else { s };
-            match check_mx_record(resolver, peer, target, &qualify(q), budget).await {
+            match check_mx_record(resolver, peer, target, *cidr, &qualify(q), budget).await {
                 Ok(r) => r,
                 Err(e) => Some(e.to_result()),
             }
@@ -1337,5 +1342,129 @@ mod wire {
             1,
             "the wire query must carry qtype 1 (A)"
         );
+    }
+}
+
+/// F4 (SECURITY-AUDIT.md): the probe cases from the audit. Each used to
+/// turn a hard fail into Neutral/None (or fail a legitimate sender).
+#[cfg(test)]
+mod f4_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct Dns {
+        txt: HashMap<String, Vec<String>>,
+    }
+
+    impl SpfResolver for Dns {
+        async fn txt(&self, d: &str) -> Result<Vec<String>> {
+            Ok(self.txt.get(d).cloned().unwrap_or_default())
+        }
+        async fn a(&self, d: &str) -> Result<Vec<Ipv4Addr>> {
+            Ok(match d {
+                "v.example" | "mx.v.example" | "other.example" => {
+                    vec!["192.0.2.1".parse().unwrap()]
+                }
+                _ => vec![],
+            })
+        }
+        async fn mx(&self, d: &str) -> Result<Vec<(u16, String)>> {
+            Ok(match d {
+                "v.example" => vec![(10, "mx.v.example".to_string())],
+                _ => vec![],
+            })
+        }
+        async fn ptr(&self, _: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    async fn eval(record: &str, peer: &str) -> SpfResult {
+        let dns = Dns {
+            txt: HashMap::from([("v.example".to_string(), vec![record.to_string()])]),
+        };
+        match check_host(
+            &dns,
+            peer.parse().unwrap(),
+            &"x@v.example".to_string(),
+            "v.example".to_string(),
+            &None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => e.to_result(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_fail_records_are_not_weakened() {
+        const OUTSIDE: &str = "198.51.100.9";
+        for (record, peer, expected) in [
+            ("v=spf1 ip4:192.0.2.1 -all", OUTSIDE, SpfResult::Fail),
+            ("v=spf1 ip4:192.0.2.1 -ALL", OUTSIDE, SpfResult::Fail),
+            ("V=SPF1 IP4:192.0.2.1 -All", OUTSIDE, SpfResult::Fail),
+            (
+                "v=spf1 ip4:192.0.2.1 bogus -all",
+                OUTSIDE,
+                SpfResult::PermError,
+            ),
+            (
+                "v=spf1 ip4:192.0.2.1 all:x -all",
+                OUTSIDE,
+                SpfResult::PermError,
+            ),
+            ("v=spf1 mx/24 -all", OUTSIDE, SpfResult::Fail),
+            ("v=spf1 MX/24 -all", "192.0.2.200", SpfResult::Pass),
+            ("v=spf1 a/24 -all", "192.0.2.77", SpfResult::Pass),
+            (
+                "v=spf1 a:other.example/24 -all",
+                "192.0.2.77",
+                SpfResult::Pass,
+            ),
+            (
+                "v=spf1 a:other.example/24//64 -all",
+                "192.0.2.77",
+                SpfResult::Pass,
+            ),
+            ("v=spf1 a//64 -all", "192.0.2.1", SpfResult::Pass),
+            ("v=spf1 a/33 -all", OUTSIDE, SpfResult::PermError),
+            ("v=spf1 a/ -all", OUTSIDE, SpfResult::PermError),
+            ("v=spf1 a: -all", OUTSIDE, SpfResult::PermError),
+            ("v=spf1 include -all", OUTSIDE, SpfResult::PermError),
+            (
+                "v=spf1 redirect=a.example redirect=b.example",
+                OUTSIDE,
+                SpfResult::PermError,
+            ),
+            (
+                "v=spf1 unknown-mod=x ip4:192.0.2.1 -all",
+                OUTSIDE,
+                SpfResult::Fail,
+            ),
+            (
+                "v=spf1 ip6:2001:db8::1 ip6:2001:db8::/32 -all",
+                OUTSIDE,
+                SpfResult::Fail,
+            ),
+        ] {
+            assert_eq!(eval(record, peer).await, expected, "{record} from {peer}");
+        }
+    }
+
+    #[test]
+    fn spf_record_detection() {
+        for yes in ["v=spf1", "v=spf1 -all", "V=SPF1 -all", "v=Spf1 a"] {
+            assert!(is_spf_record(yes), "{yes}");
+        }
+        for no in [
+            "v=spf10 -all",
+            "v=spf1-all",
+            "spf1",
+            "",
+            "v=DMARC1; p=reject",
+        ] {
+            assert!(!is_spf_record(no), "{no}");
+        }
     }
 }

@@ -13,7 +13,7 @@
 > (REPORT.md) is triaged in §6: all critical and high findings (and the
 > round-2 findings N1–N7) are fixed and regression-tested; the medium
 > and low findings are tracked there.
-> Workspace state: **229 tests, 0 failures,
+> Workspace state: **258 tests, 0 failures,
 > clippy-clean (0 warnings), fmt-clean, stable Rust 1.100.0.**
 >
 > **V1 scope: receive-only.** The product is a hosted receive-only
@@ -71,7 +71,7 @@ fix. Kept as a permanent record; nothing here is open.
 | AUTH (RFC 4954/4616/8310) | **DONE** — PLAIN + LOGIN with challenge continuation (`Control::Challenge`, `SmtpState::Auth(return_to)`, `*` abort); TLS-only accept + advertisement; `--auth-users`; SPF/DMARC exemptions for authenticated senders. ⚠️ **Unsafe to enable until `From:` validation lands (Phase 8): the exemptions are unconditional, so AUTH is a receive-side spoofing channel.** *Open: OAUTHBEARER* |
 | SPF (RFC 7208) | **DONE** — correct identities, full mechanism set, lookup budget, typed Temp/Perm errors, resolver trait with offline fixtures. *Open: macro expansion completeness, DNS caching* |
 | DKIM verify (RFC 6376/8463) | **DONE** — RSA + Ed25519, openssl-anchored fixture corpus, wired into `end_data`. *Open: DKIM signing (Phase 8)* |
-| DMARC (RFC 7489) | **DONE** — `dmarc` crate: record parsing, relaxed/strict alignment, org-domain fallback, `p=reject` → `550 5.7.1` at end-of-data; live-verified against facebook.com. *Open: rua/ruf reporting, pct sampling, PSL* |
+| DMARC (RFC 7489) | **DONE** — `dmarc` crate: record parsing, relaxed/strict alignment, org-domain fallback, `p=reject` → `550 5.7.1` at end-of-data; live-verified against facebook.com. *Open: rua/ruf reporting, pct sampling, PSL for relaxed alignment; policy discovery is a bounded ancestor walk (F2)* |
 | Recipient policy | **DONE** — `--local-domains`, closed relay, 100-recipient cap, MAIL-before-RCPT/RCPT-before-DATA sequence enforcement |
 | EHLO capabilities | **DONE** — multiline `250-SIZE n / 250-STARTTLS / 250-AUTH PLAIN LOGIN / 250 HELP`, gated by availability and connection state. *Open: 8BITMIME/SMTPUTF8/PIPELINING advertisement (PIPELINING works de-facto), VRFY/EXPN semantics* |
 | Recipient validation | **DONE** |
@@ -192,6 +192,10 @@ plan because the receive-only design deliberately preserves its hooks
 authenticated senders; DKIM's canonicalization core is shared with the
 future signer). Do not invest here until after V1 ships.
 
+> **Update (2026-11-22):** `From:` validation is done (below). AUTH is
+> still not internet-ready: plaintext credentials, no failed-attempt
+> limit (M16), and no submission-only listener remain.
+>
 > **Exception — `From:` validation is a security prerequisite, not a
 > sending feature.** AUTH is already shipped and usable via
 > `--auth-users`, and an authenticated session unconditionally skips SPF
@@ -204,11 +208,15 @@ future signer). Do not invest here until after V1 ships.
 
 - [ ] **DKIM signing** for authenticated submissions (sign with the
       authenticated domain's key; the `dkim` crate gains a signer).
-- [ ] **`From:` validation** for authenticated submissions (user's domain
-      or configured aliases; refuse spoofed From headers at MAIL time).
-      **Required before AUTH is enabled anywhere** (see the exception note
-      above): without it, an authenticated session bypasses SPF and DMARC
-      rejection and can inject spoofed `From:` mail into hosted mailboxes.
+- [x] **`From:` validation** for authenticated submissions (2026-11-22):
+      `--auth-senders` maps each login to exact addresses and `@domain`
+      grants (`mailserv/src/auth.rs`). `MAIL FROM` must be granted (`553
+      5.7.1`; the null sender is refused) and so must every `From:` author
+      (`550 5.7.1`), before the SPF skip or DMARC exemption applies. Fails
+      closed: no grants means no sending; a grant for an unknown login is a
+      startup error. *Follow-ups:* grants from the authority/console instead
+      of config (Phase 12), and a submission-only listener (587/465) so
+      AUTH is never offered on port 25.
 - [ ] **Production-grade credential storage.** `--auth-users` currently
       takes plaintext `user:password` pairs on the CLI or in the config
       file — the credentials land in shell history, `ps` output, and
@@ -220,6 +228,21 @@ future signer). Do not invest here until after V1 ships.
       (e.g. argon2) or an external auth backend, plus credential reload
       without restart. Until replaced, do not expose `auth-users` on
       internet-facing deployments.
+
+      **Decision (interim file, later backend) — see DESIGN.md §5.** A
+      file is an accepted V1 choice, provided it is treated as a secrets
+      file: split credentials from sender grants (different owners and
+      rotation cadences), store argon2id hashes rather than plaintext,
+      `0600` and owned by the service user (refuse to start if
+      group/world-readable), and never pass credentials in argv. Add
+      SIGHUP reload so a revoked user or grant stops working without a
+      restart. Put the file impl behind two seams — `CredentialVerifier`
+      and `SenderAuthorizer` — so the backend is a drop-in rather than a
+      rewrite. Do **not** build the backend until submission is a real
+      product; a receive-only V1 with AUTH disabled has no use for it.
+      Constraints when it lands: fail closed for AUTH only (never block
+      inbound delivery), cache with a TTL, revoke without restart, and
+      bound calls with timeouts and a circuit breaker.
 - [ ] OAUTHBEARER (optional).
 - [ ] Implicit TLS on 465 (shares the acceptor; separate listener).
 
@@ -510,7 +533,12 @@ lookups with dynamic ones.
 6. **Submission credentials.** The static plaintext `--auth-users` map
    (already flagged in Phase 8) is doubly wrong here: credentials must
    come from the authority (hashed), and submission accounts are created
-   in the console, not in server config.
+   in the console, not in server config. Split the two concerns when the
+   authority owns them: the credential verifier becomes a backend
+   (`CredentialVerifier`), while sender grants (`SenderAuthorizer`) are
+   authorization policy and normally remain in the app/console. See the
+   Phase 8 credential-storage decision for the seam and fail-closed
+   constraints.
 7. **MX-scale economics.** The per-query DoT connection was fixed by
    the Phase 10 `DnsClient` (pooled connection + TTL cache); the
    remaining MX-scale item is rate limiting / RCPT-probe caps (Phase
@@ -575,29 +603,29 @@ running binary. A round-2 re-review found gaps in the first fixes
 | H2 | High | SPF macro expansion replaced every letter after the first `%` | **FIXED** — RFC 7208 §7 expander (letters, digit/`r` transformers, delimiters, `%%`/`%_`/`%-`, URL-escaping, 253-octet truncation; IPv6 nibble `%{i}`, epoch `%{t}`, `%{p}` = `unknown`); `include:` lexes `%`; RFC §7.4 example tests |
 | H3 | High | ESMTP parameters (`SIZE=`, `BODY=`) ended up inside the address: SPF bypass, bounces with `SIZE=` refused | **FIXED** — `<path> [params]` split (RFC 5321 §4.1.2); `SIZE=` over the limit → `552` at MAIL; control characters in paths refused |
 | H7 | High | Unlimited DKIM signatures per message (CPU + DNS amplification) | **FIXED** — at most `dkim::MAX_SIGNATURES` (5, topmost) evaluated; offline regression test |
+| S1 | **Critical** | (SECURITY.md) Stack-overflow abort of the whole process via deeply nested header comments (recursive pest `comment` rule, reached by DKIM's typed parse) | **FIXED** — DKIM runs on `mailparse::parse_raw_message` (iterative byte scan, no grammar); `parse_headers` refuses nesting > `MAX_COMMENT_DEPTH` (64) via a conservative pre-scan; regression tests on a 2 MiB stack; live 300k-level payload no longer crashes a release build |
+| S2 | High | (SECURITY.md) DKIM `h=` selection O(h × headers): one message pins a worker for minutes | **FIXED** — per-name header index (linear, RFC 6376 §5.4.2 semantics kept); `h=` capped at `dkim::MAX_SIGNED_HEADERS` (256) |
+| N19 | High (deploy) | IPv4-mapped peers on a `[::]` listener never match SPF `ip4:`/`a`/`mx` | **FIXED** — `canonical_peer()` (`to_canonical()`) at accept and in `handle_connection` |
+| M8 | Medium | Trace-header injection via HELO (bare CR copied into `Received:`) | **FIXED** — HELO must be a domain or address literal, else `501 5.5.2` before it is recorded; delivery also neutralises non-printables in stored HELO |
+| N11 | Medium | DKIM returned nothing when the typed parser rejected a message (non-UTF-8 headers etc.) | **FIXED** — by the S1 change (raw view only) |
+| F1 / M6 | **High** | (SECURITY-AUDIT.md) DMARC failed open on a policy-lookup error (SERVFAIL, query timeout): spoofs of `p=reject` domains delivered | **FIXED** — any lookup error is `451 4.4.3`; `MultipleRecords` means DMARC not applied (RFC 7489 §6.6.3, logged at `warn`); hermetic SERVFAIL test |
+| F2 / M3 / M4 | **High** | (SECURITY-AUDIT.md) Org-domain fallback = last two labels: `x.victim.co.uk` asked `_dmarc.co.uk`; `sp=` never applied | **FIXED** — bounded tree walk (`dmarc::policy_candidates`: the From domain then each ancestor down to 2 labels, at most 8 queries); `FoundPolicy` records where the record was found so `sp=` governs inherited policies; fail closed on errors. Live: spoof from `payroll.nonexistent.bbc.co.uk` → `550 5.7.1`. *Open: PSL-based relaxed alignment (M5)* |
+| F3 / N8 | **High** | (SECURITY-AUDIT.md) Bare CR in the header block hid a second `From:` from the DMARC scanner | **FIXED** — `550 5.6.0` for any CR not followed by LF in the header block, before any DNS work; live-verified |
+| F4 / M1 | Medium | (SECURITY-AUDIT.md) SPF parser weakened hard-fail records (`-ALL`, unknown terms, `mx/24`, `V=SPF1`) and ignored `a`/`mx` CIDR | **FIXED** — term-based parser (RFC 7208 §4.6.1) replaces the logos lexer: case-insensitive names, PermError on any unknown or malformed term, dual-CIDR on `a`/`mx`, duplicate `redirect=`/`exp=` PermError, case-insensitive record detection (`v=spf10` excluded); audit probe table is the regression test |
+| F5 / M17 | Medium | (SECURITY-AUDIT.md) DKIM accepted < 1024-bit RSA keys, honoured `l=` (appended content verified), and accepted signatures without `From` in `h=` | **FIXED** — `MIN_RSA_BITS` 1024 (`WeakKey`); a signature whose `l=` doesn't equal the canonical body length never verifies (`PartialBody`); `h=` must include `From` (RFC 6376 §6.1.1). *Open: duplicate tags, `k=` vs `a=` check* |
 
 **Open findings** (see REPORT.md for full detail; roughly priority order):
 
-- **M1**: SPF parser stops silently at the first unrecognized term and
-  the lexer is case-sensitive (`-ALL` dropped → Neutral instead of
-  Fail; `v=spf10` matches). Fix: PermError on any unparseable term,
-  case-insensitive lexing.
 - **M2**: SPF budget over-counts MX-host and PTR-name A lookups
   (spurious PermError → 550 on large legitimate records).
-- **M3**: DMARC organisational domain = last two labels — ccTLD
-  second-level registries (`co.uk`, `com.au`…) are unprotected. Needs
-  the Public Suffix List.
-- **M4**: DMARC `sp=` never applied (`policy_for(from, from)`);
-  `fetch_policy` must return the domain the record was found at.
 - **M5**: relaxed alignment is suffix-of, not same-organisational-domain
-  — sibling subdomains fail DMARC and get rejected.
-- **M6**: DMARC fails open on DNS error (compounded by H6); `quarantine`
-  is computed then ignored.
+  — sibling subdomains fail DMARC and get rejected (false negatives, not a
+  spoofing vector). Needs the Public Suffix List; policy discovery itself
+  no longer does (F2).
+- **M6** (remainder): `quarantine` is computed then delivered as normal
+  mail — out of V1 scope by decision (2026-11-22).
 - **M7**: no `Authentication-Results:` header added; forged inbound ones
   are not stripped (RFC 8601).
-- **M8**: trace-header injection — HELO/MAIL FROM free text (incl. bare
-  CR) is copied verbatim into `Received:`/`Return-Path:`. *(Round 3: control characters in MAIL/RCPT paths are now refused; HELO validation still open.)* Validate HELO
-  as domain/literal and reject control characters.
 - **M9**: catch-all deliveries collapse into one copy (idempotency key
   must include the envelope address — the temp-mail use case depends on
   knowing which address received the mail); lossy `sanitize()`
@@ -623,10 +651,8 @@ running binary. A round-2 re-review found gaps in the first fixes
   failed-attempt limit, `*`-abort leaves LOGIN state (stale-username
   confusion), case-sensitive mechanism names, non-constant-time
   compare, plaintext credentials (Phase 8).
-- **M17**: DKIM verifier gaps — no minimum RSA size (RFC 8301), `l=`
-  honoured (unsigned trailing content verifies), `h=` not required to
-  include From, duplicate tags allowed, key `k=` not checked against
-  signature `a=`.
+- **M17** (remainder): duplicate DKIM tags allowed; key `k=` not checked
+  against signature `a=`. (Key size, `l=`, From-in-`h=` fixed: F5.)
 - **L1–L12**: see REPORT.md §Low — DNS label encoding validation,
   cache eviction policy, resolver privacy/DNSSEC, EHLO-per-connection
   SPF cost, `redirect=` to no-record, per-DATA-line log spans, session

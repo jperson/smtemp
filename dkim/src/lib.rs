@@ -2,10 +2,6 @@
 //! crate: canonicalization, body hashing, signed-header-data
 //! construction, public-key records, and cryptographic verification
 //! (RSA PKCS#1 v1.5 and Ed25519, SHA-256).
-#![warn(missing_docs)]
-
-//! DKIM (RFC 6376) parsing, canonicalization, and hashing, built on the
-//! `mailparse` crate.
 //!
 //! Implemented:
 //! - `DKIM-Signature` tag parsing ([`DkimSignature::parse`])
@@ -16,11 +12,12 @@
 //!   each header instance used at most once, followed by the
 //!   `DKIM-Signature` header with the `b=` value emptied
 //!   ([`signed_header_data`])
-//!
 //! - retrieval of the DKIM public key record over the shared DNS
 //!   client ([`fetch_public_key`]), and cryptographic verification of
-//!   the `b=` signature (RSA + Ed25519)
-//! - `x=`/`t=` expiry enforcement
+//!   the `b=` signature (RSA + Ed25519; [`verify_with_key`],
+//!   [`verify_dkim`])
+//! - `x=` expiry enforcement
+#![warn(missing_docs)]
 
 use base64::prelude::*;
 use rsa::pkcs1::DecodeRsaPublicKey as _;
@@ -45,8 +42,9 @@ pub enum DkimError {
     #[error("missing required tag: {0}")]
     MissingTag(&'static str),
 
-    /// The DKIM-Signature enum wraps per-tag problems; this variant is a
-    /// present tag with an unusable value (v=2, l= not a number, ...).
+    /// A present tag with an unusable value: `v=` other than 1, `l=`,
+    /// `t=` or `x=` not a number, or an `h=` that is empty, lists more
+    /// than [`MAX_SIGNED_HEADERS`] names, or does not sign From.
     #[error("invalid value for tag: {0}")]
     InvalidTag(&'static str),
 
@@ -54,15 +52,18 @@ pub enum DkimError {
     #[error("unsupported hash or key algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
-    /// The DKIM-Signature header was not valid UTF-8.
+    /// The DKIM-Signature header was not valid UTF-8. Not currently
+    /// produced: [`find_signatures`] skips such headers.
     #[error("invalid UTF-8 in DKIM-Signature header")]
     InvalidUtf8,
 
-    /// The DNS query for the key record failed (transport or rcode).
+    /// The DNS query for the key record failed (resolver unreachable,
+    /// timeout, invalid name).
     #[error("DNS lookup for the public key failed: {0}")]
     KeyLookupFailed(String),
 
-    /// The key-record name exists but carries no parseable DKIM key.
+    /// No TXT answer at the key-record name parses as a DKIM key record
+    /// (including NXDOMAIN and empty answers).
     #[error("no usable DKIM key record found at {0}")]
     NoKeyRecord(String),
 
@@ -82,7 +83,8 @@ pub enum DkimError {
     #[error("key record does not permit the email service")]
     ServiceNotPermitted,
 
-    /// The i= identity's domain does not align with d= (strict mode).
+    /// The `i=` identity's domain is neither `d=` nor (unless the key sets
+    /// `t=s`) a subdomain of it.
     #[error("AUID (i=) domain does not match the signing domain (d=)")]
     DomainMismatch,
 
@@ -96,7 +98,8 @@ pub enum DkimError {
     InvalidSignature(String),
 
     /// The signature's `l=` does not cover the whole body, so content
-    /// outside the signature could have been appended. Such a signature is never treated as verified.
+    /// outside the signature could have been appended. Such a signature
+    /// is never treated as verified.
     #[error("body length (l=) does not cover the whole message body")]
     PartialBody,
 
@@ -142,8 +145,14 @@ pub struct DkimSignature<'a> {
 }
 
 impl<'a> DkimSignature<'a> {
-    /// Parse the tag list of a `DKIM-Signature` header value (everything
-    /// after the colon).
+    /// Parse the tag list `raw` of a `DKIM-Signature` header value
+    /// (everything after the colon). `c=` defaults to `simple/simple`.
+    ///
+    /// # Errors
+    ///
+    /// [`DkimError::MissingTag`] for an absent `v`, `a`, `b`, `bh`, `d`,
+    /// `s` or `h` tag; [`DkimError::InvalidTag`] for an unusable value
+    /// (see its docs).
     pub fn parse(raw: &'a str) -> Result<Self, DkimError> {
         let mut version = None;
         let mut algorithm = None;
@@ -207,7 +216,7 @@ impl<'a> DkimSignature<'a> {
                             .map_err(|_| DkimError::InvalidTag("x"))?,
                     )
                 }
-                _ => {} // i=, q=, z= and unknown tags are not needed for hashing
+                _ => {} // q=, z= and unknown tags are not needed for verification
             }
         }
 
@@ -256,13 +265,18 @@ impl<'a> DkimSignature<'a> {
         })
     }
 
-    /// The DNS name to query for the public key:
+    /// Returns the DNS name to query for the public key:
     /// `{selector}._domainkey.{domain}`.
     pub fn key_query_name(&self) -> String {
         format!("{}._domainkey.{}", self.selector, self.domain)
     }
 
-    /// The hash algorithm named by `a=` (the part after the '-').
+    /// Returns the hash algorithm named by `a=` (the part after the last
+    /// '-', e.g. `sha256`).
+    ///
+    /// # Errors
+    ///
+    /// [`DkimError::UnsupportedAlgorithm`] when `a=` has no '-'.
     fn hash_algorithm(&self) -> Result<&'a str, DkimError> {
         self.algorithm
             .rsplit_once('-')
@@ -271,7 +285,6 @@ impl<'a> DkimSignature<'a> {
     }
 }
 
-/// A `DKIM-Signature` header found in a message, paired with its parsed tags.
 /// One `DKIM-Signature` header found in a message, paired with its parsed
 /// tags.
 #[derive(Debug)]
@@ -284,9 +297,11 @@ pub struct ParsedSignature<'a, 'm> {
     pub header: &'a RawHeader<'m>,
 }
 
-/// Find every `DKIM-Signature` in the message (multiple are common and all
-/// must be checked independently). Signatures that are not valid UTF-8 or
-/// fail tag parsing are skipped.
+/// Find every `DKIM-Signature` in `msg` (multiple are common and all must
+/// be checked independently).
+///
+/// Returns the parsed signatures in header order (topmost first).
+/// Signatures that are not valid UTF-8 or fail tag parsing are skipped.
 pub fn find_signatures<'a, 'm>(msg: &'a RawMessage<'m>) -> Vec<ParsedSignature<'a, 'm>> {
     msg.headers
         .iter()
@@ -307,25 +322,28 @@ pub fn find_signatures<'a, 'm>(msg: &'a RawMessage<'m>) -> Vec<ParsedSignature<'
 // Canonicalization (RFC 6376 Section 3.4)
 // ---------------------------------------------------------------------------
 
-/// Is this byte a WSP (space or tab)? RFC 6376 Section 3.4 folds
+/// Is byte `b` a WSP (space or tab)? RFC 6376 Section 3.4 folds
 /// CRLF + WSP; WSP here is the character class test.
 fn is_wsp(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
-/// Trim folding whitespace (WSP, CR, LF) from both ends of a `&str`.
+/// Returns `s` with folding whitespace (WSP, CR, LF) trimmed from both
+/// ends.
 fn trim_fws(s: &str) -> &str {
     s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'))
 }
 
-/// Remove all folding whitespace from a tag value (e.g. folded base64).
+/// Returns the tag value `s` with all folding whitespace (WSP, CR, LF)
+/// removed (e.g. folded base64).
 pub fn strip_fws(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(c, ' ' | '\t' | '\r' | '\n'))
         .collect()
 }
 
-/// Trim folding whitespace (WSP, CR, LF) from both ends of a `&[u8]`.
+/// Returns `s` with folding whitespace (WSP, CR, LF) trimmed from both
+/// ends.
 fn trim_fws_bytes(s: &[u8]) -> &[u8] {
     let is_fws = |b: &u8| is_wsp(*b) || *b == b'\r' || *b == b'\n';
     let start = s.iter().position(|b| !is_fws(b)).unwrap_or(s.len());
@@ -333,17 +351,21 @@ fn trim_fws_bytes(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-/// Split into lines, accepting CRLF or bare-LF endings. The trailing empty
-/// element of a terminated body is preserved as an empty line.
+/// Split `body` into lines (without their endings), accepting CRLF or
+/// bare-LF endings. The trailing empty element of a terminated body is
+/// preserved as an empty line.
 fn split_lines(body: &[u8]) -> Vec<&[u8]> {
     body.split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .collect()
 }
 
-/// "relaxed" header canonicalization (RFC 6376 Section 3.4.2): lowercase the
-/// field name, delete WSP around the colon, unfold, collapse WSP runs to a
-/// single SP, and delete trailing WSP.
+/// "relaxed" header canonicalization (RFC 6376 Section 3.4.2) of the
+/// header `name` and raw `value`: lowercase the field name, delete WSP
+/// around the colon, unfold, collapse WSP runs to a single SP, and delete
+/// trailing WSP.
+///
+/// Returns `name:value` canonicalized, without a trailing CRLF.
 pub fn relaxed_header(name: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + value.len() + 2);
 
@@ -376,7 +398,8 @@ pub fn relaxed_header(name: &[u8], value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// "simple" header canonicalization: the header exactly as it appears.
+/// "simple" header canonicalization: returns `name:value` exactly as it
+/// appears, without a trailing CRLF.
 pub fn simple_header(name: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + value.len() + 1);
     out.extend_from_slice(name);
@@ -385,7 +408,7 @@ pub fn simple_header(name: &[u8], value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Canonicalize a single header with the named algorithm
+/// Canonicalize the header `name`/`value` with the algorithm `alg`
 /// ("relaxed" or "simple"; anything else falls back to "simple").
 pub fn canonicalize_header(alg: &str, name: &[u8], value: &[u8]) -> Vec<u8> {
     match alg {
@@ -394,7 +417,7 @@ pub fn canonicalize_header(alg: &str, name: &[u8], value: &[u8]) -> Vec<u8> {
     }
 }
 
-/// "relaxed" body canonicalization (RFC 6376 Section 3.4.4): per line, ignore
+/// "relaxed" canonicalization of `body` (RFC 6376 Section 3.4.4): per line, ignore
 /// trailing WSP and reduce WSP runs to a single SP; then ignore trailing
 /// whitespace-only lines. A non-empty canonicalized body ends with exactly
 /// one CRLF; a completely empty body canonicalizes to a single CRLF.
@@ -432,7 +455,7 @@ pub fn relaxed_body(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// "simple" body canonicalization (RFC 6376 Section 3.4.3): the body as-is,
+/// "simple" canonicalization of `body` (RFC 6376 Section 3.4.3): as-is,
 /// except trailing empty lines are ignored and a missing final CRLF is
 /// added. A completely empty body canonicalizes to a single CRLF.
 pub fn simple_body(body: &[u8]) -> Vec<u8> {
@@ -450,7 +473,7 @@ pub fn simple_body(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Canonicalize the body with the named algorithm ("relaxed" or "simple";
+/// Canonicalize `body` with the algorithm `alg` ("relaxed" or "simple";
 /// anything else falls back to "simple").
 pub fn canonicalize_body(alg: &str, body: &[u8]) -> Vec<u8> {
     match alg {
@@ -459,7 +482,8 @@ pub fn canonicalize_body(alg: &str, body: &[u8]) -> Vec<u8> {
     }
 }
 
-/// The `DKIM-Signature` header value with the `b=` tag's value deleted
+/// Returns the `DKIM-Signature` header value `raw_value` with the `b=`
+/// tag's value deleted
 /// (RFC 6376 Section 3.7: the signature header is included in the header
 /// hash with `b=` treated as the empty string). The `b=` name and the `;`
 /// separators are preserved.
@@ -486,12 +510,16 @@ fn dkim_sig_without_b(raw_value: &[u8]) -> Vec<u8> {
 // Hashing (RFC 6376 Section 3.7)
 // ---------------------------------------------------------------------------
 
-/// Compute the base64 body hash (`bh=`) for a signature over the message's
-/// raw body: canonicalize per the signature's body algorithm, truncate to
-/// `l=` bytes if present, then hash with the algorithm named by `a=`.
+/// Compute the base64 body hash (`bh=`) for signature `sig` over the raw
+/// body of `msg`: canonicalize per the signature's body algorithm,
+/// truncate to `l=` bytes if present, then hash with the algorithm named
+/// by `a=`.
 ///
-/// Returns `Ok(base64 digest)` or `Err` for an unsupported hash
-/// algorithm.
+/// Returns the base64 digest.
+///
+/// # Errors
+///
+/// [`DkimError::UnsupportedAlgorithm`] for a hash other than SHA-256.
 pub fn body_hash(msg: &RawMessage, sig: &DkimSignature) -> Result<String, DkimError> {
     let mut canon = canonicalize_body(sig.body_canon, msg.body);
     if let Some(l) = sig.body_length {
@@ -504,21 +532,27 @@ pub fn body_hash(msg: &RawMessage, sig: &DkimSignature) -> Result<String, DkimEr
     }
 }
 
-/// Check the computed body hash against the signature's `bh=` tag.
+/// Check the body hash computed over `msg` against the `bh=` tag of
+/// `sig`.
 ///
-/// Returns `Ok(true)` on an exact match, `Ok(false)` on a mismatch
-/// (the classic DKIM `permfail` body condition), or `Err` if the body
-/// hash itself could not be computed.
+/// Returns `true` on an exact match, `false` on a mismatch (the classic
+/// DKIM `permfail` body condition).
+///
+/// # Errors
+///
+/// The body hash itself could not be computed (see [`body_hash`]).
 pub fn body_hash_matches(msg: &RawMessage, sig: &DkimSignature) -> Result<bool, DkimError> {
     Ok(body_hash(msg, sig)? == strip_fws(sig.body_hash))
 }
 
-/// Verify the body hash of every `DKIM-Signature` in the message, returning
-/// each parsed signature with its body-hash verdict.
+/// Verify the body hash of every `DKIM-Signature` in `msg`.
 ///
-/// Note: a passing body hash alone does NOT prove the message is authentic;
-/// cryptographic verification of `b=` against the published public key is
-/// not implemented yet.
+/// Returns each parsed signature with its body-hash verdict (`false` also
+/// when the hash can't be computed).
+///
+/// Note: a passing body hash alone does NOT prove the message is
+/// authentic; [`verify_dkim`] also verifies `b=` against the published
+/// public key.
 pub fn verify_body_hashes<'m>(msg: &'m RawMessage<'m>) -> Vec<(DkimSignature<'m>, bool)> {
     find_signatures(msg)
         .into_iter()
@@ -535,6 +569,10 @@ pub fn verify_body_hashes<'m>(msg: &'m RawMessage<'m>) -> Vec<(DkimSignature<'m>
 /// instance used at most once, each followed by CRLF, and finally the
 /// canonicalized `DKIM-Signature` header itself (with `b=` emptied) without
 /// a trailing CRLF.
+///
+/// `sig` is the signature parsed from `sig_header`, a header of `msg`.
+/// This never returns `Err` today; the `Result` leaves room for
+/// canonicalization failures.
 pub fn signed_header_data(
     msg: &RawMessage,
     sig: &DkimSignature,
@@ -1131,10 +1169,10 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         (signed, key)
     }
 
-    /// DKIM works on the raw view, so a signed
-    /// message whose headers the typed grammar rejects — non-UTF-8 bytes,
-    /// or comments nested past mailparse's bound — still verifies, and
-    /// deep nesting never reaches the recursive grammar at all.
+    /// DKIM works on the raw view, so a signed message whose headers the
+    /// typed grammar rejects — non-UTF-8 bytes, or comments nested past
+    /// mailparse's bound — still verifies, and deep nesting never reaches
+    /// the recursive grammar at all.
     #[test]
     fn verifies_messages_the_typed_parser_rejects() {
         let deep = format!("{}{}", "(".repeat(100_000), ")".repeat(100_000));
@@ -1203,7 +1241,7 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         let parsed = &find_signatures(&msg)[0];
         let started = std::time::Instant::now();
         signed_header_data(&msg, &parsed.signature, parsed.header).unwrap();
-        // The quadratic scan was ~51M comparisons here; linear is ~1 ms.
+        // A quadratic scan would be ~51M comparisons here; linear is ~1 ms.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "took {:?}",
@@ -1254,7 +1292,13 @@ pub struct DkimKeyRecord {
 }
 
 impl DkimKeyRecord {
-    /// Parse the tag list of a DKIM key TXT record.
+    /// Parse the tag list `raw` of a DKIM key TXT record, applying the
+    /// defaults (`k=rsa`, `s=*`). An empty `p=` (revocation) parses; it is
+    /// refused at verification.
+    ///
+    /// # Errors
+    ///
+    /// [`DkimError::InvalidKey`] when there is no `p=` tag.
     pub fn parse(raw: &str) -> Result<Self, DkimError> {
         let mut version = String::new();
         let mut key_type = String::new();
@@ -1325,9 +1369,16 @@ impl DkimKeyRecord {
     }
 }
 
-/// Fetch the DKIM public key record for a signature:
-/// TXT at `{selector}._domainkey.{domain}`, over the shared DNS-over-TLS
-/// client (pooled connection, TTL cache).
+/// Fetch the DKIM public key record for signature `sig`: TXT at
+/// `{selector}._domainkey.{domain}`, through `resolver` (the shared
+/// DNS-over-TLS client).
+///
+/// Returns the first TXT answer that parses as a key record.
+///
+/// # Errors
+///
+/// [`DkimError::KeyLookupFailed`] when the query fails,
+/// [`DkimError::NoKeyRecord`] when no answer parses.
 pub async fn fetch_public_key(
     resolver: &DnsClient,
     sig: &DkimSignature<'_>,
@@ -1373,8 +1424,8 @@ fn auid_matches(sig: &DkimSignature, key: &DkimKeyRecord) -> bool {
 /// RFC 8301 §3.2: the smallest RSA key a verifier may accept.
 pub const MIN_RSA_BITS: usize = 1024;
 
-/// Whether the signature covers the whole canonicalised body. With `l=` shorter than the body, anything after it
-/// is unsigned: content appended to a genuinely signed message would still
+/// Whether `sig` covers the whole canonicalised body of `msg`. With `l=`
+/// shorter than the body, anything after it is unsigned: content appended to a genuinely signed message would still
 /// verify and pass DMARC. With `l=` longer than the body, RFC 6376 §3.5
 /// says the signature is invalid. Either way it must not count as
 /// verified. [`body_hash`] still computes the `l=`-truncated hash, for
@@ -1386,8 +1437,8 @@ fn covers_whole_body(msg: &RawMessage, sig: &DkimSignature) -> bool {
     }
 }
 
-/// Whether the signature is expired: `x=` is in the past (RFC 6376
-/// Section 3.5). Signatures without `x=` never expire.
+/// Whether `sig` is expired at `now` (Unix seconds): `x=` is in the past
+/// (RFC 6376 Section 3.5). Signatures without `x=` never expire.
 fn is_expired(sig: &DkimSignature, now: u64) -> bool {
     sig.expiry.is_some_and(|x| x < now)
 }
@@ -1396,8 +1447,14 @@ fn is_expired(sig: &DkimSignature, now: u64) -> bool {
 /// public key in `key` (RFC 6376 Section 6.1, RFC 8463 for Ed25519).
 /// Only `*-sha256` signatures are supported.
 ///
-/// Returns `Ok(false)` when the signature does not match; `Err` for
-/// structural problems (revoked key, unsupported algorithm, malformed key).
+/// Returns `true` when the signature verifies, `false` when it does not
+/// match.
+///
+/// # Errors
+///
+/// Structural problems: an unsupported key record version, a revoked
+/// key, an unsupported or unaccepted hash, an unsupported key type, a
+/// malformed or too-short key, or a malformed `b=` value.
 pub fn verify_signature(
     sig: &DkimSignature,
     key: &DkimKeyRecord,
@@ -1430,7 +1487,14 @@ pub fn verify_signature(
     }
 }
 
+/// Verify `sig`'s `b=` over `signed_data` with the RSA key in `key`:
 /// RSA PKCS#1 v1.5 with SHA-256 (RFC 6376 Section 3.3).
+///
+/// Returns whether the signature matches.
+///
+/// # Errors
+///
+/// A malformed key, a key under [`MIN_RSA_BITS`], or a malformed `b=`.
 fn verify_rsa(
     sig: &DkimSignature,
     key: &DkimKeyRecord,
@@ -1446,7 +1510,7 @@ fn verify_rsa(
         .or_else(|_| RsaPublicKey::from_pkcs1_der(&key_bytes))
         .map_err(|e| DkimError::InvalidKey(e.to_string()))?;
     // RFC 8301 §3.2: keys under 1024 bits MUST NOT be accepted; they are
-    // cheap to factor, so anyone could forge for the domain (F5). The rsa
+    // cheap to factor, so anyone could forge for the domain. The rsa
     // crate already refuses keys over 4096 bits, which bounds the CPU cost.
     let bits = public_key.n().bits();
     if bits < MIN_RSA_BITS {
@@ -1463,8 +1527,15 @@ fn verify_rsa(
     Ok(verifying_key.verify(signed_data, &signature).is_ok())
 }
 
-/// Ed25519 (PureEdDSA) over the SHA-256 digest of the canonicalized data
-/// (RFC 8463). The `p=` tag is the base64 of the raw 32-byte public key.
+/// Verify `sig`'s `b=` over `signed_data` with the Ed25519 key in `key`:
+/// PureEdDSA over the SHA-256 digest of the canonicalized data (RFC
+/// 8463). The `p=` tag is the base64 of the raw 32-byte public key.
+///
+/// Returns whether the signature matches.
+///
+/// # Errors
+///
+/// A malformed or wrong-length key, or a malformed `b=`.
 fn verify_ed25519(
     sig: &DkimSignature,
     key: &DkimKeyRecord,
@@ -1492,10 +1563,6 @@ fn verify_ed25519(
 ///
 /// `body_hash_ok` and `signature_ok` are independent: the body hash checks
 /// the message body against the `bh=` tag, while the signature check
-/// The outcome of checking one DKIM signature.
-///
-/// `body_hash_ok` and `signature_ok` are independent: the body hash checks
-/// the message body against the `bh=` tag, while the signature check
 /// verifies the signed header data (including the `bh=` tag as written)
 /// against the published public key. A message is DKIM-verified only when
 /// both are true.
@@ -1512,9 +1579,13 @@ pub struct DkimResult<'a> {
     pub error: Option<DkimError>,
 }
 
-/// Verify one signature against a known key record and the current time.
-/// This is the DNS-free core of the verifier and is fully testable
-/// offline.
+/// Verify the signature `parsed` of `msg` against the key record `key`
+/// at time `now` (Unix seconds). This is the DNS-free core of the
+/// verifier and is fully testable offline.
+///
+/// Returns the result. Expiry, a partial-body `l=`, a key that doesn't
+/// permit email, and a misaligned `i=` are checked first, in that order;
+/// any of them records the error and skips the cryptographic check.
 pub fn verify_with_key<'m>(
     msg: &RawMessage<'m>,
     parsed: &ParsedSignature<'_, 'm>,
@@ -1553,26 +1624,31 @@ pub fn verify_with_key<'m>(
     }
 }
 
-/// The most signatures [`verify_dkim`] evaluates per message. Each signature costs a key lookup, a full body
-/// canonicalization + hash, and a public-key operation; without a cap a
+/// The most signatures [`verify_dkim`] evaluates per message. Each
+/// signature costs a key lookup, a full body canonicalization + hash, and
+/// a public-key operation; without a cap a
 /// 1 MiB message could carry >10,000 signature headers. Legitimate mail
 /// carries a handful (author domain, ESP, a forwarder or two), so the
 /// topmost (most recently added) signatures are evaluated and the rest
 /// are ignored — an ignored signature simply contributes no pass.
 pub const MAX_SIGNATURES: usize = 5;
 
-/// The most `h=` entries a signature may list. Real
-/// signatures name a few dozen headers even with heavy oversigning; a
-/// longer list is refused as an invalid `h=` tag, so the signature
-/// contributes no pass. Header selection is linear regardless, so this only
-/// bounds the work and memory one signature can ask for.
+/// The most `h=` entries a signature may list. Real signatures name a few
+/// dozen headers even with heavy oversigning; a longer list is refused as
+/// an invalid `h=` tag, so the signature contributes no pass. Header
+/// selection is linear regardless, so this only bounds the work and
+/// memory one signature can ask for.
 pub const MAX_SIGNED_HEADERS: usize = 256;
 
-/// Verify every DKIM signature on a raw message: parse, check body hashes,
-/// fetch each signer's public key over DNS-over-TLS, and cryptographically
-/// verify the signed header data. Returns one result per signature; an
-/// empty result means the message had no parseable DKIM signature. At
-/// most [`MAX_SIGNATURES`] signatures (the topmost) are evaluated.
+/// Verify every DKIM signature on the raw message `raw`: parse, check
+/// body hashes, fetch each signer's public key through `resolver`, and
+/// cryptographically verify the signed header data. At most
+/// [`MAX_SIGNATURES`] signatures (the topmost) are evaluated.
+///
+/// Returns one result per evaluated signature (a failed key lookup is
+/// recorded as that result's error); an empty result means the message
+/// had no parseable DKIM signature or could not be split into headers
+/// and body.
 pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimResult<'m>> {
     let Ok(msg) = parse_raw_message(raw) else {
         return Vec::new();

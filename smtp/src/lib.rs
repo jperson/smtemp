@@ -70,7 +70,7 @@ impl Control {
         Control::Challenge(reply.into())
     }
 
-    /// The reply bytes to send to the client.
+    /// Returns the reply bytes to send to the client.
     pub fn reply(&self) -> &[u8] {
         match self {
             Control::Accept(r)
@@ -81,7 +81,7 @@ impl Control {
         }
     }
 
-    /// The reply bytes, consuming the control.
+    /// Returns the reply bytes, consuming the control.
     pub fn into_reply(self) -> Vec<u8> {
         match self {
             Control::Accept(r)
@@ -92,7 +92,8 @@ impl Control {
         }
     }
 
-    /// Whether this control lets the command through.
+    /// Returns whether this control lets the command through (only
+    /// [`Control::Accept`] does).
     pub fn is_accept(&self) -> bool {
         matches!(self, Control::Accept(_))
     }
@@ -180,8 +181,15 @@ enum Line {
     Overflow { terminated: bool, last: Option<u8> },
 }
 
-/// Read one line (up to and including '\n'), never buffering more than
-/// `cap` octets before reporting overflow.
+/// Read one line (up to and including '\n') from `reader`, never
+/// buffering more than `cap` octets before reporting overflow.
+///
+/// Returns [`Line::Complete`] (empty at EOF with nothing read) or
+/// [`Line::Overflow`].
+///
+/// # Errors
+///
+/// Any I/O error from the reader.
 async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     cap: usize,
@@ -225,10 +233,15 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// Consume bytes up to and including the next '\n' (or EOF), discarding
-/// them. Used to drain the remainder of an over-long line. `last` is the
-/// last octet already consumed before the drain. Returns whether the line
-/// ended with CRLF (false for a bare LF or EOF).
+/// Consume bytes from `reader` up to and including the next '\n' (or
+/// EOF), discarding them. Used to drain the remainder of an over-long
+/// line. `last` is the last octet already consumed before the drain.
+///
+/// Returns whether the line ended with CRLF (false for a bare LF or EOF).
+///
+/// # Errors
+///
+/// Any I/O error from the reader.
 async fn drain_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     mut last: Option<u8>,
@@ -253,7 +266,7 @@ async fn drain_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// ASCII case-insensitive equality.
+/// Returns whether `a` and `b` are equal, ignoring ASCII case.
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -261,8 +274,12 @@ fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
             .all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-/// Decode a base64 AUTH token. The special initial response `=` means an
-/// empty response (RFC 4954 Section 4).
+/// Decode the base64 AUTH token `input` (surrounding whitespace ignored).
+/// The special initial response `=` means an empty response (RFC 4954
+/// Section 4).
+///
+/// Returns the decoded bytes, or `None` if `input` is not UTF-8 or not
+/// valid standard base64.
 pub fn decode_b64(input: &[u8]) -> Option<Vec<u8>> {
     if input == b"=" {
         return Some(Vec::new());
@@ -274,10 +291,12 @@ pub fn decode_b64(input: &[u8]) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Decode an RFC 4616 PLAIN message: `authzid NUL authcid NUL passwd`.
-/// Returns `(authcid, passwd)`; the authorization identity must be empty
-/// or equal to the authentication identity (the only form this server
-/// supports).
+/// Decode the RFC 4616 PLAIN message `input`: `authzid NUL authcid NUL
+/// passwd`.
+///
+/// Returns `(authcid, passwd)`, or `None` unless there are exactly three
+/// UTF-8 fields and the authorization identity is empty or equal to the
+/// authentication identity (the only form this server supports).
 pub fn decode_plain(input: &[u8]) -> Option<(String, String)> {
     let parts: Vec<&[u8]> = input.split(|&b| b == 0).collect();
     if parts.len() != 3 {
@@ -292,7 +311,9 @@ pub fn decode_plain(input: &[u8]) -> Option<(String, String)> {
     Some((authcid.to_string(), passwd.to_string()))
 }
 
-/// Split the command content into its verb and the rest of the line.
+/// Split the command `content` at its first space.
+///
+/// Returns the verb and the rest of the line (`None` without a space).
 fn split_verb(content: &[u8]) -> (&[u8], Option<&[u8]>) {
     match content.iter().position(|&b| b == b' ') {
         Some(i) => (&content[..i], Some(&content[i + 1..])),
@@ -300,7 +321,8 @@ fn split_verb(content: &[u8]) -> (&[u8], Option<&[u8]>) {
     }
 }
 
-/// Trim trailing ASCII whitespace (SP, HTAB, CR, LF) from a byte slice.
+/// Returns `bytes` with trailing ASCII whitespace (SP, HTAB, LF, FF, CR)
+/// removed.
 fn trim_ascii_end(mut bytes: &[u8]) -> &[u8] {
     while let Some((&last, rest)) = bytes.split_last() {
         if last.is_ascii_whitespace() {
@@ -353,19 +375,24 @@ pub trait SmtpSession {
     /// (`DATA_LINE_TOO_LONG`, then discard-until-dot).
     const MAX_DATA_LINE: usize = 64 * 1024;
 
-    /// The banner to send when the connection opens.
+    /// Returns the banner to send when the connection opens.
     fn server_greet(&self) -> impl Future<Output = Vec<u8>> + Send;
 
-    /// HELO/EHLO. `ehlo` distinguishes the verbs so the reply can carry
-    /// the multiline capability list (RFC 5321 Section 3.2). `Accept`
-    /// advances the session to [`SmtpState::Ready`]; anything else leaves
-    /// it in [`SmtpState::Idle`].
+    /// HELO/EHLO with the non-empty, trailing-whitespace-trimmed domain
+    /// argument `arg`. `ehlo` distinguishes the verbs so the reply can
+    /// carry the multiline capability list (RFC 5321 Section 3.2).
+    /// `Accept` advances the session to [`SmtpState::Ready`]; anything
+    /// else leaves it in [`SmtpState::Idle`].
     fn helo(&mut self, ehlo: bool, arg: &str) -> impl Future<Output = Control> + Send;
 
-    /// MAIL FROM. `Accept` records the envelope sender.
+    /// MAIL FROM. `path` is everything after `FROM:` (the path plus any
+    /// ESMTP parameters), trailing whitespace trimmed, never empty.
+    /// `Accept` records the envelope sender; the state stays Ready either
+    /// way.
     fn mail_from(&mut self, path: &str) -> impl Future<Output = Control> + Send;
 
-    /// RCPT TO. `Accept` records the recipient.
+    /// RCPT TO. `path` is everything after `TO:`, as for
+    /// [`SmtpSession::mail_from`]. `Accept` records the recipient.
     fn rcpt_to(&mut self, path: &str) -> impl Future<Output = Control> + Send;
 
     /// DATA. `Accept` starts message-data mode; a rejection (e.g. no valid
@@ -409,10 +436,10 @@ pub trait SmtpSession {
         initial: Option<&[u8]>,
     ) -> impl Future<Output = Control> + Send;
 
-    /// One continuation line of an in-progress AUTH exchange, either the
-    /// base64 response to the previous challenge or a client abort (`*`,
-    /// which the protocol layer intercepts). Only called in
-    /// [`SmtpState::Auth`].
+    /// One continuation `line` of an in-progress AUTH exchange (without
+    /// its line ending): the base64 response to the previous challenge. A
+    /// client abort (`*`) is intercepted by the protocol layer and never
+    /// reaches this method. Only called in [`SmtpState::Auth`].
     fn auth_line(&mut self, line: &[u8]) -> impl Future<Output = Control> + Send;
 
     /// A message-data line exceeded [`SmtpSession::MAX_DATA_LINE`], so the
@@ -438,13 +465,23 @@ pub trait SmtpSession {
         std::future::pending()
     }
 
-    /// Serve one connection: read bounded lines, run them through
-    /// `handler`, write replies, until QUIT, EOF, an error, a read
-    /// timeout, or a STARTTLS pause.
+    /// Serve one connection over `stream`: read bounded lines, run them
+    /// through `handler`, write replies, until QUIT, EOF, an error, a
+    /// read timeout, a graceful shutdown, or a STARTTLS pause.
+    ///
+    /// Each read (including the drain of an over-long line) may take at
+    /// most `max_read_duration_ms`. `session_state` carries the state and
+    /// whether the banner was sent, so a call after a STARTTLS pause
+    /// resumes where the previous one stopped. `_peer` and `_domain` are
+    /// unused by the protocol layer.
     ///
     /// Generic over the stream so sessions can be tested in-process
     /// against an in-memory duplex — and so the driver can hand a
     /// plaintext stream first and a TLS stream after a STARTTLS upgrade.
+    ///
+    /// Returns why the loop ended. Read errors, timeouts and write
+    /// failures end the session as [`EndReason::Closed`]; this never
+    /// returns `Err` today.
     fn run<R>(
         &mut self,
         stream: &mut BufReader<R>,
@@ -584,9 +621,13 @@ pub trait SmtpSession {
         }
     }
 
-    /// Apply one command line in the given state, returning the reply and
-    /// the next state. Every command produces a reply — there is no silent
-    /// error path. `msg` includes the line ending as received.
+    /// Apply one line `msg` (including its line ending as received) in
+    /// `state`.
+    ///
+    /// Returns the reply to send and the next state. Every command
+    /// produces a reply — there is no silent error path; only message
+    /// data lines and the end of a discarded transfer produce an empty
+    /// reply.
     ///
     /// DATA framing (RFC 5321 Section 4.1.1.4 / 4.5.2): in `Data` and
     /// `Discard` states every line is message data — `RSET`, `QUIT`, and
@@ -788,10 +829,17 @@ pub trait SmtpSession {
         }
     }
 
-    /// Validate the argument of MAIL FROM / RCPT TO: an ASCII
-    /// case-insensitive `from:`/`to:` prefix and a non-empty, UTF-8 path.
-    /// `Err` carries the reply to send (syntax errors keep the session in
-    /// its current Ready state).
+    /// Validate the argument `arg` of MAIL FROM / RCPT TO: an ASCII
+    /// case-insensitive `prefix` (`from:`/`to:`) and a non-empty, UTF-8
+    /// path.
+    ///
+    /// Returns the path after the prefix, trailing whitespace trimmed.
+    ///
+    /// # Errors
+    ///
+    /// The reply to send: [`SmtpSession::UNKNOWN`] when the prefix is
+    /// missing, [`SmtpSession::SYNTAX_ERR`] for no argument, a non-UTF-8
+    /// path or an empty path. Either way the session stays in Ready.
     fn envelope_arg<'a>(
         arg: Option<&'a [u8]>,
         prefix: &[u8],
@@ -814,6 +862,7 @@ pub trait SmtpSession {
 }
 
 impl Line {
+    /// Whether this is an empty complete line: EOF with nothing read.
     fn is_complete_and_empty(&self) -> bool {
         matches!(self, Line::Complete(line) if line.is_empty())
     }
@@ -2555,8 +2604,7 @@ mod tests {
         // The "." terminator ends the discard — with no reply.
         client.write_all(b".\r\n").await.unwrap();
 
-        // The session is usable again — but it is in Ready, not Idle, so
-        // HELO would correctly be refused, and SmallSession's 16-octet
+        // The session is usable again, in Ready. SmallSession's 16-octet
         // command cap limits the command length; MAIL FROM:<a> is 15
         // octets and valid in Ready.
         client.write_all(b"MAIL FROM:<a>\r\n").await.unwrap();
@@ -2604,7 +2652,7 @@ mod tests {
         client.write_all(&[b'X'; 40]).await.unwrap();
 
         // The run task must terminate on its own (drain read timeout);
-        // awaiting it here is the regression assertion.
+        // awaiting it here is the assertion.
         let (session, result) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .expect("session must end after the read timeout, not hang")

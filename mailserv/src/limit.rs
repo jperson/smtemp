@@ -15,9 +15,9 @@
 //! consume capacity.
 //!
 //! The fixed-window counter trades precision for simplicity and O(1)
-//! state per IP; memory is bounded by the sweep on each admission,
-//! which drops IPs with no active connections once their window has
-//! rolled over.
+//! state per IP; memory is bounded by the sweep on each release, which
+//! drops IPs with no active connections once their window has rolled
+//! over.
 //!
 //! The [`DnsLimiter`] bounds a second resource per source IP: concurrent
 //! **DNS-backed evaluations** (SPF for HELO and MAIL FROM, DKIM + DMARC
@@ -46,8 +46,8 @@ pub enum LimitReason {
 }
 
 impl LimitReason {
-    /// The SMTP reply text for the refusal (a `421`, inviting the
-    /// client to retry later).
+    /// Returns the complete SMTP reply line (with CRLF) for the refusal:
+    /// a `421`, inviting the client to retry later.
     pub fn reply(&self) -> &'static [u8] {
         match self {
             LimitReason::TooManyConcurrent => {
@@ -64,8 +64,11 @@ impl LimitReason {
 /// admission counter.
 #[derive(Debug)]
 struct Entry {
+    /// Connections from this IP currently admitted and not released.
     active: u32,
+    /// When the current fixed window began.
     window_start: Instant,
+    /// Connections admitted since `window_start`.
     window_count: u32,
 }
 
@@ -74,9 +77,13 @@ struct Entry {
 /// admission is a map lookup and a few integer updates.
 #[derive(Debug)]
 pub struct ConnectionLimiter {
+    /// Concurrent connections allowed per IP.
     max_per_ip: u32,
+    /// New connections allowed per IP per `window`.
     max_per_window: u32,
+    /// Length of the fixed rate window.
     window: Duration,
+    /// Per-IP state.
     entries: Mutex<HashMap<IpAddr, Entry>>,
 }
 
@@ -95,10 +102,11 @@ impl ConnectionLimiter {
     /// Try to admit a connection from `ip`.
     ///
     /// Returns `Ok` only when the connection is within both budgets; on
-    /// success the IP's active count is incremented and the caller MUST
-    /// call [`ConnectionLimiter::release`] when the connection ends.
-    /// Returns `Err(reason)` — with nothing recorded — when the IP is
-    /// over its concurrent cap or its window budget.
+    /// success the IP's active and window counts are incremented and the
+    /// caller MUST call [`ConnectionLimiter::release`] when the
+    /// connection ends. Returns `Err(reason)` — without incrementing
+    /// either count — when the IP is over its concurrent cap or its
+    /// window budget.
     pub async fn admit(&self, ip: IpAddr) -> Result<(), LimitReason> {
         let mut entries = self.entries.lock().await;
         let now = Instant::now();
@@ -126,9 +134,10 @@ impl ConnectionLimiter {
         Ok(())
     }
 
-    /// Release one admitted connection: decrement the IP's active
-    /// count. Calling this without a matching successful `admit` (or
-    /// twice) would under-count, so it must pair exactly.
+    /// Release one admitted connection from `ip`: decrement its active
+    /// count, then sweep idle entries whose window has expired. Calling
+    /// this without a matching successful `admit` (or twice) would
+    /// under-count, so it must pair exactly.
     pub async fn release(&self, ip: IpAddr) {
         let mut entries = self.entries.lock().await;
         if let Some(entry) = entries.get_mut(&ip) {
@@ -163,7 +172,9 @@ pub struct DnsBusy;
 /// for a permit (the entry is removed when that reaches zero).
 #[derive(Debug)]
 struct DnsShare {
+    /// `per_ip` permits for this IP.
     semaphore: Arc<Semaphore>,
+    /// Evaluations holding or waiting for a permit.
     users: usize,
 }
 
@@ -194,10 +205,15 @@ pub struct DnsLimitStats {
 /// exists only while some evaluation holds or waits for its permits.
 #[derive(Debug)]
 pub struct DnsLimiter {
+    /// Concurrent evaluations allowed per IP.
     per_ip: usize,
+    /// Longest an evaluation waits for a permit.
     wait: Duration,
+    /// Shares of the IPs with an evaluation in progress.
     shares: std::sync::Mutex<HashMap<IpAddr, DnsShare>>,
+    /// Running total for [`DnsLimitStats::waits`].
     waits: AtomicU64,
+    /// Running total for [`DnsLimitStats::refusals`].
     refusals: AtomicU64,
 }
 
@@ -206,8 +222,11 @@ pub struct DnsLimiter {
 /// evaluation (or a wait for the permit) is cancelled.
 #[derive(Debug)]
 pub struct DnsPermit {
+    /// The limiter whose share this is.
     limiter: Arc<DnsLimiter>,
+    /// The source IP the share belongs to.
     ip: IpAddr,
+    /// The semaphore permit; `None` while still waiting for it.
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -237,11 +256,13 @@ impl DnsLimiter {
         }
     }
 
-    /// The per-IP limit.
+    /// Returns the per-IP limit.
     pub fn per_ip(&self) -> usize {
         self.per_ip
     }
 
+    /// Lock the share map, recovering it if a holder panicked (the map is
+    /// valid after any partial update).
     fn lock_shares(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, DnsShare>> {
         self.shares
             .lock()
@@ -288,7 +309,7 @@ impl DnsLimiter {
         }
     }
 
-    /// Current counters.
+    /// Returns a snapshot of the current counters.
     pub fn stats(&self) -> DnsLimitStats {
         DnsLimitStats {
             waits: self.waits.load(Ordering::Relaxed),
@@ -366,7 +387,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // One more admission triggers the sweep over all expired entries.
+        // The next release triggers the sweep over all expired entries.
         let survivor = "10.9.0.200".parse().unwrap();
         limiter.admit(survivor).await.unwrap();
         limiter.release(survivor).await;

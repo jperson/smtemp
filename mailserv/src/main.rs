@@ -33,12 +33,17 @@ mod spool;
 /// One DKIM verification outcome, summarized for structured logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct DkimSummary {
+    /// Signing domain (`d=`).
     domain: String,
+    /// Key selector (`s=`).
     selector: String,
+    /// Whether the body hash (`bh=`) matched.
     body_hash_ok: bool,
+    /// Whether the signature verified against the published key.
     signature_ok: bool,
     /// True only when both the body hash and the signature verify.
     verified: bool,
+    /// Why verification failed, when it did.
     error: Option<String>,
 }
 
@@ -47,12 +52,16 @@ struct DkimSummary {
 #[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Address to listen on (default 0.0.0.0).
     #[arg(long)]
     host: Option<String>,
 
+    /// Port to listen on (default 25).
     #[arg(long)]
     port: Option<u16>,
 
+    /// This server's domain, used in the greeting and `Received:` headers
+    /// (required, here or in the config file).
     #[arg(long)]
     domain: Option<String>,
 
@@ -60,9 +69,11 @@ struct Args {
     #[arg(long)]
     max_data_bytes: Option<usize>,
 
+    /// Whole-connection time limit in milliseconds (default 300000).
     #[arg(long)]
     max_conn_duration_ms: Option<u64>,
 
+    /// Per-read idle time limit in milliseconds (default 15000).
     #[arg(long)]
     max_read_duration_ms: Option<u64>,
 
@@ -170,17 +181,16 @@ struct Args {
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users, auth-senders, resolver, resolver-ca,
-    /// dns-connections,
-    /// spool-dir, maildir-dir,
-    /// max-connections, max-conn-per-ip, max-conn-rate-per-ip,
-    /// max-dns-per-ip, user, group, shutdown-grace-ms,
-    /// local-domains, authority); every key
-    /// optional.
+    /// dns-connections, spool-dir, maildir-dir, max-connections,
+    /// max-conn-per-ip, max-conn-rate-per-ip, max-dns-per-ip, user, group,
+    /// shutdown-grace-ms, local-domains, authority); every key optional.
     #[arg(long, value_name = "FILE")]
     config: Option<String>,
 }
 
-/// The TOML config file schema ([`Args::config`]).
+/// The TOML config file schema ([`Args::config`]). Every field mirrors
+/// the [`Args`] flag of the same name (kebab-case in the file) and is
+/// optional; unknown keys are ignored.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct FileConfig {
@@ -213,20 +223,34 @@ struct FileConfig {
 /// Fully resolved server configuration (CLI > file > built-in defaults).
 #[derive(Debug, Clone)]
 struct Config {
+    /// Listen address (default 0.0.0.0).
     host: String,
+    /// Listen port (default [`DEFAULT_PORT`]).
     port: u16,
+    /// This server's domain.
     domain: String,
+    /// Server-wide message size limit (default [`DEFAULT_MAX_DATA_BYTES`]).
     max_data_bytes: usize,
+    /// Whole-connection time limit (default
+    /// [`DEFAULT_MAX_CONN_DURATION_MS`]).
     max_conn_duration_ms: u64,
+    /// Per-read idle time limit (default 15 s).
     max_read_duration_ms: u64,
+    /// Server-wide concurrent connections (default
+    /// [`DEFAULT_MAX_CONNECTIONS`]).
     max_connections: u32,
+    /// Concurrent connections per source IP (default 10).
     max_conn_per_ip: u32,
+    /// New connections per source IP per 60 s window (default 60).
     max_conn_rate_per_ip: u32,
     /// Concurrent DNS-backed checks per source IP (default
     /// [`limit::DEFAULT_DNS_PER_IP`]).
     max_dns_per_ip: usize,
+    /// PEM certificate for STARTTLS.
     tls_cert: Option<String>,
+    /// PEM private key for STARTTLS.
     tls_key: Option<String>,
+    /// AUTH credentials (`auth::AuthConfig` users spec).
     auth_users: Option<String>,
     /// Sender grants for AUTH logins (`auth::SenderGrants` spec).
     auth_senders: Option<String>,
@@ -238,13 +262,16 @@ struct Config {
     /// Pipelined DoT connections to the resolver (default
     /// [`dns::DEFAULT_CONNECTIONS`]).
     dns_connections: usize,
-    /// Queue directory for accepted messages (default "spool").
+    /// Queue directory for accepted messages (default
+    /// [`DEFAULT_SPOOL_DIR`]).
     spool_dir: String,
-    /// Local delivery root (default "maildir").
+    /// Local delivery root (default [`DEFAULT_MAILDIR_DIR`]).
     maildir_dir: String,
+    /// Comma-separated hosted domains for the static authority; None
+    /// means `domain` only.
     local_domains: Option<String>,
     /// Recipient authority file; None uses the static fallback built
-    /// from local-domains (pre-authority behavior).
+    /// from `local_domains`.
     authority: Option<String>,
     /// User to drop to after binding, when started as root.
     user: Option<String>,
@@ -266,10 +293,13 @@ enum AuthorityAnswer {
     NotHosted,
     /// The domain is hosted but the address cannot receive mail.
     Refuse {
+        /// The domain's policy mode, for the refusal log.
         mode: authority::PolicyMode,
+        /// Why, for the refusal log (never revealed to the sender).
         reason: authority::RefusalReason,
     },
-    /// The authority could not be consulted: fail closed with 451.
+    /// The authority could not be consulted (the error text): fail closed
+    /// with 451.
     Unavailable(String),
 }
 
@@ -284,8 +314,9 @@ const DEFAULT_PORT: u16 = 25;
 
 /// The default per-message size limit: 10 MiB, in line with Postfix's
 /// 10,240,000-byte `message_size_limit` default. Large enough for typical
-/// attachments after base64 inflation; raise it (and size memory, see
-/// DEPLOYMENT.md D5) for more. Hosted domains can set a lower limit of
+/// attachments after base64 inflation; raise it (and size memory: a
+/// session buffers about twice this during DATA, see DEPLOYMENT.md) for
+/// more. Hosted domains can set a lower limit of
 /// their own (`max-message-bytes` in the authority file).
 const DEFAULT_MAX_DATA_BYTES: usize = 10 * 1024 * 1024;
 
@@ -301,7 +332,7 @@ const DEFAULT_MAX_CONN_DURATION_MS: u64 = 5 * 60 * 1000;
 
 /// The default server-wide connection limit: 100, the same as Postfix's
 /// `default_process_limit`. Each session can buffer up to about twice
-/// `max-data-bytes` during DATA (DEPLOYMENT.md D5), so 100 × 2 × 10 MiB
+/// `max-data-bytes` during DATA, so 100 × 2 × 10 MiB
 /// bounds message buffers at about 2 GiB in the worst case; real
 /// concurrency in DATA is far lower. Over the limit, connections get
 /// `421` and retry.
@@ -320,7 +351,16 @@ const DEFAULT_SPOOL_DIR: &str = "/var/lib/mailserv/spool";
 /// The default maildir root. Absolute for the same reason.
 const DEFAULT_MAILDIR_DIR: &str = "/var/lib/mailserv/maildir";
 
-/// Merge CLI arguments over config-file values over built-in defaults.
+/// Merge `cli` arguments over `file` config values over built-in
+/// defaults.
+///
+/// Returns the fully resolved [`Config`].
+///
+/// # Errors
+///
+/// No domain is configured, `max-dns-per-ip` is 0, `dns-connections` is
+/// outside `1..=dns::MAX_CONNECTIONS`, or a group is given without a
+/// user.
 fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
     let cli_or_file_user_set = cli.user.is_some() || file.user.is_some();
     Ok(Config {
@@ -407,7 +447,7 @@ const SPF_TEMPFAIL: &[u8] = b"451 4.4.3 Temporary SPF failure\r\n";
 /// RFC 7208 Section 8: the domain's SPF record is unusable.
 const SPF_PERMERROR: &[u8] = b"550 5.7.7 SPF policy error\r\n";
 /// RFC 5321 §4.1.1.1: the HELO/EHLO argument is not a domain or address
-/// literal (M8: it would be copied into `Received:`).
+/// literal (it would be copied into `Received:`).
 const BAD_HELO: &[u8] = b"501 5.5.2 Invalid HELO/EHLO domain\r\n";
 /// An authenticated user's MAIL FROM is not one their login may use
 /// (`--auth-senders`; RFC 3463 5.7.1, delivery not authorized).
@@ -424,18 +464,19 @@ const BAD_RCPT: &[u8] = b"553 5.1.3 Bad recipient address syntax\r\n";
 /// whole wait ([`limit::DNS_LIMIT_WAIT`]); retryable.
 const DNS_BUSY: &[u8] =
     b"451 4.7.0 Too many concurrent DNS checks from your address, try again later\r\n";
-/// The end-of-data DNS work (DKIM key lookups plus the DMARC policy
-/// fetch) didn't finish within [`END_OF_DATA_DNS_DEADLINE`]; retryable.
-/// The header block has a bare CR (F3, SECURITY-AUDIT.md; RFC 5322 §2.2).
+/// The header block has a bare CR (RFC 5322 §2.2: CR only occurs in
+/// CRLF). Refused because parsers disagree on where such a line ends.
 const BARE_CR_IN_HEADER: &[u8] = b"550 5.6.0 Message header contains a bare CR\r\n";
 /// The DMARC policy lookup failed (SERVFAIL, query timeout): deferred,
-/// never treated as "no policy" (F1, SECURITY-AUDIT.md).
+/// never treated as "no policy".
 const DMARC_TEMPFAIL: &[u8] =
     b"451 4.4.3 Temporary failure looking up the sender's DMARC policy, try again later\r\n";
+/// The end-of-data DNS work (DKIM key lookups plus the DMARC policy
+/// fetch) didn't finish within [`END_OF_DATA_DNS_DEADLINE`]; retryable.
 const EOD_DNS_TIMEOUT: &[u8] =
     b"451 4.4.3 Message checks timed out waiting for DNS, try again later\r\n";
 /// The overall time limit for end-of-data DNS work: every DKIM key lookup
-/// and the DMARC policy fetch together (D3, DEPLOYMENT.md). Without it,
+/// and the DMARC policy fetch together. Without it,
 /// up to 5 signatures (`dkim::MAX_SIGNATURES`) each waiting the 5 s
 /// per-query timeout, plus the DMARC fetch, could run past the connection
 /// cap, dropping the session with no reply. The same 20 s as
@@ -458,9 +499,10 @@ const MESSAGE_TOO_BIG: &[u8] = b"552 5.3.4 Message size exceeds fixed maximum me
 /// the first whitespace. An empty address is the null sender
 /// (`MAIL FROM:<>`).
 ///
-/// Returns `None` for an unterminated `<` or an address containing
-/// control characters (a bare CR would otherwise reach the generated
-/// `Return-Path:`/`Received:` headers).
+/// Returns `(address, params)`, both trimmed, or `None` for an
+/// unterminated `<` or an address containing control characters (a bare
+/// CR would otherwise reach the generated `Return-Path:`/`Received:`
+/// headers).
 fn clean_path(raw: &str) -> Option<(&str, &str)> {
     let raw = raw.trim();
     let (addr, params) = match raw.strip_prefix('<') {
@@ -479,8 +521,9 @@ fn clean_path(raw: &str) -> Option<(&str, &str)> {
     Some((addr, params))
 }
 
-/// The value of the `SIZE=` ESMTP parameter (RFC 1870), if present and
-/// numeric.
+/// Returns the value of the `SIZE=` ESMTP parameter (RFC 1870, key
+/// matched case-insensitively) in the whitespace-separated `params`, if
+/// present and numeric.
 fn size_param(params: &str) -> Option<u64> {
     params.split_ascii_whitespace().find_map(|p| {
         let (key, value) = p.split_once('=')?;
@@ -490,14 +533,15 @@ fn size_param(params: &str) -> Option<u64> {
     })
 }
 
-/// The domain of an address path: after the last '@'.
+/// Returns the domain of the address `addr` (everything after the last
+/// `@`, possibly empty), or `None` when it has no `@`.
 fn path_domain(addr: &str) -> Option<&str> {
     addr.rsplit_once('@').map(|(_, domain)| domain)
 }
 
-/// The local-part safety check for mailbox delivery (C1, security
-/// report). The local-part names a maildir directory, so it must never
-/// carry path semantics.
+/// The local-part safety check for mailbox delivery on `addr`. The
+/// local-part names a maildir directory, so it must never carry path
+/// semantics.
 ///
 /// Returns `Some(reason)` when the address must be refused: the
 /// local-part is empty, longer than RFC 5321's 64-octet limit, contains
@@ -505,7 +549,9 @@ fn path_domain(addr: &str) -> Option<&str> {
 /// leading dot or a `..` run. The safe set is RFC 5321 dot-atom text
 /// (`atext` plus `.`) **minus `/`**, the one atext character with path
 /// meaning — so ordinary addresses such as `o'brien@` keep working.
-/// Quoted local-parts are refused (server policy).
+/// Quoted local-parts are refused (server policy). Returns `None` when
+/// the local-part is safe, and also for an address with no `@` (callers
+/// reject those separately).
 fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     let local = addr.rsplit_once('@')?.0;
     if local.is_empty() {
@@ -523,12 +569,12 @@ fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     None
 }
 
-/// Is `h` an acceptable HELO/EHLO identity (M8, SECURITY.md)?
+/// Is `h` an acceptable HELO/EHLO identity?
 ///
 /// RFC 5321 §4.1.1.1: the argument is a `Domain` or an `address-literal`.
 /// It is copied into the delivered `Received:` header, so anything else —
-/// above all a bare CR or another control character, which once injected a
-/// header — is refused before it is stored. The domain form is deliberately
+/// above all a bare CR or another control character, which could inject
+/// a header — is refused before it is stored. The domain form is deliberately
 /// a little liberal (underscores, a trailing dot, single-label names such
 /// as `localhost`) because misconfigured but legitimate senders use them.
 fn valid_helo(h: &str) -> bool {
@@ -553,7 +599,8 @@ fn valid_helo(h: &str) -> bool {
         })
 }
 
-/// RFC 5321 `atext` plus `.`, excluding `/` (see [`unsafe_local_part`]).
+/// Is byte `b` in the mailbox-safe set: RFC 5321 `atext` plus `.`,
+/// excluding `/` (see [`unsafe_local_part`])?
 fn is_mailbox_safe(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
@@ -579,9 +626,9 @@ fn is_mailbox_safe(b: u8) -> bool {
         )
 }
 
-/// The outcome of scanning a raw message for its `From:` header (C4:
-/// this scan must be tolerant of bytes and headers the strict parser
-/// rejects, because a parse failure used to skip DMARC entirely).
+/// The outcome of scanning a raw message for its `From:` header. The
+/// scan tolerates bytes and headers the strict `mailparse` grammar
+/// rejects, so a message that fails to parse still gets a DMARC verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FromHeader {
     /// Exactly one `From:` header, with its domain extracted.
@@ -610,9 +657,11 @@ fn from_header_domain(raw: &[u8]) -> FromHeader {
     }
 }
 
-/// The unfolded value of the message's one `From:` header, or the
-/// problem ([`FromHeader::None`] / [`FromHeader::Multiple`]). The scan
-/// rules are those of [`from_header_domain`].
+/// Find the message's one `From:` header in the raw message `raw`.
+///
+/// Returns its unfolded, trimmed value, or the problem as `Err`
+/// ([`FromHeader::None`] / [`FromHeader::Multiple`]). The scan rules are
+/// those of [`from_header_domain`].
 fn single_from_value(raw: &[u8]) -> Result<Vec<u8>, FromHeader> {
     // The header block ends at the first empty line.
     let end = header_block_end(raw);
@@ -650,8 +699,8 @@ fn single_from_value(raw: &[u8]) -> Result<Vec<u8>, FromHeader> {
     }
 }
 
-/// Whether the header block (up to the first empty line) contains a CR
-/// that is not part of a CRLF (F3, SECURITY-AUDIT.md).
+/// Whether the header block of `raw` (up to the first empty line)
+/// contains a CR that is not part of a CRLF.
 fn header_has_bare_cr(raw: &[u8]) -> bool {
     let block = &raw[..header_block_end(raw)];
     block
@@ -660,8 +709,9 @@ fn header_has_bare_cr(raw: &[u8]) -> bool {
         .any(|(i, &b)| b == b'\r' && block.get(i + 1) != Some(&b'\n'))
 }
 
-/// The offset of the first empty line in the raw message (the header
-/// block's end), or `raw.len()` when there is none.
+/// Returns the offset of the first empty line (CRLF or bare LF) in the
+/// raw message `raw` — the header block's end — or `raw.len()` when
+/// there is none.
 fn header_block_end(raw: &[u8]) -> usize {
     let mut i = 0;
     while i < raw.len() {
@@ -682,8 +732,8 @@ fn header_block_end(raw: &[u8]) -> usize {
     raw.len()
 }
 
-/// If this header line is a `From` header, its value (everything after
-/// the colon). The name is matched case-insensitively and may be
+/// If header `line` is a `From` header, returns its value (everything
+/// after the colon, untrimmed); otherwise `None`. The name is matched case-insensitively and may be
 /// followed by whitespace before the colon (obsolete syntax that mail
 /// clients still display, so it must count as a From header).
 fn from_header_value(line: &[u8]) -> Option<&[u8]> {
@@ -698,9 +748,12 @@ fn from_header_value(line: &[u8]) -> Option<&[u8]> {
         .then(|| &line[colon + 1..])
 }
 
-/// Split a header block into lines, tolerating CRLF and bare LF (the
+/// Split header `block` into lines, tolerating CRLF and bare LF (the
 /// raw bytes come straight off the wire; bare LF was already ruled out
 /// as a DATA terminator but tolerance here costs nothing).
+///
+/// Returns the lines without their line endings; a final line without a
+/// terminator is included.
 fn split_header_lines(block: &[u8]) -> Vec<&[u8]> {
     let mut lines = Vec::new();
     let mut rest = block;
@@ -719,7 +772,8 @@ fn split_header_lines(block: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// Trim folding whitespace (WSP/CR/LF) from both ends of a header value.
+/// Returns header `value` with folding whitespace (SP, HTAB, CR, LF)
+/// trimmed from both ends.
 fn trim_header_fws(value: &[u8]) -> &[u8] {
     let is_fws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
     let start = value.iter().position(|b| !is_fws(b)).unwrap_or(value.len());
@@ -730,7 +784,7 @@ fn trim_header_fws(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
-/// The author domain of a From header value, read as an RFC 5322
+/// Classify the author domain of From header `value`, read as an RFC 5322
 /// mailbox-list (`mailbox *("," mailbox)`, each mailbox either
 /// `addr-spec` or `[display-name] <addr-spec>`).
 ///
@@ -872,7 +926,7 @@ fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     ))
 }
 
-/// The MAIL FROM verdict for an SPF evaluation of the sender identity
+/// Returns the MAIL FROM reply for SPF `result` on the sender identity
 /// (RFC 7208 Section 8): Pass/Neutral/SoftFail/None are accepted (the
 /// result is logged for downstream policy), Fail and PermError are
 /// permanent rejections, TempError is retryable.
@@ -888,8 +942,9 @@ fn mail_from_reply(result: &SpfResult) -> smtp::Control {
     }
 }
 
-/// Log why an SPF evaluation ended in an error (the error is otherwise
-/// only visible as the TempError/PermError it maps to). An exceeded
+/// Log why the SPF evaluation of `identity` (helo or mail_from) for
+/// `domain` ended in `error` (the error is otherwise only visible as the
+/// TempError/PermError it maps to). An exceeded
 /// evaluation deadline is a `warn`: it means slow or unresponsive DNS for
 /// the sender's records, which operators should see.
 fn log_spf_error(identity: &str, domain: &str, error: &spf::SpfError) {
@@ -918,11 +973,12 @@ fn log_dns_busy(stage: &str) {
 /// How often the DNS client's metrics are logged.
 const DNS_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Log the DNS client's metrics once per [`DNS_STATS_INTERVAL`] while it
-/// is being used, together with the per-source-IP DNS limiter's counters
+/// Log the metrics of DNS client `dns` once per [`DNS_STATS_INTERVAL`]
+/// while it is being used, together with the counters of `dns_limit`
 /// (DESIGN §9: the signals for sizing `--dns-connections` and
 /// `--max-dns-per-ip`). Counters are cumulative; the peaks cover the
 /// interval just ended. Quiet intervals (no new queries) are skipped.
+/// Runs forever; spawn it as a task.
 async fn report_dns_stats(dns: Arc<dns::DnsClient>, dns_limit: Arc<limit::DnsLimiter>) {
     let mut ticker = tokio::time::interval(DNS_STATS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -967,21 +1023,33 @@ async fn report_dns_stats(dns: Arc<dns::DnsClient>, dns_limit: Arc<limit::DnsLim
 /// One DMARC verification outcome, summarized for structured logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct DmarcSummary {
+    /// The RFC 5322 From domain the policy was looked up for.
     from_domain: String,
     /// The applied policy (p= or sp=).
     policy: String,
+    /// Whether an SPF pass aligned with the From domain.
     spf_aligned: bool,
+    /// Whether a verified DKIM signature aligned with the From domain.
     dkim_aligned: bool,
+    /// Whether DMARC passed (either alignment).
     pass: bool,
     /// What we did: "pass", "quarantine", or "reject".
     action: String,
 }
 
+/// The state of one SMTP connection: the [`smtp::SmtpSession`]
+/// implementation that applies this server's policy (HELO and MAIL FROM
+/// SPF, recipient authority, size limits, AUTH, end-of-data DKIM/DMARC,
+/// spooling and fast-path delivery). Borrows the shared
+/// [`SessionConfig`] for its lifetime; serialized fields form the session
+/// log record.
 #[derive(Serialize)]
 struct UserSession<'session> {
+    /// Server-wide message size limit (`max-data-bytes`).
     #[serde(skip_serializing)]
     pub max_data: usize,
 
+    /// Bytes of message data received so far in this transaction.
     #[serde(skip_serializing)]
     pub total_data: usize,
 
@@ -997,7 +1065,9 @@ struct UserSession<'session> {
     #[serde(skip_serializing)]
     declared_size: Option<u64>,
 
+    /// Unique ID of this connection, for log correlation.
     pub session_id: Uuid,
+    /// This server's domain.
     domain: &'session str,
     /// Shared DNS client (pipelined DoT connections + TTL cache) for SPF,
     /// DKIM key, and DMARC lookups.
@@ -1007,19 +1077,27 @@ struct UserSession<'session> {
     /// every session.
     #[serde(skip_serializing)]
     dns_limit: Arc<limit::DnsLimiter>,
+    /// The connected client.
     peer: SocketAddr,
 
+    /// The accepted HELO/EHLO identity.
     helo: Option<String>,
+    /// The accepted envelope sender (brackets removed; `""` for the null
+    /// sender); `None` outside a transaction.
     mail_from: Option<String>,
     /// Accepted recipients with their authority-resolved routing.
     rcpt_to: Vec<spool::SpoolRcpt>,
     /// Partial message body, raw bytes exactly as received.
     #[serde(skip_serializing)]
     data: Vec<u8>,
-    /// SPF verdict for the MAIL FROM identity (None = no record published).
+    /// SPF verdict for the MAIL FROM identity; `None` before MAIL FROM and
+    /// for authenticated sessions (SPF skipped).
     spf_result: Option<SpfResult>,
-    /// SPF verdict for the HELO/EHLO identity.
+    /// SPF verdict for the HELO/EHLO identity; `None` before HELO and for
+    /// address-literal HELOs.
     spf_helo: Option<SpfResult>,
+    /// DKIM verdicts of every message on this connection, for the session
+    /// log. Never used for DMARC, which only sees the current message's.
     dkim: Vec<DkimSummary>,
     /// Number of completed message transactions on this connection.
     message_count: usize,
@@ -1027,17 +1105,18 @@ struct UserSession<'session> {
     tls_active: bool,
     /// Whether a TLS acceptor was configured (advertised via EHLO).
     starttls_available: bool,
-    /// Accepted SASL credentials, from `--auth-users user:pass[,user:pass]`.
+    /// AUTH configuration (credentials and sender grants); `None` when
+    /// AUTH is not configured.
     #[serde(skip_serializing)]
     auth: Option<Arc<auth::AuthConfig>>,
     /// The authenticated identity for this connection, if any.
     authenticated: Option<String>,
-    /// LOGIN continuation state.
+    /// AUTH LOGIN continuation state: the user name already received.
     auth_login_user: Option<String>,
     /// The mechanism of the in-progress AUTH continuation.
     auth_pending: Option<&'static str>,
-    /// The recipient authority (Phase 12 gap 1): owns the hosted-domain
-    /// list, per-domain policy, and the address-to-mailbox mapping.
+    /// The recipient authority: owns the hosted-domain list, per-domain
+    /// policy, and the address-to-mailbox mapping.
     #[serde(skip_serializing)]
     authority: Arc<dyn authority::RecipientResolver>,
     /// Per-connection cache of *accepted* resolutions, keyed by
@@ -1062,6 +1141,9 @@ struct UserSession<'session> {
 }
 
 impl<'session> UserSession<'session> {
+    /// A fresh session for a connection from `peer`, configured from
+    /// `cfg`. `starttls_available` says whether a TLS acceptor is
+    /// configured (so EHLO advertises STARTTLS).
     fn new(peer: SocketAddr, starttls_available: bool, cfg: &'session SessionConfig) -> Self {
         UserSession {
             max_data: cfg.max_data,
@@ -1099,8 +1181,8 @@ impl<'session> UserSession<'session> {
         }
     }
 
-    /// Abandon the current transaction: clear the envelope and any
-    /// partial message data.
+    /// Abandon the current transaction: clear the envelope, the MAIL FROM
+    /// SPF verdict, the size state, and any partial message data.
     fn clear_envelope(&mut self) {
         self.mail_from = None;
         self.rcpt_to.clear();
@@ -1113,7 +1195,8 @@ impl<'session> UserSession<'session> {
         self.spf_result = None;
     }
 
-    /// The domains of this transaction's accepted recipients, for logs.
+    /// Returns the domains of this transaction's accepted recipients,
+    /// lowercased, sorted and deduplicated, for logs.
     fn rcpt_domains(&self) -> Vec<String> {
         let mut domains: Vec<String> = self
             .rcpt_to
@@ -1126,7 +1209,9 @@ impl<'session> UserSession<'session> {
     }
 
     /// Log a message refused for its size (`stage`: mail_from, rcpt_to,
-    /// data, or data_line). Envelope and sizes only, never content.
+    /// data, or data_line), with the offending `size` if known, the
+    /// `limit` it exceeded and a human-readable `detail`. Envelope and
+    /// sizes only, never content.
     fn log_size_refusal(&self, stage: &str, size: Option<u64>, limit: usize, detail: &str) {
         info!(
             stage,
@@ -1144,6 +1229,8 @@ impl<'session> UserSession<'session> {
     /// End the transaction with a temporary failure because the
     /// end-of-data DNS work ran past [`UserSession::eod_dns_deadline`]
     /// (`stage`: dkim or dmarc). Logged at `warn`, like an SPF deadline.
+    ///
+    /// Returns the `451` reply; the transaction is cleared and counted.
     fn eod_dns_timed_out(&mut self, stage: &str) -> smtp::Control {
         warn!(
             stage,
@@ -1155,6 +1242,10 @@ impl<'session> UserSession<'session> {
         smtp::Control::tempfail(EOD_DNS_TIMEOUT)
     }
 
+    /// Check `user`/`pass` against the credential store `users`; on a
+    /// match, the session becomes authenticated as `user`.
+    ///
+    /// Returns `235` on success, `535` otherwise.
     fn verify_credentials(
         &mut self,
         users: &HashMap<String, String>,
@@ -1503,15 +1594,14 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::reject(BAD_RCPT);
         };
 
-        // C1 (security report): the local-part becomes a filesystem path
-        // in maildir delivery. RFC 5321 atext technically allows `/`, but
-        // the delivery sink must never place client input into a path —
-        // a local-part with `/`, `..`, or an absolute path used to write
-        // files anywhere the service user could write. Reject anything
-        // outside the mailbox-safe character set up front (501) so the
-        // client learns immediately; the sink re-validates as defense in
-        // depth. This is a documented server policy, stricter than the
-        // RFC's full atext set.
+        // The local-part becomes a filesystem path in maildir delivery.
+        // RFC 5321 atext technically allows `/`, but the delivery sink
+        // must never place client input into a path — a local-part with
+        // `/` or `..` could write files anywhere the service user can.
+        // Reject anything outside the mailbox-safe character set up front
+        // so the client learns immediately; the sink re-validates as
+        // defense in depth. This is a documented server policy, stricter
+        // than the RFC's full atext set.
         if let Some(reason) = unsafe_local_part(&addr) {
             info!(rcpt = %addr, reason, "unsafe mailbox local-part refused");
             return smtp::Control::reject(BAD_RCPT);
@@ -1648,10 +1738,11 @@ impl smtp::SmtpSession for UserSession<'_> {
         smtp::Control::accept(UserSession::SEND_DATA)
     }
 
-    // TRACE, not the INFO default (D1, DEPLOYMENT.md): this runs once per
-    // line of message data, and the bunyan layer writes a START and an END
-    // record for every span it sees, so an INFO span made logs ~7x the size
-    // of the mail itself. At TRACE the default `RUST_LOG=info` skips it.
+    // TRACE, not the INFO default: this runs once per line of message
+    // data, and the bunyan layer writes a START and an END record for
+    // every span it sees, so an INFO span would make logs several times
+    // the size of the mail itself. At TRACE the default `RUST_LOG=info`
+    // skips it.
     #[instrument(level = "trace", skip(self, line), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     async fn recv_data(&mut self, line: &[u8]) -> smtp::DataControl {
         // Enforce the transaction's size limit (the server's, or the
@@ -1672,9 +1763,8 @@ impl smtp::SmtpSession for UserSession<'_> {
         smtp::DataControl::Continue
     }
 
-    /// A message line exceeded the protocol's line cap: the transfer is
-    /// aborted like an oversized message, and logged the same way.
     async fn data_line_too_long(&mut self) -> Vec<u8> {
+        // Logged like an oversized message.
         self.log_size_refusal(
             "data_line",
             Some(self.total_data as u64),
@@ -1684,10 +1774,10 @@ impl smtp::SmtpSession for UserSession<'_> {
         Self::DATA_LINE_TOO_LONG.to_vec()
     }
 
-    /// Resolves when `main` starts a graceful shutdown. If the sender is
-    /// gone without ever signalling, it never resolves.
     async fn shutdown_signal(&self) {
         let mut shutdown = self.shutdown.clone();
+        // A sender dropped without ever signalling means no shutdown is
+        // coming: never resolve.
         if shutdown.wait_for(|&down| down).await.is_err() {
             std::future::pending::<()>().await;
         }
@@ -1699,8 +1789,8 @@ impl smtp::SmtpSession for UserSession<'_> {
         // line endings exactly as the client sent them.
         let raw = self.data.clone();
 
-        // F3 (SECURITY-AUDIT.md): a CR not followed by LF is never valid in
-        // an RFC 5322 header block, and readers disagree on it. This
+        // A CR not followed by LF is never valid in an RFC 5322 header
+        // block, and readers disagree on it. This
         // server's scanner treats it as ordinary text, while others
         // (Python's `email`, many webmail pipelines) treat it as a line
         // break, so `Subject: x\rFrom: ceo@victim` would hide a second
@@ -1724,7 +1814,7 @@ impl smtp::SmtpSession for UserSession<'_> {
             return smtp::Control::tempfail(DNS_BUSY);
         };
         // One deadline covers all of this message's DNS work: the DKIM key
-        // lookups here and the DMARC policy fetch below (D3).
+        // lookups here and the DMARC policy fetch below.
         let dns_deadline = Instant::now() + self.eod_dns_deadline;
         let results = match timeout_at(dns_deadline, dkim::verify_dkim(&raw, &self.dns)).await {
             Ok(results) => results,
@@ -1763,12 +1853,12 @@ impl smtp::SmtpSession for UserSession<'_> {
         // here once its MAIL FROM and every From author passed the login's
         // `--auth-senders` grants (above and in `mail_from`).
         //
-        // C4 (security report): the From domain is extracted from the raw
-        // header bytes, never from the typed parser — a duplicate `From:`,
-        // an 8-bit byte in any header, or a grammar failure used to make
-        // the whole parse fail, which skipped DMARC and accepted the
-        // message. RFC 7489 Section 6.6.1: a message with no `From:` or
-        // with multiple `From:` headers is rejected, never let through.
+        // The From domain is extracted from the raw header bytes, never
+        // from the typed parser: a duplicate `From:`, an 8-bit byte in any
+        // header, or a grammar failure makes the whole parse fail, and
+        // DMARC must still run. RFC 7489 Section 6.6.1: a message with no
+        // `From:` or with multiple `From:` headers is rejected, never let
+        // through.
         let from_domain = match from_header_domain(&raw) {
             FromHeader::Parsed(domain) => Some(domain),
             problem => {
@@ -1826,11 +1916,11 @@ impl smtp::SmtpSession for UserSession<'_> {
                     warn!(from_domain = %from_domain, "multiple DMARC records; DMARC not applied");
                     None
                 }
-                // F1 (SECURITY-AUDIT.md): a failed lookup (SERVFAIL, query
-                // timeout) used to count as "no policy", so a spoof of a
-                // p=reject domain was delivered whenever its policy couldn't
-                // be fetched — which an attacker can provoke by loading the
-                // shared resolver. Fail closed: defer, the sender retries.
+                // A failed lookup (SERVFAIL, query timeout) must not count
+                // as "no policy": a spoof of a p=reject domain would be
+                // delivered whenever its policy couldn't be fetched, which
+                // an attacker can provoke by loading the shared resolver.
+                // Fail closed: defer, the sender retries.
                 Ok(Err(e)) => {
                     warn!(
                         from_domain = %from_domain,
@@ -1847,11 +1937,11 @@ impl smtp::SmtpSession for UserSession<'_> {
                 let record = &found.record;
                 let spf_passed = matches!(self.spf_result, Some(SpfResult::Pass));
                 let spf_domain = self.mail_from.as_deref().and_then(path_domain);
-                // C3 (security report): DMARC consumes ONLY this
-                // message's DKIM results. `self.dkim` accumulates across
-                // the connection for the session log; reusing it here let
-                // a replayed genuine signature from an earlier message
-                // make a later unsigned spoof pass DMARC.
+                // DMARC consumes ONLY this message's DKIM results.
+                // `self.dkim` accumulates across the connection for the
+                // session log; using it here would let a replayed genuine
+                // signature from an earlier message make a later unsigned
+                // spoof pass DMARC.
                 let dkim: Vec<(String, bool)> = dkim_summaries
                     .iter()
                     .map(|d| (d.domain.clone(), d.verified))
@@ -1864,7 +1954,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                     &from_domain,
                 );
                 // `sp=` governs a subdomain whose record was inherited
-                // from an ancestor (RFC 7489 §6.3; M4).
+                // from an ancestor (RFC 7489 §6.3).
                 let policy = found.policy_for(&from_domain);
                 let action = dmarc::apply(&evaluation, policy);
 
@@ -1905,7 +1995,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         drop(dns_permit);
 
         // Spool before accepting: the 250 is only sent after a durable
-        // write (Phase 7). The backend is blocking (fsync, and object
+        // write. The backend is blocking (fsync, and object
         // storage later), so it runs on the blocking pool. A failed
         // spool is a temporary failure — the client is invited to
         // retry, nothing is lost.
@@ -2021,6 +2111,18 @@ impl smtp::SmtpSession for UserSession<'_> {
     }
 }
 
+/// Start the server: set up logging, resolve the configuration, bind the
+/// listener (dropping root privileges right after), open the authority,
+/// spool and maildirs, start the drain and DNS-stats tasks, then accept
+/// connections until SIGTERM/SIGINT and shut down gracefully.
+///
+/// # Errors
+///
+/// Any startup failure: an unreadable or invalid config file, TLS
+/// certificate, resolver CA or authority file; an invalid configuration;
+/// a failed bind or privilege drop; or a spool or maildir that cannot be
+/// created. Once accepting, per-connection errors are logged, not
+/// returned.
 #[tokio::main]
 async fn main() -> Result<()> {
     let app_name = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")).to_string();
@@ -2037,7 +2139,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     // Anything created without an explicit mode is private to the service
-    // user (D4). The spool and maildirs also set 0600/0700 explicitly.
+    // user. The spool and maildirs also set 0600/0700 explicitly.
     privdrop::restrict_umask();
 
     let args = Args::parse();
@@ -2065,12 +2167,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    // One shared DNS client for the whole process (Phase 10): pipelined
-    // DNS-over-TLS connections and a TTL result cache serve SPF, DKIM, and
-    // DMARC alike. Built before the listener binds, so a bad --resolver-ca
-    // file stops startup instead of surfacing as DNS failures in sessions.
-    // The CA (D2, DEPLOYMENT.md) is added to the public roots, so public
-    // resolvers keep working with it set.
+    // One shared DNS client for the whole process: pipelined DNS-over-TLS
+    // connections and a TTL result cache serve SPF, DKIM, and DMARC
+    // alike. Built before the listener binds, so a bad --resolver-ca file
+    // stops startup instead of surfacing as DNS failures in sessions. The
+    // CA is added to the public roots, so public resolvers keep working
+    // with it set.
     let dns_client = dns::DnsClient::new(config.resolver).with_connections(config.dns_connections);
     let dns_client = Arc::new(match &config.resolver_ca {
         Some(path) => {
@@ -2124,7 +2226,7 @@ async fn main() -> Result<()> {
     };
     local_domains.insert(config.domain.to_ascii_lowercase());
 
-    // Privileges (D4). Decide before binding, so a misconfiguration (root
+    // Privileges. Decide before binding, so a misconfiguration (root
     // without --user, an unknown user) stops startup without touching the
     // port.
     let target = match &config.user {
@@ -2159,10 +2261,9 @@ async fn main() -> Result<()> {
     // Everything from here on (authority, spool, maildirs, every
     // connection) runs without root.
 
-    // The recipient authority (Phase 12 gap 1): a JSON file when
-    // configured — the console's publishing format, hot-reloaded —
-    // otherwise the static fallback that preserves the pre-authority
-    // behavior for --local-domains (every local-part accepts).
+    // The recipient authority: a JSON file when configured — the
+    // console's publishing format, hot-reloaded — otherwise the static
+    // fallback for --local-domains (every local-part accepts).
     if config.authority.is_some() && config.local_domains.is_some() {
         warn!("--local-domains is ignored: the authority file owns the hosted-domain list");
     }
@@ -2184,9 +2285,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // V1: local disk spool, no payload encryption. Real providers
-    // (user-held keys via the console) land with Phase 12; the backend
-    // trait is already in place.
+    // Local disk spool, no payload encryption (`spool::PayloadEncryptor`
+    // is the seam for user-held keys; none is configured).
     let disk_spool = Arc::new(spool::DiskSpool::open(&config.spool_dir, None)?);
     let spool: Arc<dyn spool::SpoolWriter> = disk_spool.clone();
     info!(backend = spool.name(), spool_dir = %config.spool_dir, "spool ready");
@@ -2195,7 +2295,7 @@ async fn main() -> Result<()> {
         Arc::new(delivery::MaildirSink::open(&config.maildir_dir)?);
     info!(backend = sink.name(), maildir_dir = %config.maildir_dir, "delivery ready");
 
-    // Storage paths (D4): say where mail really goes, and flag setups that
+    // Storage paths: say where mail really goes, and flag setups that
     // would surprise an operator.
     for (what, dir) in [
         ("spool", &config.spool_dir),
@@ -2223,10 +2323,11 @@ async fn main() -> Result<()> {
     // The drain is the retry engine: it delivers whatever the fast path
     // could not (crashes, sink failures), removes fully delivered
     // messages, retries failures with backoff, and dead-letters messages
-    // still failing after the queue lifetime (F7). The
-    // first pass runs immediately at startup (recovering anything queued
-    // before a restart); later passes run on a fixed interval. Per-message
-    // failures inside a pass are logged and counted, never fatal.
+    // still failing after the queue lifetime. The first pass runs
+    // immediately at startup (recovering anything queued before a
+    // restart); later passes run every 60 s. Delivery failures inside a
+    // pass leave the message queued; a spool I/O error ends that pass,
+    // is logged here, and the next pass retries.
     {
         let spool = disk_spool.clone();
         let sink = sink.clone();
@@ -2278,7 +2379,7 @@ async fn main() -> Result<()> {
         max_dns_per_ip = config.max_dns_per_ip,
         "DNS-over-TLS client ready (pipelined connections, TTL cache)"
     );
-    // Per-source-IP share of DNS work (DESIGN §9, H6): one client must
+    // Per-source-IP share of DNS work (DESIGN §9): one client must
     // not fill the shared resolver capacity with its own slow lookups.
     let dns_limit = Arc::new(limit::DnsLimiter::new(
         config.max_dns_per_ip,
@@ -2286,7 +2387,7 @@ async fn main() -> Result<()> {
     ));
     tokio::spawn(report_dns_stats(dns_client.clone(), dns_limit.clone()));
 
-    // Connection caps (Phase 10): a server-wide semaphore plus per-IP
+    // Connection caps: a server-wide semaphore plus per-IP
     // concurrency and connection-rate budgets, enforced in the accept
     // loop before any session work.
     let limiter = Arc::new(limit::ConnectionLimiter::new(
@@ -2295,12 +2396,12 @@ async fn main() -> Result<()> {
         Duration::from_secs(60),
     ));
     let global_capacity = Arc::new(tokio::sync::Semaphore::new(config.max_connections as usize));
-    // H5 (security report): refusals must never run inline in the accept
-    // loop — each one used to stall every subsequent accept for up to
-    // ~2.5 s (the courtesy write + drain), so an attacker holding the
-    // connection budgets could starve all legitimate senders almost for
-    // free. Refusals run in spawned tasks, capped by this small permit
-    // pool; when it is exhausted the socket is simply closed.
+    // Refusals must never run inline in the accept loop: each can take
+    // up to ~2.5 s (the courtesy write + drain), so an attacker holding
+    // the connection budgets could stall every subsequent accept and
+    // starve legitimate senders almost for free. Refusals run in spawned
+    // tasks, capped by this small permit pool; when it is exhausted the
+    // socket is simply closed.
     let refuse_capacity = Arc::new(tokio::sync::Semaphore::new(32));
 
     info!(
@@ -2315,7 +2416,7 @@ async fn main() -> Result<()> {
         "listening"
     );
 
-    // Graceful shutdown (D4): SIGTERM or SIGINT stops the accept loop;
+    // Graceful shutdown: SIGTERM or SIGINT stops the accept loop;
     // sessions are told through `shutdown_rx` (see `shutdown_signal`).
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut signals = ShutdownSignals::new()?;
@@ -2400,7 +2501,7 @@ async fn main() -> Result<()> {
         });
     };
 
-    // Graceful shutdown (D4). Stop accepting: closing the listener makes
+    // Graceful shutdown. Stop accepting: closing the listener makes
     // the kernel refuse new connections, and other MXs or a later retry
     // take the mail. Then tell every session: idle ones get 421 now, and
     // sessions mid-message finish it, get their reply, then the 421.
@@ -2441,12 +2542,18 @@ async fn main() -> Result<()> {
 /// SIGTERM and SIGINT: the requests for a graceful shutdown. Registered
 /// once, so a signal that arrives while the server is busy is not lost.
 struct ShutdownSignals {
+    /// The SIGTERM stream.
     term: tokio::signal::unix::Signal,
+    /// The SIGINT stream.
     int: tokio::signal::unix::Signal,
 }
 
 impl ShutdownSignals {
-    /// Install the handlers. Returns `Err` if the OS refuses.
+    /// Install the handlers.
+    ///
+    /// # Errors
+    ///
+    /// The OS refuses to install a signal handler.
     fn new() -> Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(ShutdownSignals {
@@ -2455,7 +2562,9 @@ impl ShutdownSignals {
         })
     }
 
-    /// Wait for the next SIGTERM or SIGINT; returns its name.
+    /// Wait for the next SIGTERM or SIGINT.
+    ///
+    /// Returns the signal's name (`"SIGTERM"` or `"SIGINT"`).
     async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.term.recv() => "SIGTERM",
@@ -2464,10 +2573,11 @@ impl ShutdownSignals {
     }
 }
 
-/// Hand a refused connection to a spawned task (H5, security report):
-/// returns immediately, so a burst of refusals never stalls the accept
-/// loop. Bounded by the refusal permit pool; when it is saturated the
-/// socket is closed without the courtesy reply.
+/// Hand the refused connection `stream` to a spawned task that sends
+/// `reply` and closes it (see [`refuse`]). Returns immediately, so a
+/// burst of refusals never stalls the accept loop. Bounded by the
+/// `capacity` permit pool; when it is saturated the socket is closed
+/// without the courtesy reply.
 async fn refuse_async(stream: TcpStream, reply: &[u8], capacity: &Arc<tokio::sync::Semaphore>) {
     match Arc::clone(capacity).try_acquire_owned() {
         Ok(permit) => {
@@ -2483,8 +2593,8 @@ async fn refuse_async(stream: TcpStream, reply: &[u8], capacity: &Arc<tokio::syn
     }
 }
 
-/// Answer a refused connection with an SMTP error and close it. The
-/// write is capped so a client that never reads cannot stall; afterwards
+/// Answer the refused connection `stream` with the SMTP error `reply`
+/// and close it. The whole exchange is capped at 2 s: the write is capped so a client that never reads cannot stall; afterwards
 /// the socket is drained briefly so the client can read the reply before
 /// close — dropping a socket with unread inbound data makes Linux send
 /// RST, which discards the client's pending receive buffer (it would
@@ -2515,11 +2625,14 @@ async fn refuse(stream: TcpStream, reply: &[u8]) {
 /// server config for each accepted connection.
 #[derive(Clone)]
 struct SessionConfig {
+    /// This server's domain.
     domain: String,
+    /// Server-wide message size limit.
     max_data: usize,
+    /// AUTH configuration; `None` when AUTH is not configured.
     auth: Option<Arc<auth::AuthConfig>>,
     /// Recipient authority: hosted domains, policy modes, and the
-    /// address-to-mailbox mapping (Phase 12 gap 1).
+    /// address-to-mailbox mapping.
     authority: Arc<dyn authority::RecipientResolver>,
     /// Shared DNS client used for SPF, DKIM key, and DMARC lookups.
     dns: Arc<dns::DnsClient>,
@@ -2538,18 +2651,29 @@ struct SessionConfig {
     sink: Option<Arc<dyn delivery::DeliverySink>>,
 }
 
-/// The peer address with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
+/// Returns `peer` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
 /// what a dual-stack `[::]` listener reports for IPv4 clients) turned back
-/// into plain IPv4 (N19, SECURITY.md). Without this, SPF `ip4:`/`a`/`mx`
+/// into plain IPv4; other addresses are unchanged. Without this, SPF `ip4:`/`a`/`mx`
 /// never match IPv4 senders, and an IPv4 client's per-IP limits, logs and
 /// `Received:` show the mapped form.
 fn canonical_peer(peer: SocketAddr) -> SocketAddr {
     SocketAddr::new(peer.ip().to_canonical(), peer.port())
 }
 
-/// Serve one connection, including a possible STARTTLS upgrade: the
-/// protocol loop runs over the plaintext stream, pauses for the TLS
-/// handshake when the policy upgrades, and resumes over the TLS stream.
+/// Serve the connection `stream`, including a possible STARTTLS upgrade
+/// through `acceptor`: the protocol loop runs over the plaintext stream,
+/// pauses for the TLS handshake (10 s limit) when the policy upgrades,
+/// and resumes over the TLS stream. Each read may take at most
+/// `max_read_ms`; `cfg` configures the session. The session record is
+/// logged when the connection ends.
+///
+/// A failed or timed-out TLS handshake ends the connection quietly
+/// (`Ok`).
+///
+/// # Errors
+///
+/// The peer address is unavailable, the protocol loop fails (I/O error),
+/// or the session record cannot be serialized.
 async fn handle_connection(
     stream: TcpStream,
     acceptor: Option<Arc<TlsAcceptor>>,
@@ -2621,19 +2745,28 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Build a TLS acceptor from PEM-encoded certificate and key files.
+/// Build a TLS acceptor from the PEM-encoded certificate chain at
+/// `cert_path` and private key at `key_path`.
+///
+/// # Errors
+///
+/// Either file cannot be read, or their contents are rejected (see
+/// [`tls_acceptor_from_pem`]).
 async fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     let cert_pem = tokio::fs::read(cert_path).await?;
     let key_pem = tokio::fs::read(key_path).await?;
     tls_acceptor_from_pem(&cert_pem, &key_pem)
 }
 
-/// Read the `--resolver-ca` PEM file (D2, DEPLOYMENT.md).
+/// Read the `--resolver-ca` PEM file at `path`.
 ///
-/// Returns every certificate in the file, in order. Returns `Err` if the
-/// file can't be read, isn't valid PEM, or holds no certificate at all —
-/// an empty or mistyped CA file must stop startup, not silently leave the
-/// local resolver untrusted.
+/// Returns every certificate in the file, in order.
+///
+/// # Errors
+///
+/// The file can't be read, isn't valid PEM, or holds no certificate at
+/// all — an empty or mistyped CA file must stop startup, not silently
+/// leave the local resolver untrusted.
 async fn load_resolver_ca(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let pem = tokio::fs::read(path)
         .await
@@ -2641,7 +2774,13 @@ async fn load_resolver_ca(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     resolver_ca_from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid resolver CA file {path}: {e}"))
 }
 
-/// Parse PEM certificates for [`load_resolver_ca`].
+/// Parse the PEM certificates in `pem` for [`load_resolver_ca`].
+///
+/// Returns every certificate, in order; other PEM sections are skipped.
+///
+/// # Errors
+///
+/// A malformed PEM section, or no certificate at all.
 fn resolver_ca_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let mut cursor = std::io::Cursor::new(pem);
     let certs: Vec<CertificateDer<'static>> =
@@ -2652,6 +2791,14 @@ fn resolver_ca_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+/// Build a TLS acceptor (no client authentication) from the PEM
+/// certificate chain `cert_pem` and the PEM private key `key_pem` (the
+/// first key in it).
+///
+/// # Errors
+///
+/// Malformed PEM, no private key, or a certificate/key pair rustls
+/// rejects.
 fn tls_acceptor_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
     let mut cert_cursor = std::io::Cursor::new(cert_pem);
     let certs: Vec<CertificateDer> =
@@ -2688,9 +2835,9 @@ mod tests {
         assert_eq!(addr(""), Some(""));
     }
 
-    /// H3 (security report): ESMTP parameters after the path are split
-    /// off — they used to end up inside the address (SPF evaluated a
-    /// bogus `domain> SIZE=…` and bounces with `SIZE=` were refused).
+    /// ESMTP parameters after the path are split off, never left inside
+    /// the address; an unterminated path or a control character in the
+    /// address is refused.
     #[test]
     fn clean_path_splits_esmtp_parameters() {
         assert_eq!(
@@ -2712,8 +2859,8 @@ mod tests {
         assert_eq!(size_param(""), None);
     }
 
-    /// N4 (security report): ordinary RFC 5321 local-parts are accepted;
-    /// anything with path meaning is not.
+    /// Ordinary RFC 5321 local-parts are accepted; anything with path
+    /// meaning (or quoting) is not.
     #[test]
     fn local_part_policy() {
         for ok in [
@@ -2737,8 +2884,7 @@ mod tests {
         }
     }
 
-    /// N2/N3 (security report): the From scanner reads an RFC 5322
-    /// mailbox-list. Folded values are unfolded, comments and quoted
+    /// The From scanner reads an RFC 5322 mailbox-list. Folded values are unfolded, comments and quoted
     /// strings never contribute an `@`, the obsolete `From :` spelling
     /// counts as a From header, and several author domains are refused.
     #[test]
@@ -2752,7 +2898,7 @@ mod tests {
             scan("From: \"Doe, John\" <j@example.org>\r\n"),
             parsed("example.org")
         );
-        // N2: a folded From keeps its continuation lines.
+        // A folded From keeps its continuation lines.
         assert_eq!(
             scan("From: \"A Rather Long Display Name\"\r\n <news@example.net>\r\nSubject: x\r\n"),
             parsed("example.net")
@@ -2765,7 +2911,7 @@ mod tests {
         // Quoted local-part containing '@'.
         assert_eq!(scan("From: \"a@b\"@example.org\r\n"), parsed("example.org"));
 
-        // N3: an '@' inside a comment or quoted string never picks the domain.
+        // An '@' inside a comment or quoted string never picks the domain.
         assert_eq!(
             scan("From: ceo@paypal.com (@attacker.example )\r\n"),
             parsed("paypal.com")
@@ -2774,7 +2920,7 @@ mod tests {
             scan("From: \"x@attacker.example\" <ceo@paypal.com>\r\n"),
             parsed("paypal.com")
         );
-        // N3: several author domains are refused; one domain twice is fine.
+        // Several author domains are refused; one domain twice is fine.
         assert_eq!(
             scan("From: ceo@paypal.com, x@attacker.example\r\n"),
             FromHeader::Multiple
@@ -2783,12 +2929,12 @@ mod tests {
             scan("From: a@example.org, b@example.org\r\n"),
             parsed("example.org")
         );
-        // N3: `From :` (obsolete spacing) is a From header too.
+        // `From :` (obsolete spacing) is a From header too.
         assert_eq!(
             scan("From : ceo@paypal.com\r\nFrom: x@attacker.example\r\n"),
             FromHeader::Multiple
         );
-        // C4 outcomes.
+        // Missing, duplicate and unparseable From headers.
         assert_eq!(scan("Subject: none\r\n"), FromHeader::None);
         assert_eq!(
             scan("From: a@example.org\r\nfrom: b@example.org\r\n"),
@@ -2943,7 +3089,7 @@ mod tests {
         assert!(err.to_string().contains("max-dns-per-ip"), "{err}");
     }
 
-    /// Per-IP DNS limit (DESIGN §9, H6): with this source IP's share
+    /// Per-IP DNS limit (DESIGN §9): with this source IP's share
     /// exhausted, every DNS-backed stage fails *temporarily*, never
     /// permanently — HELO proceeds with SPF TempError, MAIL FROM and
     /// end-of-data get `451 4.7.0` — and once the share frees up the
@@ -3050,8 +3196,8 @@ mod tests {
         assert_eq!(resolved.resolver, "8.8.8.8".parse::<Ipv4Addr>().unwrap());
     }
 
-    /// D2 (DEPLOYMENT.md): `resolver-ca` resolves CLI > file > none; unset
-    /// means public roots only (the previous behavior).
+    /// `resolver-ca` resolves CLI > file > none; unset means public roots
+    /// only.
     #[test]
     fn resolver_ca_resolution() {
         use clap::Parser as _;
@@ -3072,7 +3218,7 @@ mod tests {
         assert_eq!(resolved.resolver_ca.as_deref(), Some("/etc/ca/cli.pem"));
     }
 
-    /// D4 (DEPLOYMENT.md): production-safe defaults. Port 25 (2525 is
+    /// Production-safe defaults. Port 25 (2525 is
     /// for unprivileged testing), absolute storage paths, a 10 MiB message
     /// limit, a 5-minute connection cap, 100 connections, 60 s shutdown
     /// grace, and no user switch unless configured.
@@ -3097,7 +3243,7 @@ mod tests {
         assert_eq!(resolved.group, None);
     }
 
-    /// D4: `user`, `group` and `shutdown-grace-ms` resolve CLI > file;
+    /// `user`, `group` and `shutdown-grace-ms` resolve CLI > file;
     /// `group` without `user` is a configuration error.
     #[test]
     fn user_group_and_grace_resolution() {
@@ -3127,7 +3273,7 @@ mod tests {
         assert!(err.to_string().contains("--group requires --user"), "{err}");
     }
 
-    /// D2: the CA file loads every certificate it holds, and a missing,
+    /// The CA file loads every certificate it holds, and a missing,
     /// empty, or non-certificate file is a startup error, never a silent
     /// fallback to "local resolver untrusted".
     #[tokio::test]
@@ -3171,9 +3317,11 @@ mod tests {
     }
 
     /// Spawn handle_connection on an ephemeral port, handling exactly
-    /// one connection. When `authority` is None, the static fallback is
-    /// built from `local_domains` (the pre-authority behavior: every
-    /// local-part at a hosted domain accepts).
+    /// one connection with the given TLS `acceptor`, `auth`, `spool` and
+    /// `sink`. When `authority` is None, the static fallback is built
+    /// from `local_domains` (default `example.org`).
+    ///
+    /// Returns the address to connect to.
     async fn spawn_server(
         acceptor: Option<Arc<TlsAcceptor>>,
         auth: Option<Arc<auth::AuthConfig>>,
@@ -3205,10 +3353,6 @@ mod tests {
                         max_data: 1024 * 1024,
                         auth,
                         authority,
-                        // The integration tests exercise the real resolver
-                        // path: the sender domains used below
-                        // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
-                        // evaluates to None and DMARC has no policy.
                         // The integration tests exercise the real resolver
                         // path: the sender domains used below
                         // (spfless-domain-xyz.test) are NXDOMAIN, so SPF
@@ -3624,7 +3768,7 @@ mod tests {
     }
 
     /// Accepted messages are durably spooled: payload byte-exact, metadata
-    /// complete, and the 250 only after the write (Phase 7).
+    /// complete, and the 250 only after the write.
     #[tokio::test]
     async fn accepted_message_is_spooled() {
         let dir = tempfile::tempdir().unwrap();
@@ -3694,7 +3838,7 @@ mod tests {
         assert!(meta["peer"].is_string());
     }
 
-    // -- Recipient authority (Phase 12 gap 1) ---------------------------
+    // -- Recipient authority ---------------------------------------------
 
     /// The authority owns recipient policy: known addresses accept and
     /// route to their mailbox, unknown addresses on reject-mode domains
@@ -3906,12 +4050,11 @@ mod tests {
         assert!(text.contains("for <whatever-alias@example.org>"));
     }
 
-    // -- Security-report regressions ------------------------------------
+    // -- Security properties -----------------------------------------------
 
-    /// C1 (security report): local-parts with path semantics must be
-    /// refused at RCPT time — `/` in an RFC-atext local-part used to be
-    /// copied into maildir paths (relative traversal via `..`, absolute
-    /// paths via `Path::join`).
+    /// Local-parts with path semantics must be refused at RCPT time, so
+    /// they can never reach a maildir path (relative traversal via `..`,
+    /// absolute paths via `Path::join`).
     #[tokio::test]
     async fn path_traversal_local_parts_are_refused() {
         let addr = spawn_server(None, None, None, None, None, None).await;
@@ -3953,9 +4096,8 @@ mod tests {
         client.write_all(b"QUIT\r\n").await.unwrap();
     }
 
-    /// C4 (security report): a message with no `From:` header is
-    /// rejected (RFC 7489 Section 6.6.1) — it used to skip DMARC and be
-    /// accepted.
+    /// A message with no `From:` header is rejected (RFC 7489 Section
+    /// 6.6.1), never accepted without a DMARC check.
     #[tokio::test]
     async fn message_without_from_is_rejected() {
         let addr = spawn_server(None, None, None, None, None, None).await;
@@ -4270,7 +4412,7 @@ mod tests {
         assert!(session.rcpt_to("<c@big.example>").await.is_accept());
     }
 
-    /// D3 (DEPLOYMENT.md): end-of-data DNS work has one overall deadline.
+    /// End-of-data DNS work has one overall deadline.
     /// Against a resolver that never answers, both the DKIM key lookup
     /// and the DMARC policy fetch end at the deadline with a *temporary*
     /// failure (never a permanent rejection), the transaction is cleared,
@@ -4334,16 +4476,16 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
         assert_eq!(cfg.dns.stats().queries, 2);
     }
 
-    /// C3 (security report): DKIM verdicts must not leak across messages
-    /// on one connection. A verified signature from an earlier message
-    /// used to satisfy DMARC alignment for a later unsigned spoof of the
-    /// same domain. Here a fake verified facebook.com verdict is left in
-    /// the session, and an unsigned message `From: someone@facebook.com`
-    /// (a domain whose DMARC record is `p=reject`) must still be REJECTED —
-    /// the DMARC evaluation consumes only this message's results.
+    /// DKIM verdicts must not leak across messages on one connection: a
+    /// verified signature from an earlier message must not satisfy DMARC
+    /// alignment for a later unsigned spoof of the same domain. Here a
+    /// fake verified facebook.com verdict is left in the session, and an
+    /// unsigned message `From: someone@facebook.com` (whose mock DMARC
+    /// record is `p=reject`) must still be REJECTED — the DMARC evaluation
+    /// consumes only this message's results.
     ///
-    /// N6 (security report): hermetic — DMARC records come from a local
-    /// mock DNS-over-TLS resolver, never the live internet.
+    /// Hermetic: DMARC records come from a local mock DNS-over-TLS
+    /// resolver, never the live internet.
     #[tokio::test]
     async fn dkim_verdicts_do_not_leak_across_messages() {
         let cfg = SessionConfig {
@@ -4391,7 +4533,7 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
         );
     }
 
-    /// F1 (SECURITY-AUDIT.md): when the DMARC policy can't be fetched
+    /// When the DMARC policy can't be fetched
     /// (SERVFAIL), an unsigned spoof is deferred with 451, never delivered
     /// as if the domain published no policy.
     #[tokio::test]
@@ -4481,8 +4623,8 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
 mod helo_and_peer_tests {
     use super::*;
 
-    /// M8 (SECURITY.md): the HELO identity must be a domain or an address
-    /// literal; control characters (the bare-CR `Received:` injection),
+    /// The HELO identity must be a domain or an address literal; control
+    /// characters (a bare CR would inject a `Received:` header line),
     /// whitespace and other junk are refused.
     #[test]
     fn helo_validation() {
@@ -4534,7 +4676,7 @@ mod helo_and_peer_tests {
         assert_eq!(session.helo, None);
     }
 
-    /// N19 (SECURITY.md): an IPv4 client on a dual-stack listener is seen
+    /// An IPv4 client on a dual-stack listener is seen
     /// as plain IPv4; real IPv6 peers are untouched.
     #[test]
     fn mapped_peers_are_canonical() {
@@ -4551,6 +4693,7 @@ mod helo_and_peer_tests {
 mod from_validation_tests {
     use super::*;
 
+    /// [`from_authors`] on a string `value`.
     fn authors(value: &str) -> Option<Vec<(String, String)>> {
         from_authors(value.as_bytes())
     }
@@ -4583,6 +4726,9 @@ mod from_validation_tests {
         assert_eq!(authors(""), None);
     }
 
+    /// [`tests::size_limit_session`] in `dir` plus AUTH: `alice` may send
+    /// as `alice@example.org` and anything `@alice.example`; `carol` has
+    /// no grants.
     fn session_cfg(dir: &std::path::Path) -> SessionConfig {
         let mut cfg = tests::size_limit_session(dir);
         cfg.auth = Some(Arc::new(
@@ -4675,8 +4821,8 @@ mod from_validation_tests {
 mod bare_cr_tests {
     use super::*;
 
-    /// F3 (SECURITY-AUDIT.md): the confirmed attack shape and its
-    /// variants are detected; CRLF, bare LF, and CRs in the body are not.
+    /// The header-smuggling shape (a bare CR hiding a second `From:`) and
+    /// its variants are detected; CRLF, bare LF, and CRs in the body are not.
     #[test]
     fn bare_cr_in_header_block_is_detected() {
         for bad in [

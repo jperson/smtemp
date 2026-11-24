@@ -2,18 +2,11 @@ use anyhow::Result;
 use clap::Parser;
 use serde::Serialize;
 use std::net::Ipv4Addr;
-// use rand::Rng;
-// use rustls_pki_types::ServerName;
-// use std::sync::Arc;
-// use tokio::io::{AsyncReadExt, AsyncWriteExt};
-// use tokio::net::TcpStream;
-// use tokio::net::UdpSocket;
-// use tokio_rustls::rustls::ClientConfig;
-// use tokio_rustls::TlsConnector;
-// use webpki_roots;
 
 use dns::{query_tcp, query_tls};
 
+/// DNS record types selectable with `--query-type`; each discriminant is
+/// the IANA TYPE code sent on the wire.
 #[repr(u16)]
 #[derive(Debug, Clone, Default, clap::ValueEnum, Serialize)]
 enum QueryType {
@@ -71,23 +64,38 @@ enum QueryType {
     DLV = 32769,
 }
 
+/// Command-line arguments for `dnsq`.
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Domain name to query.
     #[arg(long)]
     domain: String,
+    /// Record type to query.
     #[clap(short, long, default_value_t, value_enum)]
     query_type: QueryType,
+    /// Record class to query (1 = IN).
     #[clap(short, long, default_value_t = 0x01)]
     record_class: u16,
+    /// Query over plain TCP. This is the default transport, so the flag
+    /// has no effect; it is accepted for explicitness.
     #[arg(long, default_value_t = false)]
     tcp: bool,
+    /// Query over DNS-over-TLS (port 853) instead of plain TCP.
     #[arg(long, default_value_t = false)]
     tls: bool,
+    /// Resolver to send the query to.
     #[arg(long, default_value = "1.1.1.1")]
     server: Ipv4Addr,
 }
 
+/// Send one DNS query as described by [`Args`] and print the parsed
+/// response to stdout as JSON.
+///
+/// # Errors
+///
+/// A failed query (connection, TLS, timeout, or malformed response) or a
+/// JSON serialization failure.
 #[tokio::main]
 async fn main() -> Result<()> {
     let _app_name = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")).to_string();

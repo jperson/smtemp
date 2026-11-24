@@ -31,33 +31,45 @@ use crate::spool::{DiskSpool, SpoolMeta};
 /// Where accepted mail goes. Blocking methods (filesystem, and later
 /// object storage); callers run them on a blocking thread pool.
 pub trait DeliverySink: Send + Sync {
-    /// Backend name for logs (e.g. `"maildir"`).
+    /// Returns the backend name for logs (e.g. `"maildir"`).
     fn name(&self) -> &str;
 
-    /// Deliver one copy of `message` to `recipient`.
+    /// Deliver one copy of `message` (the final bytes, trace headers
+    /// included) to the routing mailbox `recipient`, for the queued
+    /// message `queue_id`.
     ///
     /// Idempotency contract: for a given (recipient, queue_id) pair this
     /// MUST deliver at most once — calling again after success (or
     /// racing a concurrent attempt) returns `Ok` without duplicating
-    /// mail. Returns `Err` on transient failure; the drain loop retries.
+    /// mail.
+    ///
+    /// # Errors
+    ///
+    /// Delivery failed; the message stays queued and the drain loop
+    /// retries.
     fn deliver(&self, recipient: &str, queue_id: &str, message: &[u8]) -> Result<()>;
 }
 
 /// Maildir delivery: one maildir per recipient address, under
-/// `{root}/{domain}/{local}/` with `tmp/`, `new/`, `cur/` subdirectories
-/// (RFC 6158-style layout). Delivered files land in `new/` named
-/// `{queue_id}.{sanitized-recipient}.eml`.
+/// `{root}/{domain}/{local}/` (both lowercased). Each copy is written to
+/// `tmp/`, fsynced, and renamed into `new/` as
+/// `{queue_id}.{sanitized-recipient}.eml`; the sink creates `tmp/` and
+/// `new/` on first delivery.
 #[derive(Debug, Clone)]
 pub struct MaildirSink {
+    /// Directory holding the per-domain maildir trees.
     root: PathBuf,
 }
 
 impl MaildirSink {
-    /// Open (creating if needed) the maildir root directory.
+    /// Open (creating if needed) the maildir root directory `root`.
     ///
-    /// Returns the ready-to-use sink on success. Returns `Err` if the
-    /// root cannot be created; the server should refuse to start rather
-    /// than accept mail it cannot deliver.
+    /// Returns the ready-to-use sink.
+    ///
+    /// # Errors
+    ///
+    /// The root cannot be created; the server should refuse to start
+    /// rather than accept mail it cannot deliver.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         crate::fsutil::create_private_dir_all(&root)
@@ -104,13 +116,19 @@ impl DeliverySink for MaildirSink {
     }
 }
 
-/// Split an address into (local-part, domain), both lowercased, and
-/// validate both as filesystem-safe path components.
+/// Split `recipient` at its last `@` into `(local-part, domain)`, both
+/// ASCII-lowercased, and validate both as filesystem-safe path
+/// components.
 ///
 /// The components become maildir directory names under the sink root,
-/// so each must be a single safe component: no `/` or `\`, no `..` runs, no leading dot, no control characters, and
-/// within reasonable length. Returns `Err` for anything that could
-/// escape the maildir root — the caller treats that as a failed
+/// so each must be a single safe component: non-empty, at most 128
+/// bytes, no leading dot, no `..` run, and only dot-atom characters
+/// other than `/`.
+///
+/// # Errors
+///
+/// No `@`, or a component that fails the checks above (anything that
+/// could escape the maildir root). The caller treats that as a failed
 /// delivery (the message stays queued), never as a path to honor.
 fn split_recipient(recipient: &str) -> Result<(String, String)> {
     let (local, domain) = recipient
@@ -120,8 +138,8 @@ fn split_recipient(recipient: &str) -> Result<(String, String)> {
     let domain = domain.to_ascii_lowercase();
     // Both components must be a single path segment: never empty, no
     // leading dot (so never `.` or `..`), no `..` run, and only RFC 5321
-    // dot-atom characters minus `/` (the same set the session enforces at
-    // RCPT time; `\` and control characters are not atext).
+    // dot-atom characters minus `/` (the set the session enforces for
+    // local-parts at RCPT time; `\` and control characters are not atext).
     let safe = |b: u8| {
         b.is_ascii_alphanumeric()
             || matches!(
@@ -161,8 +179,9 @@ fn split_recipient(recipient: &str) -> Result<(String, String)> {
     Ok((local, domain))
 }
 
-/// Filesystem-safe recipient tag for maildir filenames: alphanumerics,
-/// `.`, `_`, `-` kept, everything else replaced with `_`.
+/// Returns a filesystem-safe tag for `recipient` in maildir filenames:
+/// ASCII alphanumerics, `.`, `_` and `-` are kept, everything else
+/// becomes `_`.
 fn sanitize(recipient: &str) -> String {
     recipient
         .chars()
@@ -176,12 +195,14 @@ fn sanitize(recipient: &str) -> String {
         .collect()
 }
 
-/// Write bytes to `path` and fsync before returning: callers can rely on
-/// the bytes surviving a crash once this resolves.
+/// Write `bytes` to a new private file at `path` (truncating any
+/// existing file) and fsync before returning: callers can rely on the
+/// bytes surviving a crash once this returns `Ok`.
 ///
-/// Returns `Ok(())` once the bytes are durable on disk. Returns `Err`
-/// if the file cannot be created, written, or fsynced — the error
-/// message names the path.
+/// # Errors
+///
+/// The file cannot be created, written, or fsynced; the error message
+/// names the path.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = crate::fsutil::create_private_file(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
@@ -192,21 +213,26 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// RFC 5322 date-time for the `Received:` header; falls back to the RFC
-/// 3339 form if the strict formatting fails (still machine-parseable).
+/// Format `ts` (in UTC) as an RFC 5322 date-time for the `Received:`
+/// header.
+///
+/// Returns the RFC 2822/5322 form, or the RFC 3339 form if the strict
+/// formatting fails (still machine-parseable).
 fn rfc5322_date(ts: jiff::Timestamp) -> String {
     let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
     jiff::fmt::rfc2822::to_string(&zoned).unwrap_or_else(|_| ts.to_string())
 }
 
-/// Prepend the final-delivery trace headers to the raw message.
+/// Prepend the final-delivery trace headers to the raw message `raw`.
 ///
-/// Produces one recipient's delivery copy: `Return-Path:` (envelope
-/// sender in `<>`, `<>` for the null sender), then a `Received:` header
-/// (from HELO/peer, by our domain, with ESMTP or ESMTPS, queue ID, `for`
-/// this recipient only — RFC 5321 §4.4 says include `for` for a single
-/// recipient so other envelope recipients are not disclosed), then the
-/// original bytes verbatim.
+/// Returns one recipient's delivery copy: `Return-Path:` (the envelope
+/// sender from `meta` in `<>`, `<>` for the null sender), then a
+/// `Received:` header (from the HELO and peer IP, by
+/// `meta.server_domain`, with ESMTP or ESMTPS, the queue ID, and `for
+/// <recipient>`), then `raw` verbatim. RFC 5321 §4.4 allows exactly one
+/// path in `for`; naming only this copy's `recipient` keeps the other
+/// envelope recipients private. An unparseable `meta.received_at` is
+/// dated at the Unix epoch.
 pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Vec<u8> {
     let sender = match meta.mail_from.as_deref() {
         Some(addr) if !addr.is_empty() => format!("<{addr}>"),
@@ -220,9 +246,9 @@ pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Ve
         .map(|(ip, _)| ip)
         .unwrap_or(&meta.peer);
     let protocol = if meta.tls_active { "ESMTPS" } else { "ESMTP" };
-    // HELO is validated at the SMTP layer (M8); this is defense in depth
-    // for spooled metadata written before that check existed. Anything but
-    // printable ASCII becomes `?`, so no CR/LF can split the header.
+    // HELO is validated at the SMTP layer; this is defense in depth
+    // against whatever the spooled metadata holds. Anything but printable
+    // ASCII becomes `?`, so no CR/LF can split the header.
     let helo: String = meta
         .helo
         .as_deref()
@@ -281,39 +307,54 @@ pub const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 /// outage of the delivery backend.
 pub const MAX_QUEUE_LIFETIME: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
-/// The wait before the next attempt after `attempts` failed ones:
-/// 1, 2, 4, 8 … minutes, capped at [`RETRY_MAX`].
+/// Returns the wait before the next attempt after `attempts` failed
+/// ones: 1, 2, 4, 8 … minutes (1 minute for 0 or 1), capped at
+/// [`RETRY_MAX`].
 pub fn retry_delay(attempts: u32) -> Duration {
     let doublings = attempts.saturating_sub(1).min(16);
     RETRY_BASE.saturating_mul(1u32 << doublings).min(RETRY_MAX)
 }
 
-/// Seconds since the Unix epoch, now.
+/// Returns the current time in seconds since the Unix epoch (0 if the
+/// clock is before the epoch).
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// One pass of the queue drain at the current time (see [`drain_at`]).
+/// Run one pass of the queue drain over `spool` into `sink` at the
+/// current time. See [`drain_at`] for the behavior, return value and
+/// errors.
 pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainStats> {
     drain_at(spool, sink, unix_now())
 }
 
-/// One pass of the queue drain at `now` (Unix seconds).
+/// Run one pass of the queue drain over `spool` into `sink` at `now`
+/// (Unix seconds).
 ///
 /// For each committed message:
 /// - not yet due (its last failure was less than [`retry_delay`] ago):
 ///   skipped, and its payload is not read;
+/// - payload unreadable (removed by a concurrent fast-path dequeue, or
+///   damaged): logged and skipped for this pass;
 /// - due: delivery is attempted to every recipient (idempotent per
 ///   recipient, so recipients that already have their copy are not
 ///   duplicated). A message delivered to every recipient is dequeued.
-/// - a failed attempt is recorded. If the message has been failing for
-///   [`MAX_QUEUE_LIFETIME`], it is dead-lettered and logged at `error`.
+/// - otherwise a failed attempt is recorded. If the message has been
+///   failing for [`MAX_QUEUE_LIFETIME`], it is dead-lettered and logged
+///   at `error`.
 ///
-/// Blocking; callers run it on a blocking thread pool. Per-message
-/// failures are logged and counted, never fatal to the pass — the drain
-/// is designed to run forever.
+/// Blocking; callers run it on a blocking thread pool. Delivery failures
+/// are logged and leave the message queued; they never fail the pass.
+///
+/// Returns what the pass did.
+///
+/// # Errors
+///
+/// Spool I/O fails: listing the queue, removing a delivered message,
+/// recording an attempt, or dead-lettering. The pass stops at that
+/// message; the caller logs the error and the next pass retries.
 pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<DrainStats> {
     let mut stats = DrainStats::default();
     for queued in spool.list()? {
@@ -563,17 +604,22 @@ mod tests {
 
     /// A sink that fails while `failing` is set, then delivers.
     struct FlakySink {
+        /// Whether `deliver` currently fails.
         failing: std::sync::atomic::AtomicBool,
+        /// Number of `deliver` calls so far.
         calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakySink {
+        /// A sink that starts out failing.
         fn failing() -> Self {
             FlakySink {
                 failing: true.into(),
                 calls: 0.into(),
             }
         }
+
+        /// Returns the number of `deliver` calls so far.
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -594,6 +640,7 @@ mod tests {
         }
     }
 
+    /// The retry interval doubles per failure and stops at `RETRY_MAX`.
     #[test]
     fn retry_schedule_backs_off_to_the_cap() {
         let mins = |a| retry_delay(a).as_secs() / 60;
@@ -601,9 +648,9 @@ mod tests {
         assert_eq!(retry_delay(10_000), RETRY_MAX, "no overflow");
     }
 
-    /// A day-long delivery outage loses nothing. Retries back off (a message isn't touched
-    /// before it is due), and the message is delivered once the sink
-    /// recovers, a day later.
+    /// A day-long delivery outage loses nothing. Retries back off (a
+    /// message isn't touched before it is due), and the message is
+    /// delivered once the sink recovers, a day later.
     #[tokio::test]
     async fn long_outage_is_retried_with_backoff_then_delivered() {
         let dir = tempfile::tempdir().unwrap();
@@ -688,9 +735,9 @@ mod tests {
             ]
         );
 
-        // The requeue procedure: move .eml then .json
-        // back to new/ and delete .attempts. The message is due at once,
-        // with a fresh lifetime.
+        // The requeue procedure: move .eml then .json back to new/ and
+        // delete .attempts. The message is due at once, with a fresh
+        // lifetime.
         let new = dir.path().join("spool/new");
         for ext in ["eml", "json"] {
             std::fs::rename(

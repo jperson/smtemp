@@ -28,10 +28,15 @@ pub struct Edns0 {
 }
 
 impl Edns0 {
-    /// Decode the OPT pseudo-RR fields from a record's owner name,
-    /// type, class, and TTL. The OPT name must be the root (RFC 6891
-    /// §6.1.2); options in `rdata` carry no semantics for this client
-    /// and are ignored.
+    /// Decode the OPT pseudo-RR fields from a record's owner `name`,
+    /// `record_type`, `record_class` (the payload size) and `ttl`
+    /// (extended RCODE, version, flags). Options in the rdata carry no
+    /// semantics for this client and are ignored.
+    ///
+    /// # Errors
+    ///
+    /// `record_type` is not OPT (41), or `name` is not the root (RFC 6891
+    /// §6.1.2).
     fn from_fields(name: &str, record_type: u16, record_class: u16, ttl: u32) -> Result<Self> {
         if record_type != 0x29 {
             return Err(anyhow!("not an OPT record (type {record_type})"));
@@ -65,15 +70,26 @@ pub struct DnsMessage {
     pub additionals: Vec<DnsResourceRecord>,
 }
 
-/// Bounds-checked read helpers for hostile input. DNS responses come from
-/// the configured resolver, which may be buggy, spoofed, or compromised —
-/// every parse failure must be a returned Err, never a panic.
+// Bounds-checked read helpers for hostile input. DNS responses come from
+// the configured resolver, which may be buggy, spoofed, or compromised —
+// every parse failure must be a returned Err, never a panic.
+
+/// Read the octet at `offset` in `data`.
+///
+/// # Errors
+///
+/// `offset` is past the end of `data`.
 fn read_u8(data: &[u8], offset: usize) -> Result<u8> {
     data.get(offset)
         .copied()
         .ok_or_else(|| anyhow!("truncated DNS message at offset {offset}"))
 }
 
+/// Read the big-endian `u16` at `offset` in `data`.
+///
+/// # Errors
+///
+/// The two octets do not fit in `data`.
 fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let end = offset
         .checked_add(2)
@@ -84,6 +100,11 @@ fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     }
 }
 
+/// Read the big-endian `u32` at `offset` in `data`.
+///
+/// # Errors
+///
+/// The four octets do not fit in `data`.
 fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
     let end = offset
         .checked_add(4)
@@ -94,8 +115,11 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
     }
 }
 
-/// A checked subslice `[offset..end]`: errors on reversal or overrun
-/// instead of panicking.
+/// Returns the checked subslice `data[offset..end]`.
+///
+/// # Errors
+///
+/// `offset > end`, or `end` is past the end of `data`.
 fn slice(data: &[u8], offset: usize, end: usize) -> Result<&[u8]> {
     if offset > end {
         return Err(anyhow!("DNS rdata length underflow ({offset} > {end})"));
@@ -105,10 +129,9 @@ fn slice(data: &[u8], offset: usize, end: usize) -> Result<&[u8]> {
 }
 
 impl DnsMessage {
-    /// Build a standard query with an EDNS0 OPT pseudo-RR in the
-    /// additional section, advertising a 1232-byte payload size (the
-    /// DNS flag-day 2020 recommendation: large enough for modern
-    /// responses, small enough to avoid IP fragmentation).
+    /// Build a standard recursive query (RD set) with transaction ID `id`
+    /// for `questions`, with an EDNS0 OPT pseudo-RR in the additional
+    /// section advertising [`EDNS0_PAYLOAD_SIZE`].
     pub fn new(id: u16, questions: Vec<DnsQuestion>) -> Self {
         let header = DnsHeader {
             transaction_id: id,
@@ -149,11 +172,15 @@ impl DnsMessage {
     /// Extract and validate the EDNS0 OPT pseudo-RR from the additional
     /// section (RFC 6891).
     ///
-    /// Returns `Ok(None)` when the responder sent no OPT record (it may
-    /// not support EDNS0 even though we queried with it). Returns `Err`
-    /// on conformance violations: more than one OPT record, or an OPT
-    /// with a non-root owner name, or an OPT version greater than the 0
-    /// we requested — each means the responder is misbehaving, and the
+    /// Returns the OPT record's fields, or `None` when the responder sent
+    /// no OPT record (it may not support EDNS0 even though we queried
+    /// with it).
+    ///
+    /// # Errors
+    ///
+    /// Conformance violations: more than one OPT record, an OPT with a
+    /// non-root owner name, or an OPT version greater than the 0 we
+    /// requested — each means the responder is misbehaving, and the
     /// answer is not trustworthy.
     pub fn edns0(&self) -> Result<Option<Edns0>> {
         let mut found: Option<Edns0> = None;
@@ -182,8 +209,14 @@ impl DnsMessage {
         Ok(found)
     }
 
-    /// Parse a full DNS message (header, questions, records) from raw
-    /// bytes. Total: every malformed input is an `Err`, never a panic.
+    /// Parse a full DNS message (header, questions, records) from `data`.
+    ///
+    /// Returns the number of bytes consumed and the message.
+    ///
+    /// # Errors
+    ///
+    /// Total: every malformed input (truncation, bad pointers, rdata
+    /// overruns, non-UTF-8 labels) is an `Err`, never a panic.
     pub fn from_bytes(data: &[u8]) -> Result<(usize, Self)> {
         let cursor = std::io::Cursor::new(data);
         let mut buf = BufReader::new(cursor);
@@ -229,12 +262,16 @@ impl DnsMessage {
         Ok((offset, msg))
     }
 
-    /// Serialize the full message (header, questions, records).
-    /// Serialize to wire format. The header counts are synchronized
-    /// with the actual section lengths here — a message that carries
-    /// records but advertises fewer of them in its header is malformed
-    /// on the wire, and forgetting to bump the counts by hand is an
-    /// easy way to produce exactly that.
+    /// Serialize the full message (header, questions, records) to wire
+    /// format. The header counts are synchronized with the actual section
+    /// lengths here — a message that carries records but advertises fewer
+    /// of them in its header is malformed on the wire, and forgetting to
+    /// bump the counts by hand is an easy way to produce exactly that.
+    ///
+    /// # Errors
+    ///
+    /// A name with no valid wire form ([`InvalidName`]), or a header
+    /// encoding failure.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
         let mut header = self.header.clone();
         header.question_count = self.questions.len() as u16;
@@ -325,8 +362,14 @@ pub struct DnsQuestion {
 }
 
 impl DnsQuestion {
-    /// Parse a question entry at `offset`; returns the offset past it.
-    /// Every read is bounds-checked.
+    /// Parse the question entry at `offset` in the message `data`.
+    ///
+    /// Returns the offset past it and the question.
+    ///
+    /// # Errors
+    ///
+    /// A malformed name or a truncated entry; every read is
+    /// bounds-checked.
     pub fn from_bytes(data: &[u8], mut offset: usize) -> Result<(usize, Self)> {
         let label: Label;
         (offset, label) = Label::from_bytes(data, offset, 0)?;
@@ -345,6 +388,10 @@ impl DnsQuestion {
     }
 
     /// Serialize the question entry.
+    ///
+    /// # Errors
+    ///
+    /// The name has no valid wire form ([`InvalidName`]).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut data: Vec<u8> = vec![];
         let _ = data.write_all(self.name.to_bytes()?.as_slice());
@@ -374,9 +421,15 @@ pub struct DnsResourceRecord {
 }
 
 impl DnsResourceRecord {
-    /// Parse one resource record at `offset`; returns the offset past its
-    /// rdata. Every read is bounds-checked, and the parsed rdata is
-    /// bounded by the record's own `rdlength`.
+    /// Parse one resource record at `offset` in the message `data`.
+    ///
+    /// Returns the offset past its rdata and the record.
+    ///
+    /// # Errors
+    ///
+    /// A malformed name, a truncated record, or malformed rdata. Every
+    /// read is bounds-checked, and the parsed rdata is bounded by the
+    /// record's own `rdlength`.
     pub fn from_bytes(data: &[u8], mut offset: usize) -> Result<(usize, Self)> {
         let label: Label;
         (offset, label) = Label::from_bytes(data, offset, 0)?;
@@ -403,6 +456,11 @@ impl DnsResourceRecord {
 
     /// Serialize the record; `rdlength` is recomputed from the rdata so
     /// it can never disagree with the encoded bytes.
+    ///
+    /// # Errors
+    ///
+    /// A name (owner or in the rdata) has no valid wire form
+    /// ([`InvalidName`]).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut data: Vec<u8> = vec![];
         let _ = data.write_all(self.name.to_bytes()?.as_slice());
@@ -423,15 +481,24 @@ impl DnsResourceRecord {
 pub struct Label(String);
 
 impl Label {
-    /// Build a label from its human-readable dotted form.
+    /// Build a label from its human-readable dotted form `s` (not
+    /// validated until [`Label::to_bytes`]).
     pub fn new(s: String) -> Self {
         Label(s)
     }
 
-    /// Parse a (possibly compression-pointer) name at `offset`, returning
-    /// the offset just past it in the *original* message. `depth` bounds
-    /// pointer-chain recursion; every read is bounds-checked, so hostile
-    /// pointers (self-referential, out-of-range) yield `Err`.
+    /// Parse a (possibly compression-pointer) name at `offset` in the
+    /// message `data`. `depth` is the pointer-chain depth so far (callers
+    /// pass 0).
+    ///
+    /// Returns the offset just past the name in the *original* message
+    /// and the dotted name.
+    ///
+    /// # Errors
+    ///
+    /// A pointer chain deeper than 20, an out-of-range pointer, a
+    /// truncated label, or a label that is not UTF-8. Every read is
+    /// bounds-checked, so hostile pointers never panic.
     pub fn from_bytes(data: &[u8], mut offset: usize, depth: usize) -> Result<(usize, Self)> {
         if depth > 20 {
             return Err(anyhow!("Max recursion reached"));
@@ -474,8 +541,10 @@ impl Label {
     /// Serialize the name as uncompressed wire labels plus the root
     /// terminator.
     ///
-    /// Returns `Err` ([`InvalidName`]) for a name that has no valid wire
-    /// form (see [`check_name`]). Footgun: never write such a name anyway.
+    /// # Errors
+    ///
+    /// [`InvalidName`] for a name that has no valid wire form (see
+    /// [`check_name`]). Footgun: never write such a name anyway.
     /// A label length is one octet, so a 64–255-octet label would set the
     /// top bits that mark a compression pointer, a longer one would wrap,
     /// and an empty label would end the name early.
@@ -535,7 +604,9 @@ impl std::error::Error for InvalidName {}
 /// Check that `name` (text form, no trailing dot) has a valid wire
 /// encoding. The empty string is the root name and is valid.
 ///
-/// Returns `Err` describing the first problem found.
+/// # Errors
+///
+/// [`InvalidName`] describing the first problem found.
 pub fn check_name(name: &str) -> Result<(), InvalidName> {
     let invalid = |reason| InvalidName {
         name: name.to_string(),
@@ -563,7 +634,12 @@ pub fn check_name(name: &str) -> Result<(), InvalidName> {
 /// [`check_name`]. The root name is refused here: nothing in the mail
 /// checks has a reason to query it.
 ///
-/// Returns the normalized name (a sub-slice of `name`) or the error.
+/// Returns the normalized name (a sub-slice of `name`).
+///
+/// # Errors
+///
+/// [`InvalidName`] for an empty (or root) name or one that fails
+/// [`check_name`].
 pub fn normalize_name(name: &str) -> Result<&str, InvalidName> {
     let trimmed = name.trim();
     let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
@@ -623,7 +699,8 @@ pub enum QType {
     WKS(Ipv4Addr, u8, Vec<u8>),
     /// Reverse-lookup pointer.
     PTR(Label),
-    /// Host information.
+    /// Host information: the raw rdata as text (not split into its CPU
+    /// and OS character-strings).
     HINFO(String),
     /// Mailbox info (obsolete).
     MINFO(Label, Label),
@@ -632,16 +709,26 @@ pub enum QType {
     /// Text record: all character-strings concatenated (DKIM keys and
     /// SPF records span multiple strings).
     TXT(String),
-    /// Unrecognized record type: rdata not parsed.
+    /// Unrecognized record type (or OPT): rdata not parsed, and
+    /// serialized as empty.
     EMPTY,
 }
 
 impl QType {
-    /// Parse rdata of `rtype` from `data[offset..end]`. `end` is the
-    /// attacker-controlled `rdlength` bound, so it is validated against
-    /// the message before anything is sliced; every fixed-width field
-    /// read is additionally checked against the record's own rdata bounds
-    /// so a lying `rdlength` cannot cross into the next record.
+    /// Parse rdata of record type `rtype` from `data[offset..end]`, where
+    /// `data` is the whole message (names may point anywhere in it).
+    /// `end` is the attacker-controlled `rdlength` bound, so it is
+    /// validated against the message before anything is sliced; every
+    /// fixed-width field read is additionally checked against the
+    /// record's own rdata bounds so a lying `rdlength` cannot cross into
+    /// the next record.
+    ///
+    /// Returns the typed rdata ([`QType::EMPTY`] for unsupported types).
+    ///
+    /// # Errors
+    ///
+    /// The bounds are invalid, the rdata is truncated or malformed, or a
+    /// name or HINFO text is not UTF-8. TXT bytes are decoded lossily.
     pub fn try_from(rtype: u16, data: &[u8], mut offset: usize, end: usize) -> Result<Self> {
         if end > data.len() {
             return Err(anyhow!("DNS rdata overruns message"));
@@ -763,7 +850,12 @@ impl QType {
         })
     }
 
-    /// Serialize the rdata.
+    /// Serialize the rdata. TXT values are split into 255-octet
+    /// character-strings.
+    ///
+    /// # Errors
+    ///
+    /// A contained name has no valid wire form ([`InvalidName`]).
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(match self {
             QType::A(ipv4) => ipv4.to_bits().to_be_bytes().to_vec(),

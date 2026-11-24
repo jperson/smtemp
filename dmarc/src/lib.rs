@@ -4,17 +4,12 @@
 //! The evaluation is pure and offline-testable; the policy-record fetch
 //! is generic over [`spf::SpfResolver`], reusing the SPF crate's resolver
 //! abstraction (and its fixture mocks).
-#![warn(missing_docs)]
-
-//! DMARC (RFC 7489) record parsing, identifier alignment, and policy
-//! application. The evaluation is pure (fully unit-testable offline);
-//! policy-record fetch is generic over [`spf::SpfResolver`], reusing the
-//! resolver abstraction (and its fixture mocks) from the SPF crate.
 //!
 //! Not implemented: `rua=`/`ruf=` reporting, `pct=` gradual sampling
 //! (treated as 100), and PSL-based organizational-domain discovery. Policy
 //! discovery walks the From domain's ancestors instead (see
 //! [`fetch_policy`]); relaxed alignment is a suffix test.
+#![warn(missing_docs)]
 
 use spf::SpfResolver;
 use thiserror::Error;
@@ -22,13 +17,15 @@ use thiserror::Error;
 /// Errors from DMARC record fetching and parsing.
 #[derive(Debug, Error)]
 pub enum DmarcError {
-    /// The record does not parse (bad version, bad `p=`, bad flags).
+    /// The record does not parse; the payload names the offending tag
+    /// (`v`, `v missing`, `p`, `adkim`, `aspf`, `pct`).
     #[error("invalid DMARC record: {0}")]
     Invalid(&'static str),
     /// More than one parseable DMARC record at the name.
     #[error("multiple DMARC records")]
     MultipleRecords,
-    /// The DNS lookup itself failed.
+    /// The DNS lookup itself failed (any resolver error, including
+    /// timeouts).
     #[error("transient DNS failure")]
     Temp,
 }
@@ -61,9 +58,16 @@ pub struct DmarcRecord {
 }
 
 impl DmarcRecord {
-    /// Parse a DMARC record from TXT text. Requires `v=DMARC1` (case
-    /// per RFC 7489 Section 6.3: the tag is case-insensitive but the
-    /// value "DMARC1" is literal) and a valid `p=`.
+    /// Parse a DMARC record from the TXT text `txt`. Requires `v=DMARC1`
+    /// (case per RFC 7489 Section 6.3: the tag is case-insensitive but the
+    /// value "DMARC1" is literal) and a valid `p=`. Reporting tags are
+    /// ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`DmarcError::Invalid`] for a missing or wrong `v=`, a missing
+    /// `p=` (reported as `v`), or an unusable `p=`, `sp=`, `adkim=`,
+    /// `aspf=` or `pct=` value.
     pub fn parse(txt: &str) -> Result<Self, DmarcError> {
         let mut version = None;
         let mut policy = None;
@@ -118,8 +122,9 @@ impl DmarcRecord {
         }
     }
 
-    /// The policy that applies to `domain` given the record's owner:
-    /// `sp=` for subdomains of the record's domain, `p=` otherwise.
+    /// Returns the policy that applies to `domain` when this record was
+    /// published for `record_domain`: `sp=` (if set) for subdomains of
+    /// `record_domain`, `p=` otherwise.
     pub fn policy_for(&self, record_domain: &str, domain: &str) -> DmarcPolicy {
         let is_subdomain = domain != record_domain
             && domain
@@ -132,6 +137,12 @@ impl DmarcRecord {
     }
 }
 
+/// Parse a `p=`/`sp=` `value` (case-insensitive).
+///
+/// # Errors
+///
+/// [`DmarcError::Invalid`] (`p`) for anything but none, quarantine or
+/// reject.
 fn parse_policy(value: &str) -> Result<DmarcPolicy, DmarcError> {
     match value.to_ascii_lowercase().as_str() {
         "none" => Ok(DmarcPolicy::None),
@@ -141,15 +152,17 @@ fn parse_policy(value: &str) -> Result<DmarcPolicy, DmarcError> {
     }
 }
 
-/// Relaxed alignment (RFC 7489 Section 3.1.1): the domains are aligned if
-/// they are equal or one is a subdomain of the other.
+/// Relaxed alignment (RFC 7489 Section 3.1.1): returns whether domains
+/// `a` and `b` are equal or one is a subdomain of the other (trimmed,
+/// case-insensitive).
 pub fn aligned_relaxed(a: &str, b: &str) -> bool {
     let a = a.trim().to_ascii_lowercase();
     let b = b.trim().to_ascii_lowercase();
     a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
 }
 
-/// Strict alignment: exact match, case-insensitive.
+/// Strict alignment: returns whether domains `a` and `b` match exactly
+/// (trimmed, case-insensitive).
 pub fn aligned_strict(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
@@ -168,9 +181,13 @@ pub struct Evaluation {
 }
 
 /// Evaluate alignment (RFC 7489 Section 4.2; the DMARC "pass" requires
-/// SPF **or** DKIM alignment). `spf` is the envelope-sender domain and
-/// whether SPF evaluated to Pass; `dkim` is each signature's `d=` domain
-/// and whether it fully verified.
+/// SPF **or** DKIM alignment) of a message with author domain
+/// `from_domain` under `record`'s alignment modes. `spf` is the
+/// envelope-sender domain and whether SPF evaluated to Pass (`None` with
+/// no sender domain); `dkim` is each signature's `d=` domain and whether
+/// it fully verified.
+///
+/// Returns the alignment results.
 pub fn evaluate(
     record: &DmarcRecord,
     spf: Option<(&str, bool)>,
@@ -190,6 +207,8 @@ pub fn evaluate(
     }
 }
 
+/// Whether `spf_domain` aligns with `from_domain` under `record`'s
+/// `aspf=` mode.
 fn spf_aligned(record: &DmarcRecord, spf_domain: &str, from_domain: &str) -> bool {
     if record.aspf_strict {
         aligned_strict(spf_domain, from_domain)
@@ -198,6 +217,8 @@ fn spf_aligned(record: &DmarcRecord, spf_domain: &str, from_domain: &str) -> boo
     }
 }
 
+/// Whether `dkim_domain` aligns with `from_domain` under `record`'s
+/// `adkim=` mode.
 fn dkim_aligned(record: &DmarcRecord, dkim_domain: &str, from_domain: &str) -> bool {
     if record.adkim_strict {
         aligned_strict(dkim_domain, from_domain)
@@ -217,8 +238,12 @@ pub enum Action {
     Reject,
 }
 
-/// Apply the message evaluation under the record's policy for its domain.
+/// Decide what to do with a message given its `evaluation` and the
+/// `policy` that governs its From domain (see [`FoundPolicy::policy_for`]).
 /// `pct` is treated as 100 (no sampling; see module docs).
+///
+/// Returns [`Action::Pass`] for a DMARC pass or `p=none`, otherwise the
+/// policy's action.
 pub fn apply(evaluation: &Evaluation, policy: DmarcPolicy) -> Action {
     if evaluation.pass {
         return Action::Pass;
@@ -242,8 +267,9 @@ pub struct FoundPolicy {
 }
 
 impl FoundPolicy {
-    /// The policy that governs `from_domain`: `sp=` when the record was
-    /// found at an ancestor of it, `p=` when at the domain itself.
+    /// Returns the policy that governs `from_domain`: `sp=` (if set) when
+    /// the record was found at an ancestor of it, `p=` when at the domain
+    /// itself.
     pub fn policy_for(&self, from_domain: &str) -> DmarcPolicy {
         self.record.policy_for(&self.domain, from_domain)
     }
@@ -254,11 +280,12 @@ impl FoundPolicy {
 /// message into dozens of queries.
 pub const MAX_POLICY_QUERIES: usize = 8;
 
-/// The names [`fetch_policy`] queries, in order: the From domain itself,
-/// then its ancestors down to two labels. A domain
-/// with more labels than the bound skips straight from the full name to
-/// its 7-label suffix (as DMARCbis's tree walk does), so at most
-/// [`MAX_POLICY_QUERIES`] names are returned.
+/// Returns the names [`fetch_policy`] queries for `from_domain` (trimmed,
+/// lowercased, trailing dot removed), in order: the domain itself, then
+/// its ancestors down to two labels. A domain with more labels than the
+/// bound skips straight from the full name to its 7-label suffix (as
+/// DMARCbis's tree walk does), so at most [`MAX_POLICY_QUERIES`] names are
+/// returned.
 pub fn policy_candidates(from_domain: &str) -> Vec<String> {
     let domain = from_domain
         .trim()
@@ -277,7 +304,11 @@ pub fn policy_candidates(from_domain: &str) -> Vec<String> {
     names
 }
 
-/// Discover the DMARC policy for a From-header domain.
+/// Discover the DMARC policy for the From-header domain `from_domain`
+/// through `resolver`.
+///
+/// Returns the first record found and the domain it was published for,
+/// or `None` when no candidate publishes one.
 ///
 /// Queries `_dmarc.<domain>` for the From domain and then each ancestor
 /// (see [`policy_candidates`]), stopping at the first that publishes a
@@ -286,6 +317,8 @@ pub fn policy_candidates(from_domain: &str) -> Vec<String> {
 /// don't replace this with a "last two labels" guess. For `x.victim.co.uk`
 /// that asks `co.uk`, never `victim.co.uk`, so a spoof from any
 /// non-existent subdomain would find no policy.
+///
+/// # Errors
 ///
 /// Errors fail closed: a transient DNS failure at any step is
 /// [`DmarcError::Temp`], because skipping that name could skip the policy
@@ -304,6 +337,14 @@ pub async fn fetch_policy<R: SpfResolver + Sync>(
     Ok(None)
 }
 
+/// Look up the TXT records at `name` through `resolver`.
+///
+/// Returns the one record that parses as DMARC, or `None` if none does.
+///
+/// # Errors
+///
+/// [`DmarcError::Temp`] when the lookup fails,
+/// [`DmarcError::MultipleRecords`] when more than one record parses.
 async fn fetch_one<R: SpfResolver + Sync>(
     resolver: &R,
     name: &str,
@@ -594,8 +635,8 @@ mod discovery_tests {
         assert_eq!(found.domain, "corp.example.com");
     }
 
-    /// A DNS failure anywhere in the walk is a temporary error, never "no policy" — the policy might be at the
-    /// name that failed.
+    /// A DNS failure anywhere in the walk is a temporary error, never "no
+    /// policy" — the policy might be at the name that failed.
     #[tokio::test]
     async fn dns_failure_is_temp_not_no_policy() {
         let mut dns = with(&[("_dmarc.victim.example", "v=DMARC1; p=reject")]);
@@ -625,7 +666,7 @@ mod discovery_tests {
         ));
     }
 
-    /// M4: `sp=` governs a subdomain whose policy came from an ancestor;
+    /// `sp=` governs a subdomain whose policy came from an ancestor;
     /// `p=` governs the domain that published the record.
     #[tokio::test]
     async fn subdomain_policy_applies_to_inherited_records() {

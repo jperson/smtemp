@@ -7,7 +7,6 @@
 #![warn(missing_docs)]
 
 use anyhow::{anyhow, Context, Result};
-//use rand::Rng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rustls_pki_types::{CertificateDer, ServerName};
@@ -30,21 +29,25 @@ use tokio_rustls::TlsConnector;
 pub mod proto;
 use crate::proto::{DnsMessage, DnsQuestion, DnsResourceRecord, Label, QType};
 
-/// Whether `err` (from [`DnsClient::query`]) means the name itself is
-/// invalid ([`proto::InvalidName`]): nothing was sent, and retrying can't
-/// help. Callers treat it like a name that does not exist (RFC 7208 §4.3),
+/// Returns whether `err` (from [`DnsClient::query`]) means the name
+/// itself is invalid ([`proto::InvalidName`]): nothing was sent, and
+/// retrying can't help. Callers treat it like a name that does not exist (RFC 7208 §4.3),
 /// not like a transient resolver failure.
 pub fn is_invalid_name(err: &anyhow::Error) -> bool {
     err.downcast_ref::<proto::InvalidName>().is_some()
 }
 
-/// Verify a response actually answers our query (RFC 5452 hardening
+/// Verify that `resp` actually answers `query` (RFC 5452 hardening
 /// against resolver confusion and spoofed datagrams): the transaction ID
 /// matches, it is marked as a response, and the question section echoes
 /// the question.
 ///
 /// Returns `Ok(())` when the response is trustworthy enough to parse
-/// further, and `Err` naming the violated check otherwise.
+/// further.
+///
+/// # Errors
+///
+/// Names the violated check.
 fn validate_response(query: &DnsMessage, resp: &DnsMessage) -> Result<()> {
     if resp.header.transaction_id != query.header.transaction_id {
         return Err(anyhow!(
@@ -62,9 +65,19 @@ fn validate_response(query: &DnsMessage, resp: &DnsMessage) -> Result<()> {
     Ok(())
 }
 
-/// Query over DNS-over-TLS (port 853): the authenticated, preferred
-/// transport. The response is validated (ID, QR, question echo, EDNS0
-/// conformance) before it is returned.
+/// Send one query for `domain` (`record_type`, `record_class`) to the
+/// resolver `dest` over DNS-over-TLS (port 853): the authenticated,
+/// preferred transport. A one-shot connection verified against the
+/// public webpki roots; no timeout is applied (long-running callers use
+/// [`DnsClient`]).
+///
+/// Returns the response, validated (ID, QR, question echo, EDNS0
+/// conformance).
+///
+/// # Errors
+///
+/// An invalid name ([`proto::InvalidName`]), a connection, TLS or I/O
+/// failure, or a malformed or invalid response.
 pub async fn query_tls<'query>(
     dest: &'query Ipv4Addr,
     domain: &'query str,
@@ -108,9 +121,17 @@ pub async fn query_tls<'query>(
     Ok(dq)
 }
 
-/// Query over plain TCP (port 53). The response is validated (ID, QR,
-/// question echo, EDNS0 conformance) before it is returned. No timeout
-/// is applied; prefer [`query_tls`].
+/// Send one query for `domain` (`record_type`, `record_class`) to the
+/// resolver `dest` over plain TCP (port 53). Unauthenticated and with no
+/// timeout; prefer [`query_tls`].
+///
+/// Returns the response, validated (ID, QR, question echo, EDNS0
+/// conformance).
+///
+/// # Errors
+///
+/// An invalid name ([`proto::InvalidName`]), a connection or I/O
+/// failure, or a malformed or invalid response.
 pub async fn query_tcp<'query>(
     dest: &'query Ipv4Addr,
     domain: &'query str,
@@ -164,7 +185,9 @@ const MAX_CACHE_TTL: u64 = 3600;
 /// One cached DNS response with its expiry.
 #[derive(Debug)]
 struct CacheEntry {
+    /// The validated response.
     resp: DnsMessage,
+    /// When the entry stops being served.
     expires: Instant,
 }
 
@@ -177,11 +200,12 @@ struct CacheEntry {
 /// because it may be transient.
 #[derive(Debug, Default)]
 struct DnsCache {
+    /// Cached responses (at most [`MAX_CACHE_ENTRIES`]).
     entries: HashMap<CacheKey, CacheEntry>,
 }
 
 impl DnsCache {
-    /// Look up a cached response.
+    /// Look up the cached response for `key`.
     ///
     /// `now` is injected so expiry is deterministic in tests. Returns
     /// `Some(response)` while the entry is live — the stored response,
@@ -196,8 +220,8 @@ impl DnsCache {
         Some(self.entries.get(key)?.resp.clone())
     }
 
-    /// Store a response under `key` if it carries cacheable TTL
-    /// information.
+    /// Store `resp` under `key`, expiring its TTL after `now`, if it
+    /// carries cacheable TTL information.
     ///
     /// Responses without TTL information (no answers and no SOA, or a
     /// transient error code) and zero-TTL responses are silently not
@@ -222,7 +246,7 @@ impl DnsCache {
     }
 }
 
-/// The cache lifetime for a validated response.
+/// The cache lifetime for the validated response `resp`.
 ///
 /// Returns `Some(ttl)` for cacheable answers — the minimum record TTL
 /// for positive responses, the SOA-derived negative TTL for
@@ -251,9 +275,11 @@ fn cache_ttl(resp: &DnsMessage) -> Option<Duration> {
 /// Live counters and gauges for a [`DnsClient`]: the baseline for sizing
 /// the connection pool and measuring pipelining.
 ///
-/// Everything is a lock-free atomic. The gauges (`waiting`, `in_flight`)
-/// are maintained by drop guards, so a query whose future is cancelled
-/// mid-wait or mid-exchange still decrements them.
+/// Everything is a lock-free atomic. Each field backs the
+/// [`DnsStatsSnapshot`] field of the same name (documented there). The
+/// gauges (`waiting`, `in_flight`) are maintained by drop guards, so a
+/// query whose future is cancelled mid-wait or mid-exchange still
+/// decrements them.
 #[derive(Debug, Default)]
 struct DnsStats {
     queries: AtomicU64,
@@ -278,7 +304,8 @@ struct DnsStats {
 /// [`DnsClient::reset_peaks`] (or creation).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct DnsStatsSnapshot {
-    /// Calls to [`DnsClient::query`].
+    /// Calls to [`DnsClient::query`] with a valid name (invalid names are
+    /// refused before counting).
     pub queries: u64,
     /// Queries answered from the TTL cache (no network).
     pub cache_hits: u64,
@@ -317,6 +344,7 @@ pub struct DnsStatsSnapshot {
 struct GaugeGuard<'a>(&'a AtomicU64);
 
 impl<'a> GaugeGuard<'a> {
+    /// Increment `gauge` and return the guard that decrements it.
     fn new(gauge: &'a AtomicU64) -> Self {
         gauge.fetch_add(1, Ordering::Relaxed);
         GaugeGuard(gauge)
@@ -329,7 +357,7 @@ impl Drop for GaugeGuard<'_> {
     }
 }
 
-/// Lock a std mutex, recovering the data if a previous holder panicked.
+/// Lock `mutex`, recovering the data if a previous holder panicked.
 /// The tables guarded here stay consistent across a panic (every update
 /// is a single insert/remove), and the guard types below lock in `Drop`,
 /// where a second panic would abort the process.
@@ -385,13 +413,15 @@ struct PendingTable {
 /// its writer task.
 #[derive(Debug)]
 struct Shared {
+    /// The connection's in-flight queries.
     table: Mutex<PendingTable>,
+    /// The owning client's metrics.
     stats: Arc<DnsStats>,
 }
 
 impl Shared {
-    /// Mark the connection closed and fail every waiting query (they
-    /// retry once on a new connection). Idempotent.
+    /// Mark the connection closed and fail every waiting query with
+    /// `reason` (they retry once on a new connection). Idempotent.
     fn fail_all(&self, reason: &str) {
         let drained: Vec<PendingQuery> = {
             let mut table = lock(&self.table);
@@ -403,14 +433,18 @@ impl Shared {
         }
     }
 
-    /// Deliver a response to the query waiting on its transaction ID.
+    /// Deliver `resp` to the query waiting on its transaction ID.
     ///
     /// A response whose ID matches nothing in flight is a late reply to a
     /// query that already timed out or was cancelled: it is counted and
-    /// discarded, and the connection stays usable. Returns `Err` when a
-    /// response matches an ID but fails validation (question echo, QR,
-    /// EDNS0 conformance): the resolver's view of this connection can no
-    /// longer be trusted, so the caller tears the connection down.
+    /// discarded, and the connection stays usable.
+    ///
+    /// # Errors
+    ///
+    /// The response matches an ID but fails validation (question echo,
+    /// QR, EDNS0 conformance): the waiter is failed, and since the
+    /// resolver's view of this connection can no longer be trusted, the
+    /// caller tears the connection down.
     fn complete(&self, resp: DnsMessage) -> Result<()> {
         let pending = lock(&self.table)
             .queries
@@ -434,8 +468,12 @@ impl Shared {
 /// query got its answer, timed out, or its future was cancelled — so
 /// abandoned queries never leak table entries.
 struct PendingGuard {
+    /// The connection's shared state.
     shared: Arc<Shared>,
+    /// The query's transaction ID.
     id: u16,
+    /// The query's submission token; only an entry with this token is
+    /// removed.
     token: u64,
 }
 
@@ -464,14 +502,19 @@ impl Drop for PendingGuard {
 /// query using it finishes) aborts both tasks and closes the connection.
 #[derive(Debug)]
 struct Pipeline {
+    /// State shared with the reader and writer tasks.
     shared: Arc<Shared>,
+    /// Length-prefixed query frames for the writer task.
     outbound: mpsc::UnboundedSender<Vec<u8>>,
+    /// The reader task ([`read_loop`]).
     reader: JoinHandle<()>,
+    /// The writer task ([`write_loop`]).
     writer: JoinHandle<()>,
 }
 
 impl Pipeline {
-    /// Start the reader and writer tasks on an established connection.
+    /// Start the reader and writer tasks on the established connection
+    /// `stream`, counting into `stats`.
     fn start(stream: DotStream, stats: Arc<DnsStats>) -> Self {
         let (read_half, write_half) = tokio::io::split(stream);
         let shared = Arc::new(Shared {
@@ -494,7 +537,8 @@ impl Pipeline {
         lock(&self.shared.table).closed
     }
 
-    /// Queue one query on this connection.
+    /// Queue one query for `domain`/`qtype` (class IN) on this connection,
+    /// registered under the submission `token`.
     ///
     /// Returns `Ok(Some((reply, guard)))` once the query is registered and
     /// handed to the writer (keep `guard` alive while waiting), `Ok(None)`
@@ -560,7 +604,8 @@ impl Drop for Pipeline {
     }
 }
 
-/// A random transaction ID not currently in flight on this connection.
+/// Returns a random transaction ID not among `in_flight` on this
+/// connection.
 /// IDs stay unpredictable (RFC 5452 hygiene, though TLS already
 /// authenticates the channel); the table holds at most the in-flight
 /// limit, so a free ID is found almost immediately.
@@ -642,6 +687,7 @@ struct Slot {
 /// A query's claim on a slot; releases its share of the slot's load when
 /// dropped (including on cancellation).
 struct SlotClaim<'a> {
+    /// The claimed slot.
     slot: &'a Slot,
 }
 
@@ -700,12 +746,16 @@ impl DnsClient {
         DnsClient::with_timeout(server, Duration::from_secs(5))
     }
 
-    /// A client with an explicit per-query timeout.
+    /// A client for `server` like [`DnsClient::new`], but with the
+    /// per-query (and connect) timeout `timeout`.
     pub fn with_timeout(server: Ipv4Addr, timeout: Duration) -> Self {
         DnsClient::with_config(server, default_client_config(), timeout, None)
     }
 
-    /// A client with an explicit TLS configuration and connect endpoint.
+    /// A client for `server` with the TLS configuration `config`, the
+    /// per-query timeout `timeout`, and an optional `endpoint` (`host:port`)
+    /// to dial instead of `server:853`. Uses the default connection and
+    /// in-flight limits.
     ///
     /// Test seam: a mock DoT server runs on an ephemeral port with a
     /// private trust root, so tests inject both. Production code should
@@ -741,7 +791,11 @@ impl DnsClient {
     /// subject alternative name. This replaces any TLS configuration given
     /// to [`DnsClient::with_config`].
     ///
-    /// Returns `Err` if a certificate is not a usable trust anchor.
+    /// Returns the reconfigured client.
+    ///
+    /// # Errors
+    ///
+    /// A certificate is not a usable trust anchor.
     pub fn with_extra_roots(mut self, roots: &[CertificateDer<'static>]) -> Result<Self> {
         self.config = Arc::new(
             ClientConfig::builder()
@@ -768,17 +822,17 @@ impl DnsClient {
         self
     }
 
-    /// The number of connection slots.
+    /// Returns the number of connection slots.
     pub fn connections(&self) -> usize {
         self.slots.len()
     }
 
-    /// The per-connection in-flight limit.
+    /// Returns the per-connection in-flight limit.
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight
     }
 
-    /// A snapshot of this client's metrics.
+    /// Returns a snapshot of this client's metrics.
     pub fn stats(&self) -> DnsStatsSnapshot {
         let s = &self.stats;
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -810,7 +864,8 @@ impl DnsClient {
             .store(s.in_flight.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
-    /// Query one name over DNS-over-TLS.
+    /// Query `domain` for record type `qtype` (class IN) over
+    /// DNS-over-TLS.
     ///
     /// Cache hits (a prior validated response for the same lowercase
     /// qname and qtype whose TTL has not expired) are returned without
@@ -821,20 +876,23 @@ impl DnsClient {
     /// fresh connection; a timeout abandons the query without harming the
     /// connection.
     ///
-    /// Returns `Ok(response)` — a validated response (ID, QR, question
-    /// echo, EDNS0 conformance), possibly from the cache and possibly
-    /// carrying a non-zero error rcode, which callers map to their own
-    /// semantics — or `Err` when the resolver could not be consulted
-    /// (connect failure, connection failure after the retry, protocol
-    /// violation, or the per-query timeout elapsing).
+    /// Surrounding whitespace and one trailing dot are removed from
+    /// `domain` first, so the cache key and the name sent are identical.
     ///
-    /// A name with no valid wire form (an empty label, a label over 63
-    /// octets, or a name over 253) is refused **before** anything is sent,
-    /// with an [`InvalidName`](crate::proto::InvalidName) error (see
-    /// [`is_invalid_name`]). Such names are attacker-reachable (SPF
-    /// records, DKIM `d=`/`s=`), and public resolvers silently drop the
-    /// malformed query, so sending one would cost the full timeout. Surrounding whitespace and one trailing dot are
-    /// removed first, so the cache key and the name sent are identical.
+    /// Returns a validated response (ID, QR, question echo, EDNS0
+    /// conformance), possibly from the cache and possibly carrying a
+    /// non-zero error rcode, which callers map to their own semantics.
+    ///
+    /// # Errors
+    ///
+    /// The resolver could not be consulted: connect failure, connection
+    /// failure after the retry, protocol violation, or the per-query
+    /// timeout elapsing. A name with no valid wire form (an empty label,
+    /// a label over 63 octets, or a name over 253) is refused **before**
+    /// anything is sent, with an [`InvalidName`](crate::proto::InvalidName)
+    /// error (see [`is_invalid_name`]). Such names are attacker-reachable
+    /// (SPF records, DKIM `d=`/`s=`), and public resolvers silently drop
+    /// the malformed query, so sending one would cost the full timeout.
     pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
         let domain = proto::normalize_name(domain).map_err(anyhow::Error::new)?;
         let stats = &self.stats;
@@ -901,7 +959,8 @@ impl DnsClient {
         unreachable!("the second attempt always returns")
     }
 
-    /// Claim the least-loaded slot (ties: the lowest index). The caller
+    /// Claim the least-loaded slot (ties: the lowest index); the returned
+    /// claim releases its load when dropped. The caller
     /// holds a capacity permit, so some slot is below the in-flight
     /// limit; a claim that loses a race to a full slot is rolled back
     /// and retried.
@@ -920,13 +979,16 @@ impl DnsClient {
         }
     }
 
-    /// The slot's open connection, or a newly established one if it has
-    /// none or its connection has closed.
+    /// Returns `slot`'s open connection, or a newly established one if it
+    /// has none or its connection has closed.
     ///
-    /// Returns `Err` if connecting fails or exceeds the timeout. The
-    /// connect (TCP + TLS handshake) is bounded like a query: a black-holed
-    /// resolver must not hold the slot
-    /// for the kernel's connect timeout.
+    /// The connect (TCP + TLS handshake) is bounded like a query: a
+    /// black-holed resolver must not hold the slot for the kernel's
+    /// connect timeout.
+    ///
+    /// # Errors
+    ///
+    /// Connecting fails or exceeds the timeout.
     async fn get_or_connect(&self, slot: &Slot) -> Result<Arc<Pipeline>> {
         let mut conn = slot.conn.lock().await;
         if let Some(pipeline) = conn.as_ref() {
@@ -971,9 +1033,8 @@ impl DnsClient {
 /// The default TLS client configuration.
 ///
 /// Returns a configuration trusting the webpki root store with no
-/// client authentication — built once per client rather than per
-/// query, which matters because loading the root store dominated the
-/// old per-query cost alongside the handshake itself.
+/// client authentication. Built once per client rather than per query:
+/// loading the root store is expensive.
 fn default_client_config() -> Arc<ClientConfig> {
     let root_cert_store = root_store(&[]).expect("no extra roots to reject");
     Arc::new(
@@ -987,10 +1048,12 @@ fn default_client_config() -> Arc<ClientConfig> {
 ///
 /// The extra roots are added, never substituted, so a client configured
 /// with a private CA for a local resolver still verifies public DoT
-/// resolvers (1.1.1.1, 9.9.9.9, ...) exactly as before.
+/// resolvers (1.1.1.1, 9.9.9.9, ...).
 ///
-/// Returns `Err` if an extra certificate is not a usable trust anchor
-/// (for example, not DER-encoded X.509).
+/// # Errors
+///
+/// An extra certificate is not a usable trust anchor (for example, not
+/// DER-encoded X.509).
 fn root_store(extra: &[CertificateDer<'static>]) -> Result<RootCertStore> {
     let mut store = RootCertStore::empty();
     store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1002,12 +1065,17 @@ fn root_store(extra: &[CertificateDer<'static>]) -> Result<RootCertStore> {
     Ok(store)
 }
 
-/// Establish a DNS-over-TLS connection to `endpoint`.
+/// Establish a DNS-over-TLS connection to `endpoint` (`host:port`) with
+/// the TLS configuration `config`.
 ///
-/// Returns `Ok(stream)` once the TCP connection is up and the TLS
+/// Returns the stream once the TCP connection is up and the TLS
 /// handshake has completed (the server name for SNI and verification
-/// is the endpoint's host part). Returns `Err` if the TCP connect or
-/// the TLS handshake fails; the error names the endpoint.
+/// is the endpoint's host part).
+///
+/// # Errors
+///
+/// The TCP connect (the error names the endpoint), the host part as a
+/// server name, or the TLS handshake fails.
 async fn connect(endpoint: &str, config: &Arc<ClientConfig>) -> Result<DotStream> {
     let stream = TcpStream::connect(endpoint)
         .await
@@ -1253,8 +1321,8 @@ mod tests {
         assert!(root_store(&[garbage]).is_err());
     }
 
-    /// D3 / L1: names are checked against the RFC 1035 limits before they
-    /// can be encoded or sent.
+    /// Names are checked against the RFC 1035 limits before they can be
+    /// encoded or sent.
     #[test]
     fn name_limits() {
         use crate::proto::{check_name, normalize_name};
@@ -1290,7 +1358,7 @@ mod tests {
         assert!(err.len() < 200, "{err}");
     }
 
-    /// L1: the encoder refuses a label it can't represent instead of
+    /// The encoder refuses a label it can't represent instead of
     /// writing its length into the pointer/extended-label bits.
     #[test]
     fn encoder_refuses_oversized_labels() {
@@ -1315,7 +1383,7 @@ mod tests {
         assert!(question.to_vec().is_err());
     }
 
-    /// D3: an invalid name is refused before anything touches the
+    /// An invalid name is refused before anything touches the
     /// network: no capacity, no connection, an `InvalidName` error.
     #[tokio::test]
     async fn invalid_names_are_refused_without_a_query() {
@@ -1361,7 +1429,7 @@ mod tests {
         assert_eq!(client.stats().cache_hits, 1);
     }
 
-    /// D2: a resolver with a private (here self-signed) certificate is
+    /// A resolver with a private (here self-signed) certificate is
     /// refused by default and trusted once its CA is added.
     #[tokio::test]
     async fn extra_root_trusts_a_private_resolver() {

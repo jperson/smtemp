@@ -47,8 +47,8 @@ pub enum SpfResult {
 
 /// Why an SPF evaluation could not produce a normal result. The variants
 /// matter because they map to different SMTP outcomes (RFC 7208 Section
-/// 4.6.1): transient DNS failures are 4xx, everything else — including
-/// both evaluation limits — is 5xx.
+/// 4.6.1): transient DNS failures and the time limit are 4xx (TempError),
+/// everything else — including both lookup limits — is 5xx (PermError).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SpfError {
     /// A DNS lookup failed; the evaluation may be retried.
@@ -70,7 +70,8 @@ pub enum SpfError {
 }
 
 impl SpfError {
-    /// The SPF result this error produces.
+    /// Returns the SPF result this error produces: TempError for
+    /// [`SpfError::Temp`] and [`SpfError::Deadline`], PermError otherwise.
     pub fn to_result(&self) -> SpfResult {
         match self {
             SpfError::Temp | SpfError::Deadline(_) => SpfResult::TempError,
@@ -92,17 +93,25 @@ impl SpfError {
 /// recursing without bound.
 #[derive(Default)]
 struct Budget {
+    /// DNS-querying terms evaluated so far.
     lookups: usize,
+    /// Lookups so far that returned no records.
     void: usize,
 }
 
+/// RFC 7208 §4.6.4: the most DNS-querying terms one evaluation may use.
 const MAX_LOOKUPS: usize = 10;
+/// RFC 7208 §4.6.4: the most void lookups one evaluation may make.
 const MAX_VOID_LOOKUPS: usize = 2;
 
 impl Budget {
-    /// Account one DNS lookup; Err means the evaluation must abort with
-    /// PermError (RFC 7208 Section 4.6.4: "If this limit is exceeded, a
-    /// PermError MUST be returned").
+    /// Account one DNS lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`SpfError::LookupLimit`] once more than [`MAX_LOOKUPS`] are spent:
+    /// the evaluation must abort with PermError (RFC 7208 Section 4.6.4:
+    /// "If this limit is exceeded, a PermError MUST be returned").
     fn spend(&mut self) -> Result<(), SpfError> {
         self.lookups += 1;
         if self.lookups > MAX_LOOKUPS {
@@ -113,6 +122,10 @@ impl Budget {
 
     /// Account one void lookup — a query that returned no records at all
     /// (NXDOMAIN or an empty answer section).
+    ///
+    /// # Errors
+    ///
+    /// [`SpfError::VoidLimit`] once more than [`MAX_VOID_LOOKUPS`] occur.
     fn record_void(&mut self) -> Result<(), SpfError> {
         self.void += 1;
         if self.void > MAX_VOID_LOOKUPS {
@@ -143,9 +156,9 @@ pub trait SpfResolver {
     fn ptr(&self, domain: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
 }
 
-/// [`SpfResolver`] over DNS-over-TLS. Each query is bounded by `timeout`;
-/// a resolver that stalls (or a black-holed route) produces a transient
-/// error instead of hanging the SMTP session.
+/// [`SpfResolver`] over DNS-over-TLS. Each query is bounded by the
+/// client's per-query timeout; a resolver that stalls (or a black-holed
+/// route) produces a transient error instead of hanging the SMTP session.
 pub struct DotResolver {
     /// The shared DNS client: pooled DNS-over-TLS connection and a
     /// TTL-based result cache, shared across every consumer in the
@@ -154,45 +167,49 @@ pub struct DotResolver {
 }
 
 impl DotResolver {
-    /// A resolver with its own client and the default 5-second
-    /// per-query timeout. Prefer [`DotResolver::shared`] in a server:
+    /// A resolver for `server` with its own client and the default
+    /// 5-second per-query timeout. Prefer [`DotResolver::shared`] in a server:
     /// one client per process means one pooled connection and one warm
     /// cache instead of a fresh handshake per evaluation.
     pub fn new(server: Ipv4Addr) -> Self {
         DotResolver::with_timeout(server, Duration::from_secs(5))
     }
 
-    /// A resolver with its own client and an explicit per-query timeout.
+    /// A resolver for `server` with its own client and the per-query
+    /// timeout `timeout`.
     pub fn with_timeout(server: Ipv4Addr, timeout: Duration) -> Self {
         DotResolver {
             client: Arc::new(DnsClient::with_timeout(server, timeout)),
         }
     }
 
-    /// Wrap an already-shared client. This is how a server should build
+    /// Wrap the already-shared `client`. This is how a server should build
     /// its resolver: the client pools the TLS connection and caches
     /// results across every SPF, DKIM, and DMARC lookup in the process.
     pub fn shared(client: Arc<DnsClient>) -> Self {
         DotResolver { client }
     }
 
-    /// The underlying shared client, for consumers outside SPF (the
-    /// DKIM key lookup uses the same pooled connection and cache).
+    /// Returns the underlying shared client, for consumers outside SPF
+    /// (the DKIM key lookup uses the same pooled connection and cache).
     pub fn client(&self) -> Arc<DnsClient> {
         Arc::clone(&self.client)
     }
 
-    /// One DNS query through the shared client (pipelined connections,
-    /// TTL cache). The client's timeout and connection failures surface as
-    /// `Err`, which `check_host` maps to the transient/perm results per
-    /// RFC 7208 Section 4.6.
+    /// One DNS query for `domain`/`qtype` through the shared client
+    /// (pipelined connections, TTL cache).
     ///
-    /// Returns `Ok(None)` when the name has no valid wire form (an empty
-    /// label, a label over 63 octets, or a name over 253): nothing is sent,
-    /// and RFC 7208 §4.3 says a malformed domain is treated like one that
-    /// does not exist. As a transient error it would have given TempError
-    /// (`451`) and an endless retry for a name that can never resolve (D3
-    /// in DEPLOYMENT.md).
+    /// Returns the response, or `None` when the name has no valid wire
+    /// form (an empty label, a label over 63 octets, or a name over 253):
+    /// nothing is sent, and RFC 7208 §4.3 says a malformed domain is
+    /// treated like one that does not exist. As a transient error it would
+    /// give TempError (`451`) and an endless retry for a name that can
+    /// never resolve.
+    ///
+    /// # Errors
+    ///
+    /// The client's timeout and connection failures, which the
+    /// [`SpfResolver`] methods pass on as transient failures.
     async fn query(&self, domain: &str, qtype: u16) -> Result<Option<DnsMessage>> {
         match self.client.query(domain, qtype).await {
             Ok(resp) => Ok(Some(resp)),
@@ -202,8 +219,12 @@ impl DotResolver {
     }
 }
 
-/// Collect mapped answers, treating NXDOMAIN (and an invalid name, `None`)
-/// as an empty result and any other rcode as a transient failure.
+/// Collect the answers of `resp` that `f` maps to a value, treating
+/// NXDOMAIN (and an invalid name, `None`) as an empty result.
+///
+/// # Errors
+///
+/// Any rcode other than NOERROR or NXDOMAIN (a transient failure).
 fn take_answers<T>(resp: Option<DnsMessage>, f: impl Fn(QType) -> Option<T>) -> Result<Vec<T>> {
     let Some(resp) = resp else {
         return Ok(Vec::new());
@@ -220,12 +241,10 @@ fn take_answers<T>(resp: Option<DnsMessage>, f: impl Fn(QType) -> Option<T>) -> 
 }
 
 impl SpfResolver for DotResolver {
+    // The A qtype is checked on the wire against a mock DoT server by
+    // `wire::a_lookups_query_type_1_over_the_wire`.
     async fn txt(&self, domain: &str) -> Result<Vec<String>> {
-        // H1 (security report): the query types here were the last thing
-        // on the wire — `a` used to query type 22 (NSAP-PTR) instead of
-        // 1 (A), so `a`/`mx`/`ptr`/`exists` never matched and legitimate
-        // senders got 550. The wire-level regression test runs this impl
-        // against a mock DoT server and asserts the qtype byte.
+        // 0x10 = TXT.
         let resp = self.query(domain, 0x10).await?;
         take_answers(resp, |r| match r {
             QType::TXT(s) => Some(s),
@@ -234,7 +253,7 @@ impl SpfResolver for DotResolver {
     }
 
     async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
-        // 0x01 = A (H1: 0x16 was NSAP-PTR — an A record never came back).
+        // 0x01 = A.
         let resp = self.query(domain, 0x01).await?;
         take_answers(resp, |r| match r {
             QType::A(ip) => Some(ip),
@@ -243,6 +262,7 @@ impl SpfResolver for DotResolver {
     }
 
     async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>> {
+        // 0x0F = MX.
         let resp = self.query(domain, 0x0F).await?;
         take_answers(resp, |r| match r {
             QType::MX(pref, label) => Some((pref, String::from(&label))),
@@ -251,6 +271,7 @@ impl SpfResolver for DotResolver {
     }
 
     async fn ptr(&self, domain: &str) -> Result<Vec<String>> {
+        // 0x0C = PTR.
         let resp = self.query(domain, 0x0C).await?;
         take_answers(resp, |r| match r {
             QType::PTR(label) => Some(String::from(&label)),
@@ -259,9 +280,16 @@ impl SpfResolver for DotResolver {
     }
 }
 
-/// Fetch and parse the SPF record of a domain. Returns `Ok(None)` when the
-/// domain publishes no `v=spf1` TXT record (NXDOMAIN or no matching
-/// record); `Err` is for transient lookup failures or an unusable record.
+/// Fetch the SPF record of `domain` through `resolver` and parse it with
+/// the macro context `subs`.
+///
+/// Returns the parsed record, or `None` when the domain publishes no
+/// `v=spf1` TXT record (NXDOMAIN or no matching record).
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a failed lookup; [`SpfError::Perm`] for more
+/// than one `v=spf1` record or one that does not parse (RFC 7208 §3.2).
 pub async fn query_spf_record<R: SpfResolver + Sync>(
     resolver: &R,
     domain: &str,
@@ -299,15 +327,23 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
 /// all of it.
 pub const EVALUATION_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Evaluate `check_host()` for an identity (RFC 7208 Section 4). Each call
-/// gets a fresh lookup budget and the [`EVALUATION_DEADLINE`] time limit.
+/// Evaluate `check_host()` (RFC 7208 Section 4) for the connecting IP
+/// `peer`, the identity `sender` (`local@domain`, used for macros), its
+/// `domain`, and the client's `helo` name (for the `%{h}` macro). Each
+/// call gets a fresh lookup budget and the [`EVALUATION_DEADLINE`] time
+/// limit.
 ///
-/// Returns `Ok(SpfResult)` for every well-formed evaluation — including
-/// `None` (no record published), `SoftFail`, `TempError`, and
-/// `PermError`, which are *results*, not errors — so `Err` never escapes
-/// for record-level problems. The caller (SMTP policy) maps the result
-/// to a reply code. An evaluation that runs out of time returns
-/// `Err(SpfError::Deadline)`, which maps to `TempError`.
+/// Returns the result, including `None` (no record published) and the
+/// `TempError`/`PermError` produced inside mechanisms (e.g. an `include`
+/// whose lookup fails). The caller (SMTP policy) maps the result to a
+/// reply code.
+///
+/// # Errors
+///
+/// Failures of the top-level record (and of a `redirect=` target): a
+/// failed TXT lookup or an unusable record, an exhausted lookup budget
+/// on a redirect, or [`SpfError::Deadline`] when the evaluation runs out
+/// of time. Map them with [`SpfError::to_result`].
 pub async fn check_host<R>(
     resolver: &R,
     peer: IpAddr,
@@ -321,7 +357,9 @@ where
     check_host_within(resolver, peer, sender, domain, helo, EVALUATION_DEADLINE).await
 }
 
-/// [`check_host`] with an explicit time limit (tests use a short one).
+/// [`check_host`] with the time limit `deadline` instead of
+/// [`EVALUATION_DEADLINE`] (tests use a short one). Same results and
+/// errors.
 pub async fn check_host_within<R>(
     resolver: &R,
     peer: IpAddr,
@@ -342,11 +380,17 @@ where
     .unwrap_or(Err(SpfError::Deadline(deadline)))
 }
 
-/// The recursive `check_host()` core, carrying the RFC 7208
-/// Section 4.6.4 budget across includes and redirects. Returns the
-/// first matching mechanism's qualified result, or the redirect
-/// target's evaluation, or `None` when everything falls through to
-/// no mechanism (the caller then applies the default result).
+/// The recursive `check_host()` core for `domain`, carrying the RFC 7208
+/// Section 4.6.4 `budget` across includes and redirects.
+///
+/// Returns the first matching mechanism's qualified result, else the
+/// redirect target's evaluation, else `Neutral` (the default when nothing
+/// matches); `None` when the domain publishes no record, and `PermError`
+/// for a duplicate `redirect=`.
+///
+/// # Errors
+///
+/// As for [`check_host`], except the deadline (applied by the caller).
 #[async_recursion]
 async fn check_host_limited<R>(
     resolver: &R,
@@ -413,7 +457,7 @@ where
     }
 }
 
-/// The result a matching directive yields for a given qualifier.
+/// Returns the result a matching directive yields for qualifier `q`.
 fn qualify(q: &SpfQualifier) -> SpfResult {
     match q {
         SpfQualifier::Plus => SpfResult::Pass,
@@ -423,8 +467,8 @@ fn qualify(q: &SpfQualifier) -> SpfResult {
     }
 }
 
-/// RFC 7208 Section 5.6: `ip4:` matches only against an IPv4 peer
-/// address inside the CIDR. Returns `Some(result)` on match, `None`
+/// RFC 7208 Section 5.6: `ip4:` matches only against an IPv4 `peer`
+/// address inside the CIDR `ip`. Returns `Some(result)` on match, `None`
 /// otherwise (and always `None` for an IPv6 peer).
 fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
@@ -433,8 +477,8 @@ fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResul
     }
 }
 
-/// RFC 7208 Section 5.6: `ip6:` matches only against an IPv6 peer
-/// address inside the CIDR. Returns `Some(result)` on match, `None`
+/// RFC 7208 Section 5.6: `ip6:` matches only against an IPv6 `peer`
+/// address inside the CIDR `ip`. Returns `Some(result)` on match, `None`
 /// otherwise (and always `None` for an IPv4 peer).
 fn check_ipv6(peer: IpAddr, ip: &Ipv6Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
@@ -443,8 +487,17 @@ fn check_ipv6(peer: IpAddr, ip: &Ipv6Net, result: &SpfResult) -> Option<SpfResul
     }
 }
 
-/// `a` / `a:domain` / `a:domain/cidr` (RFC 7208 Section 5.2): the A records
-/// of the domain (or the current domain when the domain-spec is empty).
+/// `a` / `a:domain` / `a:domain/cidr` (RFC 7208 Section 5.3): match `peer`
+/// against the A records of the target domain `d` (the caller substitutes
+/// the current domain for an empty domain-spec), each widened to
+/// `cidr.v4`.
+///
+/// Returns `Some(m)` on a match, `None` otherwise.
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a failed lookup; the budget's limits; or
+/// [`SpfError::Perm`] for an invalid prefix length.
 async fn check_a_record<R: SpfResolver + Sync>(
     resolver: &R,
     peer: IpAddr,
@@ -460,8 +513,7 @@ async fn check_a_record<R: SpfResolver + Sync>(
     }
 
     for ip in ips {
-        // The mechanism's ip4-cidr-length applies to every address (F4:
-        // `a/24` used to be ignored or folded into the domain).
+        // The mechanism's ip4-cidr-length applies to every address.
         let ipn = Ipv4Net::new(ip, cidr.v4).map_err(|_| SpfError::Perm)?;
         if let Some(r) = check_ipv4(peer, &ipn, m) {
             return Ok(Some(r));
@@ -470,10 +522,17 @@ async fn check_a_record<R: SpfResolver + Sync>(
     Ok(None)
 }
 
-/// `mx` (RFC 7208 Section 5.3): the A records of each MX exchange of the
-/// domain. The MX lookup counts as one budgeted lookup and each exchange's
-/// A lookup as another, so a record pointing at a wildcard MX target is
-/// bounded by the shared budget.
+/// `mx` (RFC 7208 Section 5.4): match `peer` against the A records of
+/// each MX exchange of `d`, widened to `cidr.v4`. The MX lookup counts as
+/// one budgeted lookup and each exchange's A lookup as another, so a
+/// record pointing at a wildcard MX target is bounded by the shared
+/// budget.
+///
+/// Returns `Some(m)` on a match, `None` otherwise.
+///
+/// # Errors
+///
+/// As for [`check_a_record`].
 async fn check_mx_record<R: SpfResolver + Sync>(
     resolver: &R,
     peer: IpAddr,
@@ -505,9 +564,15 @@ async fn check_mx_record<R: SpfResolver + Sync>(
 }
 
 /// `ptr` (RFC 7208 Section 5.5): forward-confirmed reverse DNS of the
-/// connecting IP, validated against the domain-spec (or the current domain
-/// when the domain-spec is empty). The PTR lookup and each forward lookup
-/// count against the budget.
+/// connecting IPv4 `peer`, validated against the domain-spec `d` (or
+/// `current_domain` when `d` is empty). The PTR lookup and each forward
+/// lookup count against the budget. IPv6 peers never match.
+///
+/// Returns `Some(m)` on a match, `None` otherwise.
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a failed lookup, or the budget's limits.
 async fn check_ptr_record<R: SpfResolver + Sync>(
     resolver: &R,
     peer: IpAddr,
@@ -550,8 +615,15 @@ async fn check_ptr_record<R: SpfResolver + Sync>(
     Ok(None)
 }
 
-/// `exists` (RFC 7208 Section 5.7): matches when the domain has at least
-/// one A record, regardless of the connecting IP.
+/// `exists` (RFC 7208 Section 5.7): matches when the domain `d` has at
+/// least one A record, regardless of the connecting IP.
+///
+/// Returns `Some(Pass)` on a match (the caller applies the qualifier),
+/// `None` otherwise.
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a failed lookup, or the budget's limits.
 async fn check_exists<R: SpfResolver + Sync>(
     resolver: &R,
     d: &str,
@@ -566,10 +638,11 @@ async fn check_exists<R: SpfResolver + Sync>(
     Ok(Some(SpfResult::Pass))
 }
 
-/// Evaluate one directive (mechanism + qualifier) against the peer.
-/// Returns `Some(result)` when the mechanism matches (the verdict),
-/// `None` when it does not (evaluation continues to the next
-/// directive). DNS-dependent mechanisms consume the shared budget.
+/// Evaluate one directive (mechanism + qualifier) of `domain`'s record
+/// against `peer`. Returns `Some(result)` when the mechanism matches (the
+/// verdict) or fails (TempError/PermError, mapped from its error), `None`
+/// when it does not match (evaluation continues to the next directive).
+/// DNS-dependent mechanisms consume the shared `budget`.
 async fn check_directive<R: SpfResolver + Sync>(
     resolver: &R,
     domain: &str,
@@ -608,7 +681,7 @@ async fn check_directive<R: SpfResolver + Sync>(
 
         SpfMechanism::A(s, cidr) => {
             // An empty domain-spec means the current domain (RFC 7208
-            // Section 5.2).
+            // Section 5.3).
             let target = if s.is_empty() { domain } else { s };
             match check_a_record(resolver, peer, target, *cidr, &qualify(q), budget).await {
                 Ok(r) => r,
@@ -617,7 +690,7 @@ async fn check_directive<R: SpfResolver + Sync>(
         }
         SpfMechanism::Mx(s, cidr) => {
             // An empty domain-spec means the current domain (RFC 7208
-            // Section 5.3).
+            // Section 5.4).
             let target = if s.is_empty() { domain } else { s };
             match check_mx_record(resolver, peer, target, *cidr, &qualify(q), budget).await {
                 Ok(r) => r,
@@ -1005,7 +1078,7 @@ mod tests {
             vec!["v=spf1 include:a.example -all".to_string()],
         );
 
-        // The loop used to recurse without bound; the budget terminates it.
+        // Without the budget this would recurse without bound.
         let result = check(&resolver, "192.0.2.1", "foo@a.example", "a.example")
             .await
             .unwrap();
@@ -1154,7 +1227,7 @@ mod tests {
             vec!["v=spf1 -all exp=passer.example".to_string()],
         );
         // The exp target passes for this IP. A verifier that recursed into
-        // it (the old behavior) would wrongly return Pass.
+        // it would wrongly return Pass.
         resolver.txt.insert(
             "passer.example".to_string(),
             vec!["v=spf1 +all".to_string()],
@@ -1205,10 +1278,10 @@ mod wire {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    /// A minimal DNS-over-TLS test server (H1, security report): answers
-    /// every query with a single A record for 192.0.2.1 and records the
-    /// qtype of every query. Returns the bound address, the server cert
-    /// (the client's trust store must contain it), and the qtype counter.
+    /// A minimal DNS-over-TLS test server: answers every query with a
+    /// single A record for 192.0.2.1 and sums the qtypes of the queries it
+    /// receives. Returns the bound address, the server cert (the client's
+    /// trust store must contain it), and the qtype sum.
     async fn spawn_mock_dot() -> (
         std::net::SocketAddr,
         rustls_pki_types::CertificateDer<'static>,
@@ -1274,7 +1347,7 @@ mod wire {
         (addr, cert_der, qtypes)
     }
 
-    /// D3 (DEPLOYMENT.md): a name with no valid wire form is answered as
+    /// A name with no valid wire form is answered as
     /// "no records" without any network traffic (RFC 7208 §4.3: a
     /// malformed domain is treated like one that doesn't exist), rather
     /// than a transient error (TempError, 451, retried forever) or a
@@ -1310,12 +1383,11 @@ mod wire {
         assert_eq!(client.stats().connects, 0, "nothing may be sent");
     }
 
-    /// H1 (security report): `DotResolver::a()` must query **type 1 (A)**.
-    /// It used to query type 22 (NSAP-PTR), so `a`/`mx`/`ptr`/`exists`
-    /// never matched anything and every empty lookup counted as a void
-    /// lookup — legitimate senders got 550. This test runs the resolver
-    /// against a real mock DoT server and asserts the qtype that went
-    /// over the wire, plus that the A answer actually comes back.
+    /// `DotResolver::a()` must query **type 1 (A)**: with any other type,
+    /// `a`/`mx`/`ptr`/`exists` would never match and every lookup would
+    /// count as void. This test runs the resolver against a real mock DoT
+    /// server and asserts the qtype that went over the wire, plus that the
+    /// A answer actually comes back.
     #[tokio::test]
     async fn a_lookups_query_type_1_over_the_wire() {
         let (addr, server_cert, qtypes) = spawn_mock_dot().await;
@@ -1345,14 +1417,19 @@ mod wire {
     }
 }
 
-/// F4 (SECURITY-AUDIT.md): the probe cases from the audit. Each used to
-/// turn a hard fail into Neutral/None (or fail a legitimate sender).
+/// Record-parsing edge cases evaluated end to end: case-insensitive
+/// terms, malformed terms, CIDR suffixes on `a`/`mx`, duplicate
+/// modifiers. None may weaken a hard fail into Neutral/None or fail a
+/// legitimate sender.
 #[cfg(test)]
-mod f4_tests {
+mod record_edge_case_tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Fixture DNS: TXT from the map; fixed A and MX answers for
+    /// `v.example`, `mx.v.example` and `other.example`; no PTR records.
     struct Dns {
+        /// TXT records by name.
         txt: HashMap<String, Vec<String>>,
     }
 
@@ -1379,6 +1456,8 @@ mod f4_tests {
         }
     }
 
+    /// Evaluate `record` as `v.example`'s SPF record for `peer`, mapping
+    /// errors to their results.
     async fn eval(record: &str, peer: &str) -> SpfResult {
         let dns = Dns {
             txt: HashMap::from([("v.example".to_string(), vec![record.to_string()])]),

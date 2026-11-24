@@ -8,7 +8,8 @@
 //! under `tmp/` first, fsynced, and then renamed into `new/`, with the
 //! metadata file renamed **last**. A `{id}.json` in `new/` is therefore
 //! the commit point: a payload without metadata is an incomplete write
-//! from a crashed process and may be cleaned up by a future drain pass.
+//! from a crashed process, and [`DiskSpool::list`] (so the drain) ignores
+//! it.
 //!
 //! [`SpoolWriter`] abstracts writes only: the drain's read side (list,
 //! load, record attempt, remove, dead-letter) uses [`DiskSpool`] directly,
@@ -19,11 +20,24 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::{DkimSummary, DmarcSummary};
 
 /// Shared removal body for [`DiskSpool::remove`] and
-/// [`DiskSpool::remove_committed`]: metadata first, then payload and
-/// sidecar; missing files are tolerated (a concurrent drain pass may
-/// have removed the message already).
+/// [`DiskSpool::remove_committed`]: remove `meta_path` first, then
+/// `payload_path` and `attempts_path`.
+///
+/// Missing files are tolerated (a concurrent drain pass may have removed
+/// the message already), and failures removing the payload or sidecar
+/// are ignored: once the metadata is gone they are crash debris.
+///
+/// # Errors
+///
+/// Removing the metadata file fails for any reason other than it not
+/// existing.
 fn remove_committed_at(meta_path: &Path, payload_path: &Path, attempts_path: &Path) -> Result<()> {
     match std::fs::remove_file(meta_path) {
         Ok(()) => {}
@@ -36,11 +50,6 @@ fn remove_committed_at(meta_path: &Path, payload_path: &Path, attempts_path: &Pa
     let _ = std::fs::remove_file(attempts_path);
     Ok(())
 }
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use uuid::Uuid;
-
-use crate::{DkimSummary, DmarcSummary};
 
 /// Storage backend for the message queue.
 ///
@@ -50,26 +59,34 @@ use crate::{DkimSummary, DmarcSummary};
 /// lifetime of the stored message — it is the storage key, the log
 /// correlation ID, and (later) the idempotency key for replication.
 pub trait SpoolWriter: Send + Sync {
-    /// Backend name for logs and metadata (e.g. `"disk"`).
+    /// Returns the backend name for logs and metadata (e.g. `"disk"`).
     fn name(&self) -> &str;
 
-    /// Durably store one accepted message.
+    /// Durably store one accepted message: its `meta`data (the backend
+    /// fills in [`SpoolMeta::queue_id`]) and the raw `payload` as
+    /// received.
     ///
-    /// Returns `Ok(queue_id)` once the message is committed. Returns
-    /// `Err` if the message could not be stored; on error no complete
-    /// message may be observable through the backend (partial staging
-    /// files are acceptable debris for a future drain pass, a committed
-    /// message is not). Callers treat `Err` as a temporary failure and
-    /// refuse the message with `451`.
+    /// Returns the new queue ID once the message is committed.
+    ///
+    /// # Errors
+    ///
+    /// The message could not be stored. On error no complete message may
+    /// be observable through the backend (partial staging files are
+    /// acceptable debris, a committed message is not). Callers treat
+    /// `Err` as a temporary failure and refuse the message with `451`.
     fn write(&self, meta: SpoolMeta, payload: &[u8]) -> Result<String>;
 
-    /// Remove a fully handled message from the backend (all recipients
-    /// delivered, or dead-lettered by the drain).
+    /// Remove the fully handled message `queue_id` from the backend (all
+    /// recipients delivered).
     ///
     /// Removing a queue ID that no longer exists is **not** an error —
     /// the inline delivery fast path and the drain loop race, and either
-    /// may remove first. Returns `Err` only if removal genuinely fails
-    /// (I/O error); the message then stays queued and is retried later.
+    /// may remove first.
+    ///
+    /// # Errors
+    ///
+    /// Removal genuinely fails (I/O error); the message then stays
+    /// queued and is retried later.
     fn remove(&self, queue_id: &str) -> Result<()>;
 }
 
@@ -86,14 +103,20 @@ pub trait SpoolWriter: Send + Sync {
 /// sealed one. The session's fast path delivers the plaintext copy
 /// directly. Both must change before an encryptor is configured.
 pub trait PayloadEncryptor: Send + Sync {
-    /// Identifier stored in the message metadata (algorithm + key id)
-    /// so readers can tell how a payload was sealed and which key
+    /// Returns the identifier stored in the message metadata (algorithm +
+    /// key id) so readers can tell how a payload was sealed and which key
     /// rotation generation applies.
     fn id(&self) -> String;
 
-    /// Seal the payload. Returns `Err` if encryption cannot be
-    /// performed (e.g. key unavailable); the message is then refused
-    /// with a temporary error rather than stored in the clear.
+    /// Seal `payload`.
+    ///
+    /// Returns the bytes to store in place of the plaintext.
+    ///
+    /// # Errors
+    ///
+    /// Encryption cannot be performed (e.g. key unavailable); the message
+    /// is then refused with a temporary error rather than stored in the
+    /// clear.
     fn encrypt(&self, payload: &[u8]) -> Result<Vec<u8>>;
 }
 
@@ -134,13 +157,15 @@ pub struct SpoolMeta {
     pub peer: String,
     /// HELO/EHLO identity, if given.
     pub helo: Option<String>,
-    /// Envelope sender (None only for authenticated submissions, where
-    /// SPF was skipped).
+    /// Envelope sender, brackets removed; `Some("")` for the null sender.
+    /// Always set for a spooled message (a transaction cannot reach DATA
+    /// without an accepted MAIL FROM).
     pub mail_from: Option<String>,
     /// Accepted envelope recipients with their authority-resolved
     /// routing targets.
     pub rcpt_to: Vec<SpoolRcpt>,
-    /// SPF verdict for the MAIL FROM identity.
+    /// SPF verdict for the MAIL FROM identity; `None` for authenticated
+    /// submissions, where SPF is skipped.
     pub spf_result: Option<String>,
     /// SPF verdict for the HELO/EHLO identity.
     pub spf_helo: Option<String>,
@@ -167,9 +192,16 @@ pub struct SpoolMeta {
 /// - `new/` — committed messages: `{queue_id}.eml` (payload, possibly
 ///   ciphertext) plus `{queue_id}.json` (metadata, always plaintext).
 ///
-/// The metadata rename is the commit point, so a `.eml` without its
-/// `.json` in `new/` is debris from a crashed write, never a valid
+/// Writes seal the payload with the configured [`PayloadEncryptor`] (if
+/// any) before the first byte reaches disk. Payload and metadata are each
+/// written under `tmp/` and fsynced, then renamed into `new/` — metadata
+/// last. The metadata rename is the commit point, so a `.eml` without
+/// its `.json` in `new/` is debris from a crashed write, never a valid
 /// message.
+///
+/// Known simplifications versus a fully hardened production queue (no
+/// write-ahead journal, single-disk assumption, best-effort rollback on
+/// error paths) are deliberate.
 #[derive(Clone)]
 pub struct DiskSpool {
     /// Staging area: in-progress writes land here and are fsynced before
@@ -202,8 +234,11 @@ impl DiskSpool {
     /// `tmp/` and `new/` subdirectories, storing payloads encrypted by
     /// `encryptor` when given.
     ///
-    /// Returns the ready-to-use spool on success. Returns `Err` if
-    /// either directory cannot be created (e.g. missing permissions, or
+    /// Returns the ready-to-use spool.
+    ///
+    /// # Errors
+    ///
+    /// Either directory cannot be created (e.g. missing permissions, or
     /// the path exists as a regular file); the server should refuse to
     /// start rather than accept mail it cannot store.
     pub fn open(
@@ -224,12 +259,11 @@ impl DiskSpool {
         })
     }
 
-    /// Best-effort cleanup after a failed `write`: remove the already
-    /// committed payload and any leftover metadata staging file so no
-    /// orphan pair is left behind. Errors are ignored by design — this
-    /// runs on a failure path, and leftover files are recoverable by a
-    /// future drain pass (a payload without metadata is never a valid
-    /// committed message).
+    /// Best-effort cleanup after a failed metadata write or commit for
+    /// `queue_id`: remove the already renamed payload in `new/` and any
+    /// leftover metadata staging file in `tmp/`. Errors are ignored by
+    /// design — this runs on a failure path, and a payload without
+    /// metadata is never a valid committed message.
     fn rollback(&self, queue_id: &str) {
         let _ = std::fs::remove_file(self.new_dir.join(format!("{queue_id}.eml")));
         let _ = std::fs::remove_file(self.tmp.join(format!("{queue_id}.json")));
@@ -242,9 +276,14 @@ impl DiskSpool {
     /// the whole backlog every pass would turn that into an out-of-memory
     /// crash.
     ///
-    /// Returns `Err` only if the queue directory is unreadable; a single
-    /// malformed or uncommitted entry (a `.eml` without `.json`) is
-    /// skipped — that is crash debris for a drain pass, not a message.
+    /// A malformed or incomplete entry (unreadable or unparseable
+    /// metadata, a `.eml` without `.json` or the reverse) is skipped —
+    /// that is crash debris, not a message. A missing or unreadable
+    /// attempt sidecar counts as no attempts.
+    ///
+    /// # Errors
+    ///
+    /// The queue directory cannot be read or listed.
     pub fn list(&self) -> Result<Vec<QueuedMessage>> {
         let mut queued = Vec::new();
         for entry in std::fs::read_dir(&self.new_dir)
@@ -286,13 +325,18 @@ impl DiskSpool {
         Ok(queued)
     }
 
-    /// Record one failed delivery attempt at `now` (Unix seconds).
+    /// Record one failed delivery attempt for `queued` at `now` (Unix
+    /// seconds), building on the attempt state `queued` was listed with.
     ///
     /// Returns the updated record. It is persisted in the `{id}.attempts`
     /// sidecar as `count first_failure last_failure`, so the retry schedule
     /// and the queue lifetime survive restarts. A missing sidecar means no
     /// prior attempts. A count-only sidecar keeps its count and starts the
     /// lifetime clock now.
+    ///
+    /// # Errors
+    ///
+    /// The sidecar cannot be written durably.
     pub fn record_attempt(&self, queued: &QueuedMessage, now: u64) -> Result<AttemptRecord> {
         let record = AttemptRecord {
             attempts: queued.attempts + 1,
@@ -303,11 +347,15 @@ impl DiskSpool {
         Ok(record)
     }
 
-    /// Remove a fully handled message (payload, metadata, attempt
-    /// sidecar) from the queue. Metadata is removed first: a half-removed
-    /// message is crash debris, never a committed message. Missing files
-    /// are tolerated — a concurrent drain pass may have removed the
-    /// message already.
+    /// Remove the fully handled message `queued` (payload, metadata,
+    /// attempt sidecar) from the queue. Metadata is removed first: a
+    /// half-removed message is crash debris, never a committed message.
+    /// Missing files are tolerated — a concurrent drain pass may have
+    /// removed the message already.
+    ///
+    /// # Errors
+    ///
+    /// The metadata file exists but cannot be removed.
     pub fn remove(&self, queued: &QueuedMessage) -> Result<()> {
         remove_committed_at(
             &queued.meta_path,
@@ -316,10 +364,14 @@ impl DiskSpool {
         )
     }
 
-    /// Remove a queued message by queue ID alone (used by the session's
+    /// Remove a queued message by `queue_id` alone (used by the session's
     /// inline delivery fast path, which has no `QueuedMessage` handle).
     /// Same semantics as [`DiskSpool::remove`], tolerating a concurrent
     /// drain pass having removed it first.
+    ///
+    /// # Errors
+    ///
+    /// The metadata file exists but cannot be removed.
     pub fn remove_committed(&self, queue_id: &str) -> Result<()> {
         remove_committed_at(
             &self.new_dir.join(format!("{queue_id}.json")),
@@ -328,9 +380,16 @@ impl DiskSpool {
         )
     }
 
-    /// Move a message that exhausted its delivery budget to the
-    /// `dead-letter/` directory under the spool root, preserving all
-    /// three files for operator inspection.
+    /// Move `queued`, which exhausted its delivery budget, to the
+    /// `dead-letter/` directory under the spool root (created if needed),
+    /// preserving its metadata, payload and attempt sidecar (when present)
+    /// for operator inspection.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be created or a file cannot be moved. The
+    /// metadata moves first, so a partial failure leaves the message out
+    /// of the queue.
     pub fn dead_letter(&self, queued: &QueuedMessage) -> Result<()> {
         let dead = self
             .new_dir
@@ -382,8 +441,14 @@ pub struct QueuedMessage {
 }
 
 impl QueuedMessage {
-    /// Read the payload bytes, as stored (possibly ciphertext if an
-    /// encryptor was configured at write time).
+    /// Read the payload from disk.
+    ///
+    /// Returns the bytes as stored (ciphertext if an encryptor was
+    /// configured at write time).
+    ///
+    /// # Errors
+    ///
+    /// The payload file cannot be read.
     pub fn load_payload(&self) -> Result<Vec<u8>> {
         std::fs::read(&self.payload_path)
             .with_context(|| format!("cannot read {}", self.payload_path.display()))
@@ -403,9 +468,11 @@ pub struct AttemptRecord {
 }
 
 impl AttemptRecord {
-    /// Parse a sidecar. Unparseable fields are treated as absent: a
-    /// damaged record makes a message due now and restarts its lifetime
-    /// clock, so it can only delay giving up, never lose mail early.
+    /// Parse sidecar contents `s`; never fails.
+    ///
+    /// Unparseable fields are treated as absent (a count of 0): a damaged
+    /// record makes a message due now and restarts its lifetime clock, so
+    /// it can only delay giving up, never lose mail early.
     pub fn parse(s: &str) -> Self {
         let mut fields = s.split_ascii_whitespace();
         AttemptRecord {
@@ -431,30 +498,9 @@ impl SpoolWriter for DiskSpool {
         "disk"
     }
 
-    /// Durable write of one accepted message. Returns the queue ID.
-    ///
-    /// The payload is sealed by the configured [`PayloadEncryptor`]
-    /// (if any) *before* the first write; an encryption failure aborts
-    /// before any bytes reach disk, so there is nothing to roll back.
-    ///
-    /// Crash safety: payload and metadata are
-    /// each written under `tmp/` and fsynced, then renamed into `new/`
-    /// — metadata last. Only the final rename is the commit; anything
-    /// left in `tmp/` is an incomplete write. Known simplifications
-    /// versus a fully hardened production queue (no write-ahead journal,
-    /// single-disk assumption, best-effort rollback on error paths) are
-    /// deliberate.
-    ///
-    /// Returns `Ok(queue_id)` once both files are committed under
-    /// `new/`. Returns `Err` if any step fails (encryption,
-    /// serialization, I/O, fsync); in that case **no complete pair is
-    /// ever committed** — `new/` never contains the `.json` marker, and
-    /// partial state (a committed payload, leftover files in `tmp/`) is
-    /// rolled back on a best-effort basis. Callers treat `Err` as a
-    /// temporary failure and refuse the message with `451`; a crash
-    /// between steps can still leave recoverable debris in `tmp/` or an
-    /// uncommitted `.eml` in `new/` for a future drain pass to clean.
     fn write(&self, mut meta: SpoolMeta, raw: &[u8]) -> Result<String> {
+        // Hex Unix seconds first, so lexical order (`list`) is roughly
+        // arrival order; the UUID makes it unique.
         let queue_id = format!(
             "{:012x}.{}",
             jiff::Timestamp::now().as_second(),
@@ -473,12 +519,14 @@ impl SpoolWriter for DiskSpool {
             None => raw.to_vec(),
         };
 
-        // Payload first.
+        // Payload first. A failure here leaves at most a staging file in
+        // tmp/ and nothing in new/.
         let payload_tmp = self.tmp.join(format!("{queue_id}.eml"));
         write_durable(&payload_tmp, &payload)?;
         std::fs::rename(&payload_tmp, self.new_dir.join(format!("{queue_id}.eml")))?;
 
-        // Metadata second: its presence in new/ is the commit point.
+        // Metadata second: its presence in new/ is the commit point. On
+        // failure, roll back the payload already renamed into new/.
         let meta_tmp = self.tmp.join(format!("{queue_id}.json"));
         let meta_result = match serde_json::to_vec_pretty(&meta)
             .context("serialize spool metadata")
@@ -515,13 +563,15 @@ impl SpoolWriter for DiskSpool {
     }
 }
 
-/// Write bytes to `path`, fsync the file, and only then return: callers
-/// can rely on the bytes surviving a crash once this resolves.
+/// Write `bytes` to a new private file at `path` (truncating any
+/// existing file), fsync it, and only then return: callers can rely on
+/// the bytes surviving a crash once this returns `Ok`.
 ///
-/// Returns `Ok(())` once the bytes are durable on disk. Returns `Err`
-/// if the file cannot be created, written, or fsynced — the error
-/// message names the path, and the caller decides whether partial state
-/// at `path` needs cleanup.
+/// # Errors
+///
+/// The file cannot be created, written, or fsynced. The error message
+/// names the path, and the caller decides whether partial state at
+/// `path` needs cleanup.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = crate::fsutil::create_private_file(path)
         .with_context(|| format!("cannot create {}", path.display()))?;

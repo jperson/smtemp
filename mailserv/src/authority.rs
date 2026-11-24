@@ -1,7 +1,6 @@
-//! Recipient authority: the seam between the SMTP
-//! server and the external system that knows which domains are hosted,
-//! which addresses belong to which users, and how each domain treats
-//! recipients it does not know.
+//! Recipient authority: the seam between the SMTP server and the external
+//! system that knows which domains are hosted, which addresses belong to
+//! which users, and how each domain treats recipients it does not know.
 //!
 //! The SMTP server is deliberately thin here: it asks one question per
 //! RCPT command ("may this address receive mail right now, and where
@@ -31,8 +30,9 @@
 //! # The file-backed authority (the console's first API contract)
 //!
 //! [`FileAuthority`] loads a JSON document and hot-reloads it when the
-//! file's mtime or size changes; the console (or any operator) publishes policy
-//! by rewriting this file. The schema is deliberately small and strict
+//! file's mtime or size changes; the console (or any operator) publishes
+//! policy by rewriting this file. A rewrite that fails to load is logged
+//! and the last good policy keeps serving. The schema is deliberately small and strict
 //! (unknown fields are rejected — extend it by bumping `version`):
 //!
 //! ```json
@@ -156,49 +156,67 @@ pub enum Resolution {
 /// blocking pool and apply their own timeout, mapping both elapsed
 /// timeouts and `Err` to the fail-closed `451`.
 pub trait RecipientResolver: Send + Sync {
-    /// Backend name for logs (e.g. `"file"`, `"static"`).
+    /// Returns the backend name for logs (e.g. `"file"`, `"static"`).
     fn name(&self) -> &str;
 
-    /// Resolve one candidate recipient address.
+    /// Resolve one candidate recipient `address`, a full address
+    /// (`local@domain`), matched case-insensitively.
     ///
-    /// `address` is a full address (`local@domain`); malformed addresses
-    /// (no `@`) are an [`AuthorityUnavailable`] error, though the session
-    /// pre-checks syntax before calling. Returns `Err` only when the
-    /// authority itself cannot be consulted; "cannot receive mail" is a
+    /// Returns the authority's [`Resolution`]; "cannot receive mail" is a
     /// [`Resolution::Refuse`], never an error.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityUnavailable`] when the authority itself cannot be
+    /// consulted, or for a malformed address (no `@`), though the session
+    /// pre-checks syntax before calling.
     fn resolve(&self, address: &str) -> Result<Resolution, AuthorityUnavailable>;
 }
 
 /// Internal record for one mailbox.
 #[derive(Debug, Clone)]
 struct Mailbox {
+    /// Owning account.
     user: String,
+    /// When the address stops accepting; `None` for a permanent address.
     expires: Option<Timestamp>,
+    /// Registered public key, carried through to the recipient.
     public_key: Option<String>,
+    /// Key-rotation generation for `public_key`.
     key_generation: Option<u32>,
 }
 
-/// Internal policy for one hosted domain.
+/// Internal policy for one hosted domain (the validated [`PolicyMode`]).
 #[derive(Debug, Clone)]
 enum DomainPolicy {
+    /// Only known, unexpired addresses are accepted.
     Reject,
+    /// Unknown addresses route to `mailbox` (lowercased).
     CatchAll { mailbox: String },
+    /// Expired addresses keep accepting for `days` (1–366) past expiry.
     Grace { days: i64 },
 }
 
-/// The parsed authority document.
+/// The parsed authority document. All keys are lowercased.
 #[derive(Debug, Clone)]
 struct AuthorityData {
+    /// Hosted domain -> its policy.
     domains: HashMap<String, DomainPolicy>,
     /// Per-domain message size limits (`max-message-bytes`), for domains
     /// that set one.
     domain_limits: HashMap<String, usize>,
+    /// Full address -> mailbox record.
     mailboxes: HashMap<String, Mailbox>,
 }
 
 impl AuthorityData {
-    /// Resolve one address: the domain's policy decides acceptance and
-    /// routing, and an accepted recipient carries the domain's size limit.
+    /// Resolve `address`: the domain's policy decides acceptance and
+    /// routing (see [`AuthorityData::resolve_policy`]), and an accepted
+    /// recipient carries the domain's size limit.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityUnavailable`] for an address without `@`.
     fn resolve(&self, address: &str) -> Result<Resolution, AuthorityUnavailable> {
         let mut resolution = self.resolve_policy(address)?;
         if let Resolution::Accept(recipient) = &mut resolution {
@@ -210,6 +228,15 @@ impl AuthorityData {
         Ok(resolution)
     }
 
+    /// Apply the hosted domain's policy to `address` (trimmed and
+    /// lowercased) at the current time, without the size limit.
+    ///
+    /// Returns [`Resolution::NotHosted`] for an unknown domain, otherwise
+    /// the accept/refuse decision of the domain's [`PolicyMode`].
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityUnavailable`] for an address without `@`.
     fn resolve_policy(&self, address: &str) -> Result<Resolution, AuthorityUnavailable> {
         let addr = address.trim().to_ascii_lowercase();
         let Some((_, domain)) = addr.rsplit_once('@') else {
@@ -284,8 +311,11 @@ impl AuthorityData {
         }
     }
 
-    /// `Ok` when the entry is live (exists and not expired), `Err` with
-    /// the refusal reason otherwise.
+    /// Check whether mailbox `entry` is live at `now`.
+    ///
+    /// Returns `Ok` when the entry exists and has not expired, otherwise
+    /// `Err` with the refusal reason ([`RefusalReason::NoSuchMailbox`] for
+    /// `None`, [`RefusalReason::Expired`] at or past its expiry).
     fn check_expiry(
         &self,
         entry: Option<&Mailbox>,
@@ -300,8 +330,14 @@ impl AuthorityData {
         Ok(())
     }
 
-    /// Build the routing recipient for a known mailbox entry. The
-    /// routing mailbox is the addressed address itself.
+    /// Build the routing recipient for the known mailbox `entry` at
+    /// address `addr`. The routing mailbox is `addr` itself; the size
+    /// limit is left for [`AuthorityData::resolve`] to fill in.
+    ///
+    /// # Panics
+    ///
+    /// If `entry` is `None`; callers pass an entry they have already
+    /// checked.
     fn recipient(entry: Option<&Mailbox>, addr: &str) -> Recipient {
         let mb = entry.expect("recipient() called with a known mailbox");
         Recipient {
@@ -322,16 +358,23 @@ impl AuthorityData {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuthorityFile {
+    /// Schema version; only `1` is supported.
     version: u32,
+    /// Hosted domain -> its policy.
     domains: HashMap<String, DomainFile>,
+    /// Full address -> mailbox record.
     mailboxes: HashMap<String, MailboxFile>,
 }
 
+/// One entry of the document's `domains` map.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct DomainFile {
+    /// How the domain treats unknown recipients.
     mode: PolicyMode,
+    /// The designated inbox; required for `catch-all`.
     catch_all_mailbox: Option<String>,
+    /// The grace window in days (1–366); required for `grace`.
     grace_days: Option<u64>,
     /// The domain's own message size limit in bytes (optional). Only a
     /// *lower* limit than the server's `max-data-bytes` has an effect.
@@ -343,17 +386,30 @@ struct DomainFile {
 /// (e.g. `10` meaning 10 MB) that would silently refuse all mail.
 const MIN_DOMAIN_MESSAGE_BYTES: u64 = 1024;
 
+/// One entry of the document's `mailboxes` map.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct MailboxFile {
+    /// Owning account.
     user: String,
     /// RFC 3339 timestamp, or null/absent for a permanent address.
     expires: Option<String>,
+    /// Opaque public key string.
     public_key: Option<String>,
+    /// Key-rotation generation for `public_key`.
     key_generation: Option<u32>,
 }
 
 impl AuthorityFile {
+    /// Validate the document and convert it to lookup form, lowercasing
+    /// every domain, address and catch-all mailbox.
+    ///
+    /// # Errors
+    ///
+    /// An unsupported `version`; a `max-message-bytes` below
+    /// [`MIN_DOMAIN_MESSAGE_BYTES`]; a `catch-all` domain without
+    /// `catch-all-mailbox`; a `grace` domain without `grace-days` or with
+    /// a value outside 1–366; or an unparseable `expires` timestamp.
     fn into_data(self) -> Result<AuthorityData> {
         if self.version != 1 {
             anyhow::bail!("unsupported authority file version {}", self.version);
@@ -427,13 +483,15 @@ impl AuthorityFile {
 }
 
 /// Authority backed by a JSON file: the console's first publishing
-/// format. The file is read at startup and hot-reloaded whenever its
-/// mtime changes; an unreadable or unparseable file at runtime is a
-/// transient authority failure (fail-closed `451`), never a silent
-/// fallback.
+/// format. The file must load at startup, and is hot-reloaded whenever
+/// its mtime or size changes. A reload that fails at runtime (unreadable
+/// or invalid file) is logged at `error` and the last good policy keeps
+/// serving until the next change loads.
 #[derive(Debug)]
 pub struct FileAuthority {
+    /// The authority document.
     path: PathBuf,
+    /// The snapshot currently served.
     state: RwLock<Arc<Loaded>>,
 }
 
@@ -442,12 +500,14 @@ pub struct FileAuthority {
 /// mtime tick.
 #[derive(Debug)]
 struct Loaded {
+    /// The file's change token when last loaded (or last attempted).
     stamp: Option<(SystemTime, u64)>,
+    /// The policy being served.
     data: AuthorityData,
 }
 
-/// The (mtime, size) change token of the file, or `None` when it cannot
-/// be stat'ed.
+/// Returns the (mtime, size) change token of the file at `path`, or
+/// `None` when it cannot be stat'ed.
 fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
     std::fs::metadata(path).ok().and_then(|m| {
         let mtime = m.modified().ok()?;
@@ -456,11 +516,15 @@ fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
 }
 
 impl FileAuthority {
-    /// Load (and validate) the authority file.
+    /// Load (and validate) the authority file at `path`.
     ///
-    /// Returns the ready-to-use authority on success. Returns `Err` if
-    /// the file cannot be read or parsed — the server should refuse to
-    /// start rather than guess at recipient policy.
+    /// Returns the ready-to-use authority.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, parsed or validated (see
+    /// [`FileAuthority::load`]) — the server should refuse to start
+    /// rather than guess at recipient policy.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let stamp = file_stamp(&path);
@@ -471,8 +535,13 @@ impl FileAuthority {
         })
     }
 
-    /// Read and validate the file. Used at startup and on every mtime
-    /// change.
+    /// Read and validate the file at `path`. Used at startup and on every
+    /// change-token change.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, is not a valid document (malformed JSON,
+    /// unknown or missing fields), or fails validation.
     fn load(path: &Path) -> Result<AuthorityData> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read authority file {}", path.display()))?;
@@ -481,13 +550,19 @@ impl FileAuthority {
         file.into_data()
     }
 
-    /// The current snapshot, reloading first if the file changed.
+    /// Returns the current snapshot, reloading first if the file's change
+    /// token differs from the snapshot's.
     ///
-    /// A failed reload (a non-atomic publish, a typo'd policy) keeps serving
-    /// the **last good snapshot**, so a broken publish never turns every
-    /// RCPT into a `451`. The last attempted
-    /// change token is memoized, so a persistently bad file is read
-    /// once per change, not once per lookup.
+    /// A failed reload (a non-atomic publish, a typo'd policy) keeps
+    /// serving the **last good snapshot**, so a broken publish never turns
+    /// every RCPT into a `451`. The last attempted change token is
+    /// memoized, so a persistently bad file is read once per change, not
+    /// once per lookup. This never returns `Err` today; the signature
+    /// matches [`RecipientResolver::resolve`].
+    ///
+    /// # Panics
+    ///
+    /// If the snapshot lock is poisoned.
     fn current(&self) -> Result<Arc<Loaded>, AuthorityUnavailable> {
         let stamp = file_stamp(&self.path);
         {
@@ -507,14 +582,12 @@ impl FileAuthority {
                 *snapshot = Arc::new(Loaded { stamp, data });
             }
             Err(e) => {
-                // Serve the last good snapshot; memoize this change
-                // token so the broken file is not re-parsed per lookup.
-                // It will load successfully on the next content change.
-                // The failure is logged loudly: recipient policy is now
-                // stale (e.g. an expiry or a
-                // domain removal in the rejected publish is NOT in
-                // effect) and operators must know. Logged once per
-                // change, not per lookup.
+                // Serve the last good snapshot under this change token, so
+                // the broken file is not re-parsed (or re-logged) per
+                // lookup; the next change gets a fresh attempt. Logged
+                // loudly: recipient policy is now stale (e.g. an expiry or
+                // a domain removal in the rejected publish is NOT in
+                // effect) and operators must know.
                 tracing::error!(
                     file = %self.path.display(),
                     error = %format!("{e:#}"),
@@ -541,19 +614,19 @@ impl RecipientResolver for FileAuthority {
     }
 }
 
-/// The pre-authority fallback: every local-part at a hosted domain is
-/// accepted and routes to itself — exactly the behavior mailserv had
-/// before the authority seam. Used when no `--authority` file is
-/// configured so existing deployments and tests keep working; the
-/// product always runs with a real authority.
+/// The fallback authority: every local-part at a hosted domain is
+/// accepted and routes to itself, with no user or key. Used when no
+/// `--authority` file is configured (development and tests); production
+/// runs with a real authority (see the module docs for why).
 #[derive(Debug, Clone)]
 pub struct StaticAuthority {
+    /// Hosted domains, lowercased.
     domains: std::collections::HashSet<String>,
 }
 
 impl StaticAuthority {
-    /// Host the given domains (lowercased). Every local-part at them
-    /// accepts; everything else is [`Resolution::NotHosted`].
+    /// Host `domains` (lowercased). Every local-part at them accepts;
+    /// everything else is [`Resolution::NotHosted`].
     pub fn new(domains: impl IntoIterator<Item = String>) -> Self {
         StaticAuthority {
             domains: domains
@@ -594,7 +667,8 @@ impl RecipientResolver for StaticAuthority {
 mod tests {
     use super::*;
 
-    /// RFC 3339 helper for test fixtures.
+    /// The timestamp `seconds_from_epoch`; its `Display` is the RFC 3339
+    /// form the fixtures need.
     fn ts(seconds_from_epoch: i64) -> Timestamp {
         Timestamp::from_second(seconds_from_epoch).unwrap()
     }
@@ -657,10 +731,9 @@ mod tests {
         ));
     }
 
-    /// Catch-all routes unknown addresses to the designated inbox
-    /// (adopting its owner and key) but refuses known-but-expired
-    /// addresses: an admin who expired an address gets the refusal
-    /// signal, not silent catch-all routing.
+    /// Catch-all routes unknown addresses to the designated inbox; when
+    /// the inbox is not itself a known mailbox, its address doubles as
+    /// the user.
     #[test]
     fn catch_all_routes_unknown_and_refuses_expired() {
         let dir = tempfile::tempdir().unwrap();
@@ -668,9 +741,9 @@ mod tests {
         std::fs::write(&path, DOC).unwrap();
         let authority = FileAuthority::open(&path).unwrap();
 
-        // Unknown local-part → the designated inbox, with its owner's
-        // identity (admin@example.org is not itself a mailbox here, so
-        // the user falls back to the address).
+        // Unknown local-part → the designated inbox (admin@example.org is
+        // not itself a mailbox here, so the user falls back to the
+        // address).
         assert_eq!(
             authority.resolve("anything@catch.example.org").unwrap(),
             Resolution::Accept(Recipient {
@@ -742,9 +815,9 @@ mod tests {
         ));
     }
 
-    /// Editing the file changes answers without a restart (mtime
-    /// hot-reload); a malformed rewrite fails closed with the last
-    /// good policy preserved for the next successful reload.
+    /// Editing the file changes answers without a restart (hot reload);
+    /// a malformed rewrite keeps serving the last good policy until the
+    /// next good publish.
     #[test]
     fn hot_reload_picks_up_edits() {
         let dir = tempfile::tempdir().unwrap();
@@ -772,9 +845,7 @@ mod tests {
         );
 
         // A malformed rewrite (a non-atomic publish) must NOT turn every
-        // RCPT into a `451`: the last good snapshot keeps serving, the broken file
-        // is not re-parsed per lookup, and the next good publish
-        // applies.
+        // RCPT into a `451`: the last good snapshot keeps serving.
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&path, "not json at all").unwrap();
         assert_eq!(
@@ -869,8 +940,8 @@ mod tests {
         ).is_err());
     }
 
-    /// The static fallback preserves the pre-authority behavior: every
-    /// local-part at a hosted domain accepts and routes to itself.
+    /// The static fallback: every local-part at a hosted domain accepts,
+    /// case-insensitively; other domains are not hosted.
     #[test]
     fn static_authority_accepts_any_local_part() {
         let authority = StaticAuthority::new(vec!["Example.ORG".into(), "example.net".into()]);

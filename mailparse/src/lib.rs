@@ -5,8 +5,11 @@
 //! - **typed** ([`MailHeaders`]): the best-effort RFC view (addresses,
 //!   dates, MIME) — what application code reads.
 //!
-//! The crate is lenient: unknown or malformed headers degrade to
-//! `optional_field` instead of failing the message.
+//! The grammar is lenient: unknown or malformed headers degrade to
+//! `optional_field`. Building the typed view is stricter: a duplicate
+//! singleton field (From, To, Subject, ...), an unparseable date, or an
+//! address field without a mailbox fails the typed parse (see
+//! [`parse_headers`]). The raw view never fails on header syntax.
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
@@ -31,24 +34,25 @@ mod pest_parser {
 }
 use pest_parser::{MailParser, Rule};
 
-// (the crate-level documentation lives in the inner-attribute block at
-// the top of this file)
 /// Errors from the typed header parse and message splitting.
 #[derive(Error, Debug)]
 pub enum MailHeaderError {
-    /// A header did not match the grammar.
+    /// The header block did not match the grammar, a singleton field
+    /// (other than From) appeared twice, a `Date`/`Resent-Date` did not
+    /// parse, or a field lacked a required msg-id or mailbox part.
     #[error("Invalid header")]
     InvalidHeader,
 
-    /// A date field could not be parsed as RFC 2822.
+    /// A `Received` date could not be parsed as RFC 2822.
     #[error("InvalidDate")]
     InvalidDate,
 
-    /// An address (mailbox) field was incomplete.
+    /// A `Sender`/`Resent-Sender` field had no mailbox, or `From`
+    /// appeared twice.
     #[error("InvalidMailbox")]
     InvalidMailbox,
 
-    /// Anything else.
+    /// Anything else. Not currently produced.
     #[error("Unknown")]
     Unknown,
 
@@ -65,7 +69,8 @@ pub enum MailHeaderError {
     /// [`MAX_COMMENT_DEPTH`]. The typed parse is refused rather than
     /// attempted: the grammar's `comment` rule is recursive, and unbounded
     /// nesting would overflow the stack and abort the process (an abort,
-    /// not a panic, so callers can't catch it). The raw view ([`parse_raw_message`]) is unaffected.
+    /// not a panic, so callers can't catch it). The raw view
+    /// ([`parse_raw_message`]) is unaffected.
     #[error("Header comments nested too deeply")]
     TooDeeplyNested,
 }
@@ -133,8 +138,8 @@ pub struct RawHeader<'m> {
 }
 
 impl RawHeader<'_> {
-    /// ASCII case-insensitive comparison of this header's name against
-    /// `name` (header field names are case-insensitive per RFC 5322).
+    /// Returns whether this header's name equals `name`, ignoring ASCII
+    /// case (header field names are case-insensitive per RFC 5322).
     pub fn name_eq(&self, name: &str) -> bool {
         self.name.eq_ignore_ascii_case(name.as_bytes())
     }
@@ -154,12 +159,18 @@ pub struct ParsedMessage<'m> {
     pub body: &'m [u8],
 }
 
-/// Parse a complete RFC 5322 message: header block, blank-line separator, and
-/// body.
+/// Parse the complete RFC 5322 message `raw`: header block, blank-line
+/// separator, and body.
 ///
 /// The header block must be valid UTF-8 (typical for mail headers). For
 /// byte-level access on messages with non-UTF-8 headers, use
-/// [`split_message`] and [`extract_raw_headers`] directly.
+/// [`parse_raw_message`] (or [`split_message`] and
+/// [`extract_raw_headers`]) instead.
+///
+/// # Errors
+///
+/// [`MailHeaderError::MissingSeparator`], [`MailHeaderError::InvalidUtf8`],
+/// or any typed-parse error from [`parse_headers`].
 ///
 /// # Example
 ///
@@ -201,8 +212,13 @@ pub struct RawMessage<'m> {
     pub body: &'m [u8],
 }
 
-/// Split a message into a [`RawMessage`]: byte-exact headers and the body,
-/// with no typed parse. Fails only when there is no header/body separator.
+/// Split the message `raw` into a [`RawMessage`]: byte-exact headers and
+/// the body, with no typed parse.
+///
+/// # Errors
+///
+/// [`MailHeaderError::MissingSeparator`] when there is no header/body
+/// separator; nothing else.
 ///
 /// ```
 /// let raw = b"From: Alice <alice@example.com>\r\nSubject: \xff\r\n\r\nHello\r\n";
@@ -218,13 +234,22 @@ pub fn parse_raw_message(raw: &[u8]) -> Result<RawMessage<'_>, MailHeaderError> 
     })
 }
 
-/// Parse a header block (each header terminated by CRLF or LF) into the
-/// typed [`MailHeaders`] view.
+/// Parse the header block `src` (each header terminated by CRLF or LF)
+/// into the typed [`MailHeaders`] view.
 ///
-/// Lenient: unknown or malformed headers fall back to `optional_field` or are
-/// skipped, so a best-effort typed view is returned for most inputs. A block
-/// that nests comments deeper than [`MAX_COMMENT_DEPTH`] is refused with
-/// [`MailHeaderError::TooDeeplyNested`] before the grammar runs.
+/// Headers the grammar can't match as a known field fall back to
+/// `optional_field`, so most malformed headers don't fail the parse.
+///
+/// # Errors
+///
+/// [`MailHeaderError::TooDeeplyNested`] for a block that nests comments
+/// deeper than [`MAX_COMMENT_DEPTH`] (checked before the grammar runs);
+/// [`MailHeaderError::InvalidHeader`] if the grammar fails; and the
+/// typed-view errors: a duplicate singleton field (`From`, `Sender`,
+/// `Reply-To`, `To`, `Cc`, `Bcc`, `Message-ID`, `In-Reply-To`,
+/// `References`, `Subject`), an unparseable `Date`, `Resent-Date` or
+/// `Received` date, or a `Sender`/`Resent-Sender`/`Message-ID`/
+/// `Content-ID` without its mailbox or msg-id.
 pub fn parse_headers(src: &str) -> Result<MailHeaders<'_>, MailHeaderError> {
     if comment_depth_exceeds(src.as_bytes(), MAX_COMMENT_DEPTH) {
         return Err(MailHeaderError::TooDeeplyNested);
@@ -233,13 +258,18 @@ pub fn parse_headers(src: &str) -> Result<MailHeaders<'_>, MailHeaderError> {
     pairs.try_into()
 }
 
-/// Split a raw message at the first blank line into `(header_block, body)`.
+/// Split the raw message `raw` at the first blank line.
 ///
-/// The header block retains the line terminator of its final header (each
-/// header grammar rule consumes its own terminator). Accepts CRLF, LF, or
-/// mixed line endings. An empty input yields empty headers and body; an
-/// input beginning with a blank line yields an empty header block. An input
-/// with no blank line is rejected with [`MailHeaderError::MissingSeparator`].
+/// Returns `(header_block, body)`. The header block retains the line
+/// terminator of its final header (each header grammar rule consumes its
+/// own terminator). Accepts CRLF, LF, or mixed line endings. An empty
+/// input yields empty headers and body; an input beginning with a blank
+/// line yields an empty header block.
+///
+/// # Errors
+///
+/// [`MailHeaderError::MissingSeparator`] for a non-empty input with no
+/// blank line.
 pub fn split_message(raw: &[u8]) -> Result<(&[u8], &[u8]), MailHeaderError> {
     if raw.is_empty() {
         return Ok((&[], &[]));
@@ -269,15 +299,19 @@ pub fn split_message(raw: &[u8]) -> Result<(&[u8], &[u8]), MailHeaderError> {
     Err(MailHeaderError::MissingSeparator)
 }
 
-/// Split a header block into [`RawHeader`]s, preserving order, duplicates,
-/// folding, and exact bytes.
+/// Split `header_block` into [`RawHeader`]s, preserving order,
+/// duplicates, folding, and exact bytes. Never fails.
 ///
 /// Lines that neither contain a colon nor continue a previous header are
 /// malformed and skipped.
 pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
+    /// A header being accumulated across its folded lines.
     struct HeaderAcc<'a> {
+        /// The field name.
         name: &'a [u8],
+        /// Offset of the value's first byte (just after the colon).
         value_start: usize,
+        /// Offset just past the value's last line content.
         value_end: usize,
     }
 
@@ -335,7 +369,7 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
         .collect()
 }
 
-/// Placeholder for a zoned date (kept for API compatibility).
+/// Placeholder for a zoned date. Unused; kept for API compatibility.
 #[derive(Debug, Default)]
 pub struct DateZoned;
 
@@ -366,7 +400,9 @@ pub struct Trace<'p> {
     pub return_path: Option<&'p str>,
     /// The Received line's tokens (from/by/via/with/id/for), in order.
     pub received_tokens: Vec<&'p str>,
-    /// The Received line's date, if parseable.
+    /// The Received line's date; `Zoned::default()` when there is no
+    /// Received line or it carries no date (an unparseable date fails the
+    /// typed parse).
     pub date_time: Zoned,
 }
 
@@ -417,7 +453,8 @@ pub struct ContentDescription<'p> {
     pub description: &'p str,
 }
 
-/// The Content-Disposition header. Its parameters are not parsed yet.
+/// The Content-Disposition header. Not populated yet: the typed parse
+/// recognizes the header but extracts nothing from it.
 #[derive(Debug, Default)]
 pub struct ContentDisposition<'p> {
     /// The disposition type ("inline", "attachment").
@@ -437,13 +474,16 @@ pub struct MimeHeader<'p> {
     pub content_id: Option<MsgId<'p>>,
     /// Content-Description, if present.
     pub content_description: Option<ContentDescription<'p>>,
-    /// Content-Disposition, if present.
+    /// Content-Disposition; currently always `None` (see
+    /// [`ContentDisposition`]).
     pub content_disposition: Option<ContentDisposition<'p>>,
 }
 
-/// The typed RFC 5322/2045 view of the message headers: fields bucketed
-/// by name, duplicates appended to lists, best-effort. Malformed headers
-/// degrade to `optional_field` rather than failing the parse.
+/// The typed RFC 5322/2045 view of the message headers, fields bucketed
+/// by name. Repeatable fields (trace, resent, DKIM, Comments, Keywords)
+/// accumulate in lists; a repeated singleton field fails the parse (see
+/// [`parse_headers`]). Headers the grammar can't match degrade to
+/// `optional_field`.
 #[derive(Debug, Default)]
 pub struct MailHeaders<'h> {
     /// Trace entries, in message order (one per `Received` line, with
@@ -498,8 +538,8 @@ pub struct MailHeaders<'h> {
     /// The MIME entity headers, when any are present.
     pub mime_header: Option<MimeHeader<'h>>,
 
-    /// Every unrecognized (or typed-parse-failed) header as
-    /// name → value; duplicates overwrite.
+    /// Every header the grammar matched only as an optional field
+    /// (unrecognized or malformed), as name → value; duplicates overwrite.
     pub optional_field: HashMap<&'h str, &'h str>,
 }
 
@@ -636,6 +676,16 @@ impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
     }
 }
 
+// Field handlers: each takes the typed view `mh` being built and the
+// grammar pair `item` for one field, and records the field in `mh`.
+
+/// Record a trace block (`Return-Path` plus `Received` lines): one
+/// [`Trace`] per `Received` line, each carrying the block's Return-Path,
+/// or a single Return-Path-only entry.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidDate`] for an unparseable `Received` date.
 fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let mut return_path: Option<&'p str> = None;
     let mut receiveds: Vec<Pair<'p, Rule>> = Vec::new();
@@ -687,7 +737,8 @@ fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailH
     Ok(())
 }
 
-/// Standalone `Return-Path` header (not part of a trace block).
+/// Record a standalone `Return-Path` header (not part of a trace block)
+/// as its own [`Trace`] entry. Never fails.
 fn return_path<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let value = item
         .as_str()
@@ -702,7 +753,12 @@ fn return_path<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
-/// Standalone `Received` header (not part of a trace block).
+/// Record a standalone `Received` header (not part of a trace block) as
+/// its own [`Trace`] entry.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidDate`] for an unparseable date.
 fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let mut th = Trace::default();
     for token in item.into_inner() {
@@ -719,6 +775,11 @@ fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
     Ok(())
 }
 
+/// Append a `Resent-Date` value (the text after `Resent-Date: `).
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for an unparseable date.
 fn resent_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     mh.resent_date.push(
         rfc2822::parse(&item.as_str().trim()[13..]).map_err(|_| MailHeaderError::InvalidHeader)?,
@@ -727,30 +788,35 @@ fn resent_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
+/// Append the mailboxes of a `Resent-From` field. Never fails.
 fn resent_from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     mh.resent_from.extend(mailboxes!(rules));
     Ok(())
 }
 
+/// Append the mailboxes of a `Resent-To` field. Never fails.
 fn resent_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     mh.resent_to.extend(mailboxes!(rules));
     Ok(())
 }
 
+/// Append the mailboxes of a `Resent-Cc` field. Never fails.
 fn resent_cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     mh.resent_cc.extend(mailboxes!(rules));
     Ok(())
 }
 
+/// Append the mailboxes of a `Resent-Bcc` field. Never fails.
 fn resent_bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     mh.resent_bcc.extend(mailboxes!(rules));
     Ok(())
 }
 
+/// Append the msg-ids of a `Resent-Message-ID` field. Never fails.
 fn resent_msg_id<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -760,6 +826,7 @@ fn resent_msg_id<'p>(
     Ok(())
 }
 
+/// Append a `DKIM-Signature` header's trimmed tag list. Never fails.
 fn dkim_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let raw = item
         .as_str()
@@ -771,6 +838,11 @@ fn dkim_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
+/// Append the first mailbox of a `Resent-Sender` field.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidMailbox`] when it has no mailbox.
 fn resent_sender<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -784,7 +856,14 @@ fn resent_sender<'p>(
     Ok(())
 }
 
-//Originator fields
+// Originator fields
+
+/// Record the `Date` field (the text after `Date: `); a repeated `Date`
+/// is ignored.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for an unparseable date.
 fn orig_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.orig_date.is_none() {
         mh.orig_date = Some(
@@ -795,6 +874,11 @@ fn orig_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), M
     Ok(())
 }
 
+/// Record the `From` mailboxes.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidMailbox`] for a second `From`.
 fn from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.from.is_none() {
         let rules = item.into_inner();
@@ -806,6 +890,12 @@ fn from<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHe
     Ok(())
 }
 
+/// Record the first `Sender` mailbox.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidMailbox`] when it has no mailbox;
+/// [`MailHeaderError::InvalidHeader`] for a second `Sender`.
 fn sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.sender.is_none() {
         let rules = item.into_inner();
@@ -820,6 +910,11 @@ fn sender<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Mail
     Ok(())
 }
 
+/// Record the `Reply-To` mailboxes.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `Reply-To`.
 fn reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.reply_to.is_none() {
         let rules = item.into_inner();
@@ -830,7 +925,13 @@ fn reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
     Ok(())
 }
 
-//Destination fields
+// Destination fields
+
+/// Record the `To` mailboxes.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `To`.
 fn to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.to.is_none() {
         let rules = item.into_inner();
@@ -842,6 +943,11 @@ fn to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHead
     Ok(())
 }
 
+/// Record the `Cc` mailboxes.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `Cc`.
 fn cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.cc.is_none() {
         let rules = item.into_inner();
@@ -853,6 +959,11 @@ fn cc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHead
     Ok(())
 }
 
+/// Record the `Bcc` mailboxes.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `Bcc`.
 fn bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.bcc.is_none() {
         let rules = item.into_inner();
@@ -864,7 +975,14 @@ fn bcc<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHea
     Ok(())
 }
 
-//Identification fields
+// Identification fields
+
+/// Record the first msg-id of `Message-ID`.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] when it has no msg-id, or for a
+/// second `Message-ID`.
 fn message_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.message_id.is_none() {
         let rules = item.into_inner();
@@ -880,6 +998,11 @@ fn message_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), 
     Ok(())
 }
 
+/// Record the `In-Reply-To` msg-ids.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `In-Reply-To`.
 fn in_reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.in_reply_to.is_none() {
         let rules = item.into_inner();
@@ -891,6 +1014,11 @@ fn in_reply_to<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
+/// Record the `References` msg-ids.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `References`.
 fn references<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.references.is_none() {
         let rules = item.into_inner();
@@ -902,7 +1030,13 @@ fn references<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), 
     Ok(())
 }
 
-//Informational fields
+// Informational fields
+
+/// Record the `Subject` text (after `Subject: `, trimmed).
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] for a second `Subject`.
 fn subject<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.subject.is_none() {
         mh.subject = Some(item.as_str()[9..].trim());
@@ -913,17 +1047,26 @@ fn subject<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Mai
     Ok(())
 }
 
+/// Append a `Comments` value (after `Comments:`, trimmed). Never fails.
 fn comments<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     mh.comments.push(item.as_str()[9..].trim());
     Ok(())
 }
 
+/// Append a `Keywords` value (after `Keywords: `, trimmed). Never fails.
 fn keywords<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     mh.keywords.push(item.as_str()[10..].trim());
     Ok(())
 }
 
-//MIME
+// MIME
+
+/// Record a MIME header (creating [`MailHeaders::mime_header`] on first
+/// use) by dispatching to the handler for its kind.
+///
+/// # Errors
+///
+/// Whatever that handler returns (see [`content_id`]).
 fn mime_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
 
@@ -945,6 +1088,7 @@ fn mime_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(),
     Ok(())
 }
 
+/// Record `MIME-Version` (a later one replaces an earlier). Never fails.
 fn mime_version<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     let mut ver = MimeVersion::default();
@@ -964,6 +1108,8 @@ fn mime_version<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<()
     Ok(())
 }
 
+/// Record `Content-Type` with its parameters (a later one replaces an
+/// earlier). Never fails.
 fn content_type<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     let rules = item.into_inner();
     let mut ctype = ContentType::default();
@@ -996,6 +1142,8 @@ fn content_type<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<()
     Ok(())
 }
 
+/// Record `Content-Transfer-Encoding` (a later one replaces an earlier).
+/// Never fails.
 fn content_encoding<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -1016,6 +1164,12 @@ fn content_encoding<'p>(
     Ok(())
 }
 
+/// Record the first msg-id of `Content-ID`.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] when it has no msg-id (or, never in
+/// practice, when called before [`mime_header`] created the MIME view).
 fn content_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if let Some(mh) = &mut mh.mime_header {
         let rules = item.into_inner();
@@ -1031,6 +1185,7 @@ fn content_id<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), 
     Ok(())
 }
 
+/// Record `Content-Description`. Never fails.
 fn content_description<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -1053,6 +1208,8 @@ fn content_description<'p>(
     Ok(())
 }
 
+/// Accept `Content-Disposition` without recording anything yet (see
+/// [`ContentDisposition`]). Never fails.
 fn content_disposition<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -1062,6 +1219,12 @@ fn content_disposition<'p>(
     Ok(())
 }
 
+/// Record an optional (unrecognized or malformed) field in
+/// [`MailHeaders::optional_field`] as trimmed name → value.
+///
+/// # Errors
+///
+/// [`MailHeaderError::InvalidHeader`] if the pair lacks a name or value.
 fn optional_field<'p>(
     mh: &mut MailHeaders<'p>,
     item: Pair<'p, Rule>,
@@ -1085,20 +1248,6 @@ fn optional_field<'p>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // #[test]
-    // fn test_token() {
-    //     let src = include_str!("../test/headers");
-    //     let pairs = MailParser::parse(Rule::headers, src).unwrap();
-    //
-    //     for item in pairs {
-    //         println!(
-    //             "rule: {:?},  value: {:?}",
-    //             item.as_rule(),
-    //             item.into_inner().as_str().trim()
-    //         );
-    //     }
-    // }
 
     #[test]
     fn trace_headers() {
@@ -1547,14 +1696,9 @@ mod tests {
         let pairs = MailParser::parse(Rule::mime_header, src).unwrap();
         let item = pairs.into_iter().next().unwrap();
 
+        // The header parses and is accepted; its disposition and
+        // parameters are not extracted yet (see `ContentDisposition`).
         mime_header(&mut mh, item).unwrap();
-        // assert!(mh.mime_header.is_some());
-        //
-        // let h = mh.mime_header.unwrap();
-        // assert!(h.content_description.is_some());
-        //
-        // let des = h.content_description.unwrap().description;
-        // assert_eq!(des, "test description");
     }
 
     #[test]

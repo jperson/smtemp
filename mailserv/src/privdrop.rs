@@ -36,7 +36,12 @@ pub struct Identity {
 /// gid; default: the user's primary group) through the system's user
 /// database.
 ///
-/// Returns `Err` if the user or group doesn't exist.
+/// Returns the resolved [`Identity`]; its `user` is `user` as given.
+///
+/// # Errors
+///
+/// The user or group doesn't exist, a name contains NUL, or the user
+/// database lookup itself fails.
 pub fn lookup(user: &str, group: Option<&str>) -> Result<Identity> {
     let (uid, primary_gid) = match user.parse::<u32>() {
         Ok(uid) => passwd_by_uid(uid)?,
@@ -57,12 +62,18 @@ pub fn lookup(user: &str, group: Option<&str>) -> Result<Identity> {
     })
 }
 
-/// Decide what to do, given the effective uid at startup and the resolved
-/// `--user` identity (if configured). Pure, so the rules are unit-tested.
+/// Decide what to do, given the effective uid at startup (`euid`) and the
+/// resolved `--user` identity (`target`, if configured). Pure, so the
+/// rules are unit-tested.
 ///
-/// Returns `Ok(Some(identity))` to drop to that identity after binding,
-/// `Ok(None)` to keep running as the current user, or `Err` to refuse to
-/// start.
+/// Returns `Some(identity)` to drop to that identity after binding, or
+/// `None` to keep running as the current user.
+///
+/// # Errors
+///
+/// Refuses to start when running as root without `target`, when
+/// `target` is root, or when running unprivileged as someone other than
+/// `target`.
 pub fn plan(euid: u32, target: Option<Identity>) -> Result<Option<Identity>> {
     match (euid, target) {
         (0, None) => bail!(
@@ -93,9 +104,11 @@ pub fn effective_uid() -> u32 {
 /// Switch the whole process to `id`, irrevocably: supplementary groups,
 /// then gid, then uid (real, effective and saved, since we are root).
 ///
-/// Returns `Err` if any call fails, or if afterwards the process could
-/// still regain root or isn't running as `id`. The caller must then exit:
-/// continuing would mean serving SMTP with privileges.
+/// # Errors
+///
+/// Any of the calls fails, or afterwards the process could still regain
+/// root or isn't running as `id`. The caller must then exit: continuing
+/// would mean serving SMTP with privileges.
 pub fn drop_to(id: &Identity) -> Result<()> {
     let gid = id.gid as libc::gid_t;
     // SAFETY: plain syscalls on scalar arguments; `&gid` outlives the call.
@@ -140,7 +153,16 @@ pub fn restrict_umask() {
     }
 }
 
-/// Run a `get*_r` lookup with a buffer that grows on `ERANGE`.
+/// Run a `get*_r` lookup with a scratch buffer that starts at 4 KiB and
+/// doubles on `ERANGE`, up to 1 MiB.
+///
+/// `call` performs the lookup into the buffer and returns the C return
+/// code plus the extracted value (`None` when no entry was found).
+/// Returns that value once `call` returns 0.
+///
+/// # Errors
+///
+/// Any other nonzero return code, or `ERANGE` with the buffer at its cap.
 fn with_buffer<T>(
     mut call: impl FnMut(&mut [libc::c_char]) -> (libc::c_int, Option<T>),
 ) -> Result<Option<T>> {
@@ -158,7 +180,13 @@ fn with_buffer<T>(
     }
 }
 
-/// `(uid, primary gid)` for a user name.
+/// Look up the user `name`.
+///
+/// Returns `(uid, primary gid)`, or `None` if there is no such user.
+///
+/// # Errors
+///
+/// `name` contains NUL, or the lookup fails (see [`with_buffer`]).
 fn passwd_by_name(name: &str) -> Result<Option<(u32, u32)>> {
     let cname = CString::new(name).context("user name contains NUL")?;
     with_buffer(|buf| {
@@ -179,7 +207,13 @@ fn passwd_by_name(name: &str) -> Result<Option<(u32, u32)>> {
     })
 }
 
-/// `(uid, primary gid)` for a numeric uid.
+/// Look up the user with numeric `uid`.
+///
+/// Returns `(uid, primary gid)`, or `None` if there is no such user.
+///
+/// # Errors
+///
+/// The lookup fails (see [`with_buffer`]).
 fn passwd_by_uid(uid: u32) -> Result<Option<(u32, u32)>> {
     with_buffer(|buf| {
         // SAFETY: as in `passwd_by_name`.
@@ -192,7 +226,13 @@ fn passwd_by_uid(uid: u32) -> Result<Option<(u32, u32)>> {
     })
 }
 
-/// The gid for a group name.
+/// Look up the group `name`.
+///
+/// Returns its gid, or `None` if there is no such group.
+///
+/// # Errors
+///
+/// `name` contains NUL, or the lookup fails (see [`with_buffer`]).
 fn group_by_name(name: &str) -> Result<Option<u32>> {
     let cname = CString::new(name).context("group name contains NUL")?;
     with_buffer(|buf| {
@@ -243,7 +283,7 @@ mod tests {
     }
 
     /// Lookups work against the real user database: the current user by
-    /// uid and by name, and unknown names are errors.
+    /// uid, root by name, and unknown names are errors.
     #[test]
     fn lookup_users_and_groups() {
         let uid = effective_uid();

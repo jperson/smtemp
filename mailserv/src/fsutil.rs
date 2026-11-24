@@ -2,9 +2,8 @@
 //!
 //! Mail is personal data: everything mailserv stores is created readable
 //! by the service user only — files `0600`, directories `0700` — whatever
-//! the process umask is. The
-//! startup `umask(0o077)` in `main` is defense in depth for anything
-//! created elsewhere. The modes only ever remove permissions relative to
+//! the process umask is. The startup `umask(0o077)` in `main` is defense
+//! in depth for anything created elsewhere. The modes only ever remove permissions relative to
 //! the umask, never add them.
 
 use std::fs::File;
@@ -17,9 +16,15 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Mode for every file mailserv creates (owner read/write).
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// `create_dir_all` with [`PRIVATE_DIR_MODE`] for each directory it
-/// creates. Existing directories are left as they are (see
-/// [`warn_if_shared`]).
+/// Create `path` and any missing parents, like `create_dir_all`, giving
+/// each newly created directory [`PRIVATE_DIR_MODE`].
+///
+/// Existing directories are left as they are (see [`shared_bits`] for
+/// detecting ones that are too open).
+///
+/// # Errors
+///
+/// Any I/O error from creating a directory.
 pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -31,8 +36,15 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-/// `File::create` (create or truncate, write-only) with
-/// [`PRIVATE_FILE_MODE`] for a newly created file.
+/// Open `path` for writing like `File::create` (create or truncate),
+/// giving a newly created file [`PRIVATE_FILE_MODE`]. An existing file
+/// keeps its mode.
+///
+/// Returns the open, write-only file.
+///
+/// # Errors
+///
+/// Any I/O error from opening the file.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -45,10 +57,16 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
 }
 
 /// Create `path` and any missing parent directories as private
-/// directories owned by `uid:gid`. Used by root just before dropping
-/// privileges, so the unprivileged process owns the spool and maildir
-/// trees it must write. Directories that already exist are left alone,
-/// whoever owns them.
+/// ([`PRIVATE_DIR_MODE`]) directories owned by `uid`:`gid`.
+///
+/// Used by root just before dropping privileges, so the unprivileged
+/// process owns the spool and maildir trees it must write. Directories
+/// that already exist are left alone, whoever owns them.
+///
+/// # Errors
+///
+/// Any I/O error from creating or `chown`ing a directory. A directory
+/// created concurrently (`AlreadyExists`) is not an error.
 #[cfg(unix)]
 pub fn create_owned_dir_all(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -75,9 +93,11 @@ pub fn create_owned_dir_all(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// If `path` is a directory that group or other users can access, the
-/// permission bits that are too open (for the startup warning). `None`
-/// when it is private, missing, or not on Unix.
+/// Check whether `path` is accessible to group or other users, for the
+/// startup warning.
+///
+/// Returns the group/other permission bits that are set (`mode & 0o077`),
+/// or `None` when `path` is private, missing, or the platform is not Unix.
 ///
 /// Existing directories are never changed automatically: an operator may
 /// have opened one up deliberately (e.g. for a reader process's group).

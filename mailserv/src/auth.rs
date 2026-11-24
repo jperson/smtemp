@@ -30,8 +30,17 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Build from the `--auth-users` and `--auth-senders` specs. A grant
-    /// for a login that is not in `--auth-users` is an error (almost
+    /// Build from the `--auth-users` and `--auth-senders` specs.
+    ///
+    /// `users_spec` is a comma-separated list of `user:password` pairs
+    /// (the user is trimmed; the password is everything after the first
+    /// `:`, verbatim). `senders_spec` is the [`SenderGrants`] spec; `None`
+    /// or a blank spec means no login has any grants.
+    ///
+    /// # Errors
+    ///
+    /// A `users_spec` entry without a `:`, any [`SenderGrants::parse`]
+    /// error, or a grant for a login that is not in `users_spec` (almost
     /// always a typo, and silently ignoring it would leave the intended
     /// user unable to send).
     pub fn parse(users_spec: &str, senders_spec: Option<&str>) -> Result<Self> {
@@ -57,8 +66,8 @@ impl AuthConfig {
         })
     }
 
-    /// Logins that can authenticate but have no sender grants (so every
-    /// `MAIL FROM` they send is refused). Sorted, for stable logs.
+    /// Returns the logins that can authenticate but have no sender grants
+    /// (so every `MAIL FROM` they send is refused), sorted for stable logs.
     pub fn users_without_grants(&self) -> Vec<&str> {
         let mut users: Vec<&str> = self
             .credentials
@@ -88,12 +97,18 @@ struct Grant {
 /// `alice=alice@example.org|@example.net,bob=bob@example.org`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SenderGrants {
+    /// Login name -> what that login may send as.
     by_user: HashMap<String, Grant>,
 }
 
 impl SenderGrants {
-    /// Parse an `--auth-senders` spec. Malformed entries, empty grant
-    /// lists, implausible domains and a login listed twice are errors.
+    /// Parse an `--auth-senders` `spec` (format above).
+    ///
+    /// # Errors
+    ///
+    /// An entry without `=` or with an empty user, a grant that has no
+    /// `@` (including an empty grant list), a grant with an implausible
+    /// domain, or a login listed twice.
     pub fn parse(spec: &str) -> Result<Self> {
         let mut by_user: HashMap<String, Grant> = HashMap::new();
         for entry in spec.split(',') {
@@ -128,7 +143,11 @@ impl SenderGrants {
         Ok(SenderGrants { by_user })
     }
 
-    /// May `user` send as `local@domain`?
+    /// May login `user` send as `local@domain`?
+    ///
+    /// Returns `true` when `user` has a grant for the exact address or for
+    /// the whole domain; `false` for an unknown login, an empty
+    /// local-part, or an implausible domain.
     ///
     /// The domain is compared case-insensitively (DNS names are). The
     /// local-part is compared ASCII-case-insensitively too: RFC 5321
@@ -149,14 +168,17 @@ impl SenderGrants {
     }
 }
 
-/// `local@domain` with the local-part ASCII-lowercased; the domain is
-/// already normalized.
+/// Returns `local@domain` with `local` ASCII-lowercased. `domain` must
+/// already be normalized (see [`normalize_domain`]).
 fn normalize(local: &str, domain: &str) -> String {
     format!("{}@{domain}", local.to_ascii_lowercase())
 }
 
-/// A lowercased domain without a trailing dot, or `None` unless it looks
-/// like a hostname (letters, digits, `-`, `_`, non-empty labels).
+/// Normalize `domain` for comparison.
+///
+/// Returns it trimmed, lowercased and without a trailing dot, or `None`
+/// unless it looks like a hostname (non-empty labels of ASCII letters,
+/// digits, `-` and `_`).
 fn normalize_domain(domain: &str) -> Option<String> {
     let d = domain.trim();
     let d = d.strip_suffix('.').unwrap_or(d);
@@ -170,9 +192,11 @@ fn normalize_domain(domain: &str) -> Option<String> {
     plausible.then(|| d.to_ascii_lowercase())
 }
 
-/// Split an envelope path address (`local@domain`, brackets already
-/// removed) at its last `@`. `None` for the null sender or an address
-/// without a local-part.
+/// Split an envelope path address `addr` (`local@domain`, brackets
+/// already removed) at its last `@`.
+///
+/// Returns `(local, domain)`, or `None` for the null sender or an address
+/// with no `@`, an empty local-part or an empty domain.
 pub fn split_address(addr: &str) -> Option<(&str, &str)> {
     let (local, domain) = addr.rsplit_once('@')?;
     (!local.is_empty() && !domain.is_empty()).then_some((local, domain))

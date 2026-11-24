@@ -57,8 +57,8 @@ pub enum SpfMechanism {
 }
 
 impl SpfMechanism {
-    /// The mechanism's domain-spec, if it carries one (empty string means
-    /// "the current domain").
+    /// Returns the mechanism's domain-spec, if it carries one (empty
+    /// string means "the current domain").
     pub fn domain_spec(&self) -> Option<String> {
         match &self {
             SpfMechanism::All => None,
@@ -127,14 +127,16 @@ pub struct SpfMacroSubs {
     pub d: Option<String>,
     /// `%{i}` — the connecting IP.
     pub i: Option<String>,
-    /// `%{p}` — the validated domain of the IP (reverse DNS; currently
-    /// never populated).
+    /// `%{p}` — the validated domain of the IP. Reverse DNS is not
+    /// validated here, so this is always the specified fallback
+    /// `"unknown"`.
     pub p: Option<String>,
     /// `%{h}` — the HELO/EHLO name.
     pub h: Option<String>,
     /// `%{c}` — the SMTP client IP (readable form).
     pub c: Option<String>,
-    /// `%{r}` — the domain of the host performing the check.
+    /// `%{r}` — the domain of the host performing the check. Set to the
+    /// evaluated domain (the checking host's own name is not known here).
     pub r: Option<String>,
     /// `%{t}` — the current timestamp.
     pub t: Option<String>,
@@ -143,7 +145,10 @@ pub struct SpfMacroSubs {
 }
 
 impl SpfMacroSubs {
-    /// Build the substitution set for one evaluation.
+    /// Build the substitution set for evaluating `domain` for the
+    /// connecting IP `peer`, the identity `sender` (`local@domain`; an
+    /// empty local-part becomes `postmaster`) and the client's `helo`
+    /// name.
     pub fn new(peer: IpAddr, sender: &String, domain: &String, helo: &Option<String>) -> Self {
         let (local_part, sender_domain) = sender.split_once('@').unzip();
         // RFC 7208 Section 7.3: `t` is seconds since the epoch.
@@ -187,7 +192,7 @@ impl SpfMacroSubs {
     }
 }
 
-/// Whether a TXT string is an SPF record: it begins with `v=spf1`
+/// Whether the TXT string `txt` is an SPF record: it begins with `v=spf1`
 /// (ASCII case-insensitive), followed by a space or the end of the string
 /// (RFC 7208 §4.5). `v=spf10` is not one.
 pub fn is_spf_record(txt: &str) -> bool {
@@ -195,16 +200,20 @@ pub fn is_spf_record(txt: &str) -> bool {
     txt.len() >= 6 && txt[..6].eq_ignore_ascii_case(b"v=spf1") && (txt.len() == 6 || txt[6] == b' ')
 }
 
-/// Parse a full SPF record (`v=spf1` plus terms) into its AST, expanding
-/// macros with `subs`.
+/// Parse the full SPF record `s` (`v=spf1` plus terms) into its AST,
+/// expanding macros with `subs`.
 ///
 /// Terms are separated by spaces (RFC 7208 §4.6.1), and mechanism and
-/// modifier names are case-insensitive. **Any** term that isn't a valid
-/// mechanism or modifier is an `Err`, which evaluation maps to PermError
-/// (§4.6). Footgun: never skip a term you can't parse. Dropping it, and
-/// everything after it, would lose a trailing `-all` and turn a hard fail
-/// into Neutral. `redirect=` and `exp=` may appear at
-/// most once each (§6). Other modifiers are kept and ignored.
+/// modifier names are case-insensitive. `redirect=` and `exp=` may appear
+/// at most once each (§6). Other modifiers are kept and ignored.
+///
+/// # Errors
+///
+/// A missing `v=spf1`, a duplicate `redirect=`/`exp=`, a macro error, or
+/// **any** term that isn't a valid mechanism or modifier; evaluation maps
+/// every one to PermError (§4.6). Footgun: never skip a term you can't
+/// parse. Dropping it, and everything after it, would lose a trailing
+/// `-all` and turn a hard fail into Neutral.
 pub fn parse(subs: &SpfMacroSubs, s: &str) -> Result<Spf> {
     let mut terms = s.split_ascii_whitespace();
     let version = match terms.next() {
@@ -236,9 +245,16 @@ pub fn parse(subs: &SpfMacroSubs, s: &str) -> Result<Spf> {
     })
 }
 
-/// A `name=value` modifier, or `None` when the term isn't one (its text
-/// before the first `=` isn't a modifier name, RFC 7208 §12:
-/// `ALPHA *( ALPHA / DIGIT / "-" / "_" / "." )`). The name is lowercased.
+/// Parse `term` as a `name=value` modifier, expanding macros in the value
+/// with `subs`.
+///
+/// Returns the modifier (name lowercased), or `None` when the term isn't
+/// one (its text before the first `=` isn't a modifier name, RFC 7208
+/// §12: `ALPHA *( ALPHA / DIGIT / "-" / "_" / "." )`).
+///
+/// # Errors
+///
+/// The value's macro-string is invalid.
 fn parse_modifier(subs: &SpfMacroSubs, term: &str) -> Result<Option<SpfModifier>> {
     let Some((name, value)) = term.split_once('=') else {
         return Ok(None);
@@ -256,8 +272,14 @@ fn parse_modifier(subs: &SpfMacroSubs, term: &str) -> Result<Option<SpfModifier>
     }))
 }
 
-/// One directive: an optional qualifier, then a mechanism whose name is
-/// matched case-insensitively. Unknown mechanisms are an error.
+/// Parse `term` as one directive: an optional qualifier (default `+`),
+/// then a mechanism whose name is matched case-insensitively, with macros
+/// expanded using `subs`.
+///
+/// # Errors
+///
+/// An unknown mechanism (including `all` with an argument) or an invalid
+/// argument.
 fn parse_directive(subs: &SpfMacroSubs, term: &str) -> Result<SpfDirective> {
     let (qualifier, rest) = match term.as_bytes().first() {
         Some(b'+') => (SpfQualifier::Plus, &term[1..]),
@@ -293,7 +315,13 @@ fn parse_directive(subs: &SpfMacroSubs, term: &str) -> Result<SpfDirective> {
     })
 }
 
-/// `":" domain-spec`, required (`include`, `exists`).
+/// Parse `arg` as `":" domain-spec`, required (`include`, `exists`).
+///
+/// Returns the macro-expanded domain-spec.
+///
+/// # Errors
+///
+/// No `:`, an empty spec, a spec containing `/`, or a macro error.
 fn required_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
     match arg.strip_prefix(':') {
         Some(spec) if !spec.is_empty() && !spec.contains('/') => {
@@ -303,7 +331,12 @@ fn required_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
     }
 }
 
-/// `[ ":" domain-spec ]` (`ptr`); empty means the current domain.
+/// Parse `arg` as `[ ":" domain-spec ]` (`ptr`); an empty `arg` gives an
+/// empty string, meaning the current domain.
+///
+/// # Errors
+///
+/// As for [`required_domain`] when `arg` is non-empty.
 fn optional_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
     if arg.is_empty() {
         Ok(String::new())
@@ -312,8 +345,15 @@ fn optional_domain(subs: &SpfMacroSubs, arg: &str) -> Result<String> {
     }
 }
 
-/// `[ ":" domain-spec ] [ dual-cidr-length ]` (`a`, `mx`; RFC 7208 §5.6).
-/// A domain-spec never contains `/`, so the first `/` starts the CIDR.
+/// Parse `arg` as `[ ":" domain-spec ] [ dual-cidr-length ]` (`a`, `mx`;
+/// RFC 7208 §5.6). A domain-spec never contains `/`, so the first `/`
+/// starts the CIDR.
+///
+/// Returns the domain-spec (empty for the current domain) and the CIDR.
+///
+/// # Errors
+///
+/// An invalid domain-spec or CIDR.
 fn domain_and_cidr(subs: &SpfMacroSubs, arg: &str) -> Result<(String, DualCidr)> {
     let (domain_part, cidr_part) = arg.split_at(arg.find('/').unwrap_or(arg.len()));
     let domain = if domain_part.is_empty() {
@@ -324,8 +364,13 @@ fn domain_and_cidr(subs: &SpfMacroSubs, arg: &str) -> Result<(String, DualCidr)>
     Ok((domain, parse_dual_cidr(cidr_part)?))
 }
 
-/// `dual-cidr-length = [ "/" ip4-len ] [ "//" ip6-len ]`, with ip4-len
-/// 0–32 and ip6-len 0–128. Empty means /32 and /128.
+/// Parse `s` as `dual-cidr-length = [ "/" ip4-len ] [ "//" ip6-len ]`,
+/// with ip4-len 0–32 and ip6-len 0–128. Empty means /32 and /128.
+///
+/// # Errors
+///
+/// Any other form, a non-numeric or over-long length, or one out of
+/// range.
 fn parse_dual_cidr(s: &str) -> Result<DualCidr> {
     let mut cidr = DualCidr::default();
     if s.is_empty() {
@@ -359,7 +404,12 @@ fn parse_dual_cidr(s: &str) -> Result<DualCidr> {
     Ok(cidr)
 }
 
-/// `ip4:` network: `a.b.c.d` or `a.b.c.d/prefix` (RFC 7208 §5.6).
+/// Parse the `ip4` argument `arg` (`:a.b.c.d` or `:a.b.c.d/prefix`, RFC
+/// 7208 §5.6) as a network.
+///
+/// # Errors
+///
+/// No leading `:`, an invalid address, or a prefix that is not 0–32.
 fn parse_ip4(arg: &str) -> Result<Ipv4Net> {
     let ip = arg
         .strip_prefix(':')
@@ -377,7 +427,12 @@ fn parse_ip4(arg: &str) -> Result<Ipv4Net> {
     Ok(Ipv4Net::from(ip.parse::<Ipv4Addr>()?))
 }
 
-/// `ip6:` network: an address with an optional `/prefix`.
+/// Parse the `ip6` argument `arg` (`:` then an address with an optional
+/// `/prefix`) as a network.
+///
+/// # Errors
+///
+/// No leading `:`, or an invalid address or prefix.
 fn parse_ip6(arg: &str) -> Result<Ipv6Net> {
     let ip = arg
         .strip_prefix(':')
@@ -389,7 +444,7 @@ fn parse_ip6(arg: &str) -> Result<Ipv6Net> {
     }
 }
 
-/// Expand an RFC 7208 Section 7 macro-string.
+/// Expand the RFC 7208 Section 7 macro-string `s` using `subs`.
 ///
 /// ```text
 /// macro-string = *( macro-expand / macro-literal )
@@ -402,9 +457,13 @@ fn parse_ip6(arg: &str) -> Result<Ipv6Net> {
 /// A macro value is split on the given delimiters (default `.`),
 /// optionally reversed (`r`), cut to its rightmost N parts (digits), and
 /// re-joined with `.`. An upper-case macro letter URL-escapes the result.
-/// Any other use of `%` is a syntax error (the caller maps it to
-/// PermError). An expanded domain-spec longer than 253 octets loses
-/// labels from the left (Section 7.3).
+/// An expanded domain-spec longer than 253 octets loses labels from the
+/// left (Section 7.3).
+///
+/// # Errors
+///
+/// Any other use of `%`, an unterminated macro, or an invalid macro body
+/// (see [`expand_one_macro`]); the caller maps these to PermError.
 fn expand_macro_string(subs: &SpfMacroSubs, s: &String) -> Result<String> {
     if memchr::memchr(b'%', s.as_bytes()).is_none() {
         return Ok(s.to_string());
@@ -441,8 +500,13 @@ fn expand_macro_string(subs: &SpfMacroSubs, s: &String) -> Result<String> {
     Ok(out)
 }
 
-/// Expand the inside of one `%{...}` macro (letter, transformers,
-/// delimiters).
+/// Expand `body`, the inside of one `%{...}` macro (letter, transformers,
+/// delimiters), using `subs`. An unset value expands to the empty string.
+///
+/// # Errors
+///
+/// An empty body, an unknown macro letter, an invalid delimiter, or a
+/// zero (or unparseable) digit transformer.
 fn expand_one_macro(subs: &SpfMacroSubs, body: &str) -> Result<String> {
     let mut it = body.chars();
     let letter = it.next().ok_or_else(|| anyhow!("empty macro"))?;
@@ -615,8 +679,8 @@ mod tests {
         assert_eq!(expected, result);
     }
 
-    /// RFC 7208 Section 7 macro expansion. The
-    /// expected values are the RFC's own examples (Section 7.4) for
+    /// RFC 7208 Section 7 macro expansion. The expected values are the
+    /// RFC's own examples (Section 7.4) for
     /// sender strong-bad@email.example.com, IP 192.0.2.3.
     #[test]
     fn macro_expansion_rfc_examples() {
@@ -655,8 +719,8 @@ mod tests {
             x("%{d2}.trusted-domains.example.net"),
             "example.com.trusted-domains.example.net"
         );
-        // Literal text with no macro letters is untouched (the old
-        // implementation replaced every letter after the first '%').
+        // Literal text around a macro is untouched; only the `%{...}`
+        // itself is replaced.
         assert_eq!(
             x("%{i}._spf.mta.salesforce.com"),
             "192.0.2.3._spf.mta.salesforce.com"

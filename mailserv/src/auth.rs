@@ -12,58 +12,306 @@
 //! Fail-closed: a login with no grants can authenticate but can't send
 //! anything, and the null sender is never allowed for an authenticated
 //! session.
+//!
+//! Credentials come from a file (`--auth-users-file`), never from argv,
+//! and the file holds only **argon2id hashes** (PHC strings, made with
+//! `mailserv hash-password`), never passwords. Checking a password
+//! ([`AuthConfig::check`]) is rate-limited per session (by the caller) and
+//! per source IP, bounded in concurrency, and run on the blocking pool;
+//! the hash comparison itself is constant-time.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHashString, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
+
+use crate::limit::{AuthFailureLimiter, AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW};
+
+/// Hash `password` for the credentials file: argon2id (v19) with the
+/// crate's default parameters (19 MiB of memory, 2 passes, 1 lane: the
+/// OWASP baseline) and a random 16-byte salt.
+///
+/// Returns the PHC string, e.g. `$argon2id$v=19$m=19456,t=2,p=1$...`.
+///
+/// # Errors
+///
+/// Hashing fails (not expected with the default parameters).
+pub fn hash_password(password: &str) -> Result<String> {
+    hash_with(Argon2::default(), password)
+}
+
+/// Hash `password` with the argon2 context `argon2` and a random salt.
+///
+/// # Errors
+///
+/// Hashing fails (invalid parameters).
+fn hash_with(argon2: Argon2<'_>, password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow!("password hashing failed: {e}"))?
+        .to_string())
+}
+
+/// Parse `value` as an argon2id PHC string with usable parameters and a
+/// hash output.
+///
+/// # Errors
+///
+/// Why it isn't one (never echoing `value`, which might be a password).
+fn parse_argon2id(value: &str) -> std::result::Result<PasswordHashString, String> {
+    let hash = PasswordHashString::new(value).map_err(|_| "not a PHC hash string".to_string())?;
+    let parsed = hash.password_hash();
+    if parsed.algorithm != Algorithm::Argon2id.ident() {
+        return Err(format!("algorithm is {}, not argon2id", parsed.algorithm));
+    }
+    Params::try_from(&parsed).map_err(|e| format!("invalid parameters: {e}"))?;
+    if parsed.salt.is_none() || parsed.hash.is_none() {
+        return Err("missing salt or hash".to_string());
+    }
+    Ok(hash)
+}
+
+/// Below these argon2id costs a hash is weaker than OWASP's minimum
+/// recommendations (which trade memory against passes, from 47 MiB × 1 to
+/// 7 MiB × 5): at least 7 MiB, and memory × passes of at least 35 MiB.
+const MIN_MEMORY_KIB: u32 = 7 * 1024;
+/// See [`MIN_MEMORY_KIB`].
+const MIN_MEMORY_TIMES_PASSES_KIB: u64 = 35 * 1024;
+
+/// How many failed attempts one session may make before AUTH is refused
+/// for the rest of it (without hashing anything).
+pub const MAX_FAILURES_PER_SESSION: u32 = 3;
+
+/// The outcome of [`AuthConfig::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthCheck {
+    /// The password matches the login.
+    Accepted,
+    /// Unknown login or wrong password (the two are indistinguishable).
+    Rejected,
+    /// The source IP has used up its failure budget; nothing was checked.
+    Blocked,
+}
 
 /// AUTH configuration: the credential store plus each login's sender
-/// grants. Grants only exist alongside credentials, so the type rules out
-/// a configuration that authorizes senders without AUTH.
-#[derive(Debug, Default)]
+/// grants, and the shared guards that bound password checking. Grants only
+/// exist alongside credentials, so the type rules out a configuration that
+/// authorizes senders without AUTH.
 pub struct AuthConfig {
-    /// `user -> password`, in plaintext. Footgun: these come from argv or the
-    /// config file, so they show up in `ps` and shell history.
-    pub credentials: HashMap<String, String>,
+    /// `user -> argon2id hash`.
+    credentials: HashMap<String, PasswordHashString>,
+    /// An argon2id hash of a random password with the same parameters as
+    /// the first credential, checked for unknown logins so they cost as
+    /// much as a wrong password.
+    dummy: PasswordHashString,
     /// `user -> addresses/domains` that user may send as.
     pub senders: SenderGrants,
+    /// Failed attempts per source IP.
+    failures: AuthFailureLimiter,
+    /// Bounds concurrent hash checks to the number of CPUs, so AUTH
+    /// attempts can't monopolize the blocking pool.
+    checks: tokio::sync::Semaphore,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the hashes.
+        f.debug_struct("AuthConfig")
+            .field("users", &self.credentials.len())
+            .field("senders", &self.senders)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AuthConfig {
-    /// Build from the `--auth-users` and `--auth-senders` specs.
+    /// Load the credentials file at `path` and combine it with the
+    /// `--auth-senders` spec `senders_spec` (see
+    /// [`AuthConfig::from_credentials`] for both formats).
     ///
-    /// `users_spec` is a comma-separated list of `user:password` pairs
-    /// (the user is trimmed; the password is everything after the first
-    /// `:`, verbatim). `senders_spec` is the [`SenderGrants`] spec; `None`
-    /// or a blank spec means no login has any grants.
+    /// The file must not be accessible to "other" users; read it before
+    /// dropping privileges, so it can stay root-owned with mode `0600`.
+    /// Group access is allowed (the caller warns about it).
     ///
     /// # Errors
     ///
-    /// A `users_spec` entry without a `:`, any [`SenderGrants::parse`]
-    /// error, or a grant for a login that is not in `users_spec` (almost
-    /// always a typo, and silently ignoring it would leave the intended
-    /// user unable to send).
-    pub fn parse(users_spec: &str, senders_spec: Option<&str>) -> Result<Self> {
-        let mut credentials = HashMap::new();
-        for pair in users_spec.split(',') {
-            let Some((user, pass)) = pair.split_once(':') else {
-                bail!("--auth-users entries must be user:password, got {pair:?}");
-            };
-            credentials.insert(user.trim().to_string(), pass.to_string());
+    /// The file can't be read, is accessible to other users, or fails
+    /// [`AuthConfig::from_credentials`].
+    pub fn load(path: &Path, senders_spec: Option<&str>) -> Result<Self> {
+        if let Some(bits) = crate::fsutil::shared_bits(path) {
+            if bits & 0o007 != 0 {
+                bail!(
+                    "credentials file {} is accessible to other users (mode bits {bits:03o}); \
+                     chmod o-rwx it",
+                    path.display()
+                );
+            }
         }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read credentials file {}", path.display()))?;
+        Self::from_credentials(&text, senders_spec)
+            .with_context(|| format!("invalid credentials file {}", path.display()))
+    }
+
+    /// Build from the contents of a credentials file, `credentials`, and
+    /// the `--auth-senders` spec `senders_spec`.
+    ///
+    /// The credentials format is one `user:hash` per line, where `hash`
+    /// is an argon2id PHC string (`$argon2id$v=19$m=...,t=...,p=...$salt$
+    /// hash`, as printed by `mailserv hash-password`). The user and hash
+    /// are trimmed. Blank lines and lines starting with `#` (after leading
+    /// whitespace) are ignored. `senders_spec` is the [`SenderGrants`]
+    /// spec; `None` or a blank spec means no login has any grants.
+    ///
+    /// One argon2 hash is computed here (the dummy for unknown logins),
+    /// with the first credential's parameters.
+    ///
+    /// # Errors
+    ///
+    /// A line without a `:`, an empty user, a value that is not an
+    /// argon2id PHC string (including a plaintext password), a user listed
+    /// twice, no users at all, any [`SenderGrants::parse`] error, or a
+    /// grant for a login that has no credentials (almost always a typo,
+    /// and silently ignoring it would leave the intended user unable to
+    /// send). Errors name the line number, never the value.
+    pub fn from_credentials(credentials: &str, senders_spec: Option<&str>) -> Result<Self> {
+        let mut hashes: HashMap<String, PasswordHashString> = HashMap::new();
+        let mut first: Option<PasswordHashString> = None;
+        for (index, line) in credentials.lines().enumerate() {
+            let number = index + 1;
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let Some((user, value)) = line.split_once(':') else {
+                bail!("line {number}: expected user:hash");
+            };
+            let user = user.trim();
+            if user.is_empty() {
+                bail!("line {number}: empty user name");
+            }
+            let hash = parse_argon2id(value.trim()).map_err(|why| {
+                anyhow!(
+                    "line {number}: the value for {user:?} is not an argon2id hash ({why}); \
+                     generate one with `mailserv hash-password`"
+                )
+            })?;
+            first.get_or_insert_with(|| hash.clone());
+            if hashes.insert(user.to_string(), hash).is_some() {
+                bail!("line {number}: {user:?} is listed more than once");
+            }
+        }
+        let Some(first) = first else {
+            bail!("no users defined");
+        };
         let senders = match senders_spec {
             Some(spec) if !spec.trim().is_empty() => SenderGrants::parse(spec)?,
             _ => SenderGrants::default(),
         };
         for user in senders.by_user.keys() {
-            if !credentials.contains_key(user) {
-                bail!("--auth-senders names {user:?}, which is not in --auth-users");
+            if !hashes.contains_key(user) {
+                bail!("--auth-senders names {user:?}, which has no credentials");
             }
         }
+
+        // The dummy shares the first credential's parameters, so an unknown
+        // login costs the same as a typical known one.
+        let params = Params::try_from(&first.password_hash())
+            .map_err(|e| anyhow!("unusable argon2 parameters: {e}"))?;
+        let random_password = SaltString::generate(&mut OsRng);
+        let dummy = hash_with(
+            Argon2::new(Algorithm::Argon2id, Version::V0x13, params),
+            random_password.as_str(),
+        )?;
+        let dummy =
+            PasswordHashString::new(&dummy).map_err(|e| anyhow!("dummy hash unparseable: {e}"))?;
+
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
         Ok(AuthConfig {
-            credentials,
+            credentials: hashes,
+            dummy,
             senders,
+            failures: AuthFailureLimiter::new(AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW),
+            checks: tokio::sync::Semaphore::new(cpus),
         })
+    }
+
+    /// Returns the number of logins that can authenticate.
+    pub fn user_count(&self) -> usize {
+        self.credentials.len()
+    }
+
+    /// Returns the logins whose hash parameters are below OWASP's minimum
+    /// recommendations (see [`MIN_MEMORY_KIB`]), sorted, for a startup
+    /// warning. They still work.
+    pub fn weak_hash_users(&self) -> Vec<&str> {
+        let mut weak: Vec<&str> = self
+            .credentials
+            .iter()
+            .filter(|(_, hash)| {
+                Params::try_from(&hash.password_hash()).map_or(true, |p| {
+                    p.m_cost() < MIN_MEMORY_KIB
+                        || u64::from(p.m_cost()) * u64::from(p.t_cost())
+                            < MIN_MEMORY_TIMES_PASSES_KIB
+                })
+            })
+            .map(|(user, _)| user.as_str())
+            .collect();
+        weak.sort_unstable();
+        weak
+    }
+
+    /// Check the password `pass` for login `user`, connecting from `ip`.
+    ///
+    /// Refused at once (no hashing) when `ip` has used up its failure
+    /// budget ([`AUTH_FAILURES_PER_IP`] per [`AUTH_FAILURE_WINDOW`]).
+    /// Otherwise waits for one of the CPU-count check slots and runs
+    /// [`AuthConfig::verify`] on the blocking pool; a failure is counted
+    /// against `ip`. The caller enforces [`MAX_FAILURES_PER_SESSION`].
+    ///
+    /// Returns the outcome; a panicked check counts as [`AuthCheck::Rejected`].
+    pub async fn check(self: &Arc<Self>, ip: IpAddr, user: &str, pass: &str) -> AuthCheck {
+        if self.failures.is_blocked(ip) {
+            return AuthCheck::Blocked;
+        }
+        let accepted = {
+            let Ok(_slot) = self.checks.acquire().await else {
+                return AuthCheck::Rejected; // never closed
+            };
+            let (auth, user, pass) = (Arc::clone(self), user.to_string(), pass.to_string());
+            tokio::task::spawn_blocking(move || auth.verify(&user, &pass))
+                .await
+                .unwrap_or(false)
+        };
+        if accepted {
+            AuthCheck::Accepted
+        } else {
+            self.failures.record_failure(ip);
+            AuthCheck::Rejected
+        }
+    }
+
+    /// Check the password `pass` for login `user`. Blocking and
+    /// deliberately slow (one argon2id evaluation); use
+    /// [`AuthConfig::check`] from async code.
+    ///
+    /// Returns `true` only when `user` exists and `pass` matches. The hash
+    /// comparison is constant-time, and an unknown login is checked
+    /// against a dummy hash with the same parameters, so the time taken
+    /// reveals neither how close a guess was nor whether the login exists.
+    pub fn verify(&self, user: &str, pass: &str) -> bool {
+        let (hash, known) = match self.credentials.get(user) {
+            Some(hash) => (hash, true),
+            None => (&self.dummy, false),
+        };
+        let matches = Argon2::default()
+            .verify_password(pass.as_bytes(), &hash.password_hash())
+            .is_ok();
+        matches && known
     }
 
     /// Returns the logins that can authenticate but have no sender grants
@@ -202,12 +450,38 @@ pub fn split_address(addr: &str) -> Option<(&str, &str)> {
     (!local.is_empty() && !domain.is_empty()).then_some((local, domain))
 }
 
+/// Hash `password` with the cheapest argon2id parameters (8 KiB, 1 pass),
+/// so tests stay fast. Verification uses each hash's own parameters, so
+/// these work everywhere a real hash does.
+#[cfg(test)]
+pub(crate) fn test_hash(password: &str) -> String {
+    let params = Params::new(8, 1, 1, None).expect("valid test parameters");
+    hash_with(
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params),
+        password,
+    )
+    .expect("test hash")
+}
+
+/// A credentials file with one `user:hash` line per `(user, password)`
+/// pair, hashed with [`test_hash`].
+#[cfg(test)]
+pub(crate) fn test_credentials(users: &[(&str, &str)]) -> String {
+    users
+        .iter()
+        .map(|(user, pass)| format!("{user}:{}\n", test_hash(pass)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Logins alice, bob and carol (password `pw`) with the grants spec
+    /// `senders`.
     fn cfg(senders: &str) -> AuthConfig {
-        AuthConfig::parse("alice:pw,bob:pw,carol:pw", Some(senders)).unwrap()
+        let creds = test_credentials(&[("alice", "pw"), ("bob", "pw"), ("carol", "pw")]);
+        AuthConfig::from_credentials(&creds, Some(senders)).unwrap()
     }
 
     #[test]
@@ -234,13 +508,14 @@ mod tests {
 
     #[test]
     fn no_senders_spec_means_no_one_may_send() {
-        let c = AuthConfig::parse("alice:pw", None).unwrap();
+        let c = AuthConfig::from_credentials(&test_credentials(&[("alice", "pw")]), None).unwrap();
         assert!(!c.senders.permits("alice", "alice", "example.org"));
         assert_eq!(c.users_without_grants(), vec!["alice"]);
     }
 
     #[test]
     fn bad_specs_are_startup_errors() {
+        let creds = test_credentials(&[("alice", "pw")]);
         for bad in [
             "alice",
             "=alice@example.org",
@@ -252,13 +527,143 @@ mod tests {
             "alice=a@example.org,alice=@example.net",
         ] {
             assert!(
-                AuthConfig::parse("alice:pw", Some(bad)).is_err(),
+                AuthConfig::from_credentials(&creds, Some(bad)).is_err(),
                 "{bad:?} should be refused"
             );
         }
         // A grant for a login that can't authenticate is a typo.
-        assert!(AuthConfig::parse("alice:pw", Some("alcie=@example.org")).is_err());
-        assert!(AuthConfig::parse("alice", None).is_err());
+        assert!(AuthConfig::from_credentials(&creds, Some("alcie=@example.org")).is_err());
+    }
+
+    /// The credentials format: comments, blank lines, CRLF and spaces
+    /// around the hash are tolerated; anything that isn't an argon2id hash
+    /// (above all a plaintext password) is refused with the line number,
+    /// never echoing the value.
+    #[test]
+    fn credentials_file_format() {
+        let (a, b) = (test_hash("s3cr:et "), test_hash("pw"));
+        let c = AuthConfig::from_credentials(
+            &format!("# logins\r\n\r\n  alice : {a} \r\n\t# indented comment\nbob:{b}\n"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(c.user_count(), 2);
+        assert!(c.verify("alice", "s3cr:et "), "password kept verbatim");
+        assert!(!c.verify("alice", "s3cr:et"));
+        assert!(c.verify("bob", "pw"));
+
+        let argon2i = {
+            let params = Params::new(8, 1, 1, None).unwrap();
+            hash_with(Argon2::new(Algorithm::Argon2i, Version::V0x13, params), "x").unwrap()
+        };
+        for (bad, why) in [
+            (
+                "alice".to_string(),
+                "line 1: expected user:hash".to_string(),
+            ),
+            (format!(":{a}"), "line 1: empty user name".into()),
+            (
+                "alice:hunter2-plaintext".into(),
+                "not an argon2id hash (not a PHC".into(),
+            ),
+            ("alice:".into(), "not an argon2id hash".into()),
+            (
+                format!("alice:{argon2i}"),
+                "algorithm is argon2i, not argon2id".into(),
+            ),
+            (
+                format!("alice:{a}\nalice:{b}"),
+                "line 2: \"alice\" is listed more than once".into(),
+            ),
+            ("# only comments\n\n".into(), "no users defined".into()),
+        ] {
+            let err = AuthConfig::from_credentials(&bad, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&why), "{bad:?}: {err}");
+            assert!(!err.contains("hunter2"), "never echoes the value: {err}");
+        }
+    }
+
+    /// `verify` accepts only the right password for a known login; an
+    /// unknown login fails with any password, including one that is valid
+    /// for another login.
+    #[test]
+    fn verify_checks_user_and_password() {
+        let creds = test_credentials(&[("alice", "secret"), ("bob", "hunter2")]);
+        let c = AuthConfig::from_credentials(&creds, None).unwrap();
+        assert!(c.verify("alice", "secret"));
+        assert!(!c.verify("alice", "hunter2"), "another user's password");
+        assert!(!c.verify("alice", "secre"), "prefix");
+        assert!(!c.verify("alice", "secret!"), "longer");
+        assert!(!c.verify("alice", ""));
+        assert!(!c.verify("mallory", "secret"));
+        assert!(!c.verify("mallory", ""));
+        assert!(!c.verify("ALICE", "secret"), "logins are case-sensitive");
+    }
+
+    /// `hash-password`'s output is a default-strength argon2id hash that
+    /// loads and verifies, with a fresh salt each time; cheap test hashes
+    /// are flagged as weak, default ones aren't.
+    #[test]
+    fn default_hashes_round_trip_and_weak_ones_are_flagged() {
+        let strong = hash_password("correct horse").unwrap();
+        assert!(
+            strong.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "{strong}"
+        );
+        assert_ne!(strong, hash_password("correct horse").unwrap(), "salted");
+        let c = AuthConfig::from_credentials(
+            &format!("strong:{strong}\nweak:{}\n", test_hash("pw")),
+            None,
+        )
+        .unwrap();
+        assert!(c.verify("strong", "correct horse"));
+        assert_eq!(c.weak_hash_users(), vec!["weak"]);
+    }
+
+    /// `check` accepts the right password, counts failures per IP, and
+    /// refuses a blocked IP without checking (even the right password);
+    /// other IPs are unaffected.
+    #[tokio::test]
+    async fn check_limits_failures_per_ip() {
+        let creds = test_credentials(&[("alice", "secret")]);
+        let c = Arc::new(AuthConfig::from_credentials(&creds, None).unwrap());
+        let (ip, other): (IpAddr, IpAddr) =
+            ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+
+        assert_eq!(c.check(ip, "alice", "secret").await, AuthCheck::Accepted);
+        for _ in 0..AUTH_FAILURES_PER_IP {
+            assert_eq!(c.check(ip, "alice", "wrong").await, AuthCheck::Rejected);
+        }
+        assert_eq!(c.check(ip, "alice", "secret").await, AuthCheck::Blocked);
+        assert_eq!(c.check(other, "alice", "secret").await, AuthCheck::Accepted);
+    }
+
+    /// The file must not be readable by other users; group access is
+    /// allowed. Missing files are errors.
+    #[cfg(unix)]
+    #[test]
+    fn credentials_file_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users");
+        std::fs::write(&path, test_credentials(&[("alice", "pw")])).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(AuthConfig::load(&path, None).unwrap().verify("alice", "pw"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            AuthConfig::load(&path, None).is_ok(),
+            "group-readable is allowed"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = AuthConfig::load(&path, None).unwrap_err().to_string();
+        assert!(err.contains("accessible to other users"), "{err}");
+
+        let missing = dir.path().join("missing");
+        let err = format!("{:#}", AuthConfig::load(&missing, None).unwrap_err());
+        assert!(err.contains("cannot read credentials file"), "{err}");
     }
 
     #[test]

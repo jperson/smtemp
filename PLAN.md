@@ -1,18 +1,18 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-22** (`8e3a643` + the F7 queue-retry change): 261 tests
-pass, and clippy and fmt are clean on Rust 1.100.0.
+**As of 2026-11-23:** 273 tests pass (1 ignored), and clippy and fmt are
+clean on Rust 1.100.0.
 
-This file lists only what is **left to do**. Finished work is in git
-history, how things work is in [DESIGN.md](DESIGN.md) (its §13 lists every
-current gap), and go-live steps are in [DEPLOYMENT.md](DEPLOYMENT.md).
-Finding IDs: F-/L- are from SECURITY-AUDIT.md, S- from SECURITY.md, and
-M-/N-/H- from REPORT.md.
+This file lists only what is **left to do**. How things work is in
+[DESIGN.md](DESIGN.md) (its §13 describes every current gap), and go-live
+steps are in [DEPLOYMENT.md](DEPLOYMENT.md). Past security reviews are
+archived in [docs/reviews/](docs/reviews/README.md), which maps their
+finding IDs to where each item stands now.
 
 **V1 scope:** a receive-only hosted MX. Customers point their domain's MX
 at us, and addresses are created in an external management console. V1 has
 no relaying, sending, submission or bounces. Send-side work is post-V1
-(§5).
+(§6).
 
 ---
 
@@ -21,13 +21,13 @@ no relaying, sending, submission or bounces. Send-side work is post-V1
 | Area | Status |
 |---|---|
 | SMTP core, STARTTLS, framing and smuggling defences | ✅ Done |
-| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: M2, M5, N16 (§3) |
-| Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§4) |
-| Durable spool, maildir delivery, retry with backoff for 5 days | ✅ Done. Open: F6, M9, M14 (§3) |
-| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done. Open: F9, N10 (§3) |
-| AUTH with sender grants | ⚠️ Works, but unsafe to enable (§2.3) |
+| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, bounce alignment, and `redirect=` to a domain without a record (§2.4 item 4) |
+| Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
+| Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: duplicates on timeout, catch-all copies, maildir fsync and `tmp/` debris (§2.4) |
+| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done. Open: storage quotas and recipient probing (§2.4) |
+| AUTH with sender grants | ⚠️ Works: argon2id-hashed credentials file, attempt limits. Still advertised on port 25, so don't enable it on the MX (§2.3) |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
-| S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§4) |
+| S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§5) |
 
 ---
 
@@ -35,20 +35,20 @@ no relaying, sending, submission or bounces. Send-side work is post-V1
 
 ### 2.1 Pilot go-live (DEPLOYMENT.md)
 
-- [ ] Commit the F7 change and `SECURITY-AUDIT.md`; build the release from
-  that commit and record its hash (DEPLOYMENT A3–A4).
 - [ ] Run a dependency audit (`cargo install cargo-audit && cargo audit`)
-  and resolve its findings. This has never been run.
-- [ ] Complete DEPLOYMENT.md Phases B–H and the §6 sign-off.
+  and resolve its findings. This has never been run (DEPLOYMENT.md A2).
+- [ ] Complete the DEPLOYMENT.md checklist (Phases A–H) and the §4
+  sign-off.
 
 ### 2.2 Refactors that keep later features additive
 
-Small changes; do them before V1 so §4 doesn't become a rewrite.
+Small changes; do them before V1 so §5 doesn't become a rewrite.
 
 - [ ] **Extract a `SpoolQueue` trait** from `DiskSpool`: list,
-  `load_payload`, `record_attempt`, `remove`, `dead_letter`. It must carry
-  the F7 attempt record (`count first_failure last_failure`) and lazy
-  payload loading. Today the drain takes `&DiskSpool` directly.
+  `load_payload`, `record_attempt`, `remove`, `dead_letter`,
+  `sweep_debris`. It must carry the attempt record
+  (`count first_failure last_failure`) and lazy payload loading. Today the
+  drain takes `&DiskSpool` directly.
 - [ ] **Fix the trace-header-versus-encryption ordering.**
   - The drain prepends plaintext `Return-Path:`/`Received:` to the stored
     payload, which would corrupt mail once an encryptor is configured.
@@ -60,72 +60,109 @@ Small changes; do them before V1 so §4 doesn't become a rewrite.
 ### 2.3 Decide: AUTH in V1
 
 - [ ] Either **remove AUTH from the V1 build**, or keep it documented as
-  "never set `auth-users`". Enabling it needs all of §5's AUTH items first.
-  Today AUTH is advertised on any TLS listener, including port 25, with
-  plaintext credentials and no limit on failed attempts (F10, M16).
+  "never set `auth-users-file`".
+
+Done so far: credentials are argon2id hashes in a private file
+(`--auth-users-file`, made with `mailserv hash-password`, refused if
+other users can read it), never passwords and never argv. Checks run on
+the blocking pool with bounded concurrency, an unknown login costs the
+same as a wrong password, and failures are limited per session (3) and
+per source IP (10 per 15 minutes).
+
+Still missing before AUTH can face the internet:
+- AUTH is advertised on any TLS listener, including port 25 (a
+  submission-only listener is §6);
+- the credentials file is read only at startup (no reload on SIGHUP);
+- mechanism names are matched case-sensitively, and a client `*` abort
+  leaves the LOGIN user name behind (a later `AUTH LOGIN` then takes its
+  next line as the password for that old name).
 
 ### 2.4 Before general availability
 
 Fix these after the pilot starts and before GA, in this order:
 
-1. **Storage quotas (N10 / F8):** per-message, per-mailbox and per-domain
-   caps, plus a free-disk tempfail (`452 4.3.1`). After that, and M9,
-   `catch-all` can be offered.
-2. **Recipient probing (F9):** close the session after N refused RCPTs,
-   and keep a refused-RCPT budget per IP.
-3. **Duplicate on timeout (F6 / M11):** never let the connection cap fire
-   between the spool commit and the `250`; move fast-path delivery after
-   the reply.
-4. **Mail-loss group:**
-   - **M2:** stop charging MX/PTR address lookups to the 10-term budget,
-     but add RFC 7208 §4.6.4's 10-address cap per `mx`/`ptr`.
-   - **M5:** organisational-domain relaxed alignment. This needs a Public
-     Suffix List; vendor a dated snapshot.
-   - **N16:** HELO-identity alignment for bounces.
-5. **Catch-all copies (M9):** make the idempotency key and file name include
-   the envelope address.
+1. **Storage quotas:** per-message, per-mailbox and per-domain caps on
+   stored bytes, plus a free-disk tempfail (`452 4.3.1`). After that, and
+   item 5, `catch-all` can be offered.
+2. **Recipient probing:** close the session after N refused RCPTs, and keep
+   a refused-RCPT budget per IP (`RSET` resets today's 100-recipient cap).
+3. **Duplicates on timeout:** never let the connection cap fire between the
+   spool commit and the `250`; move fast-path delivery after the reply.
+4. **SPF and DMARC correctness** (the first three reject legitimate mail):
+   - stop charging the address lookups behind `mx` and `ptr` to SPF's
+     10-term budget, but add RFC 7208 §4.6.4's 10-address cap per
+     `mx`/`ptr`;
+   - organisational-domain relaxed DMARC alignment. This needs a Public
+     Suffix List; vendor a dated snapshot;
+   - HELO-identity SPF alignment for bounces (null sender);
+   - SPF `redirect=` to a domain with no SPF record must be PermError
+     (RFC 7208 §6.1). Today it evaluates to `None`, so a misconfigured
+     domain's mail is accepted instead of refused.
+5. **Catch-all copies:** make the delivery idempotency key and file name
+   include the envelope address, so several catch-all recipients in one
+   transaction don't collapse into one file.
 6. **What users are shown:**
-   - **M7:** add our `Authentication-Results:` and strip forged ones that
-     claim our authserv-id;
-   - **N9:** a display-name check, or document that display names are
-     unverified.
+   - add our `Authentication-Results:` and strip forged ones that claim our
+     authserv-id;
+   - a display-name check, or document that display names are unverified.
 7. **Robustness:**
-   - **M12:** an RAII guard for the per-IP connection count;
-   - **M14:** fsync the maildir directory after the rename; clean `tmp/`
-     debris;
-   - **M10:** `503` for commands before EHLO; EHLO resets the envelope;
-     allow long AUTH PLAIN initial responses;
-   - **M17:** refuse duplicate DKIM tags; check the key's `k=` against the
+   - an RAII guard for the per-IP connection count;
+   - fsync the maildir directory after the rename, and sweep old files from
+     the maildirs' `tmp/` (the spool's debris is already swept);
+   - `503` for commands before EHLO; EHLO resets the envelope; allow long
+     AUTH PLAIN initial responses;
+   - refuse duplicate DKIM tags; check the key's `k=` against the
      signature's `a=`;
-   - **L1–L9** (SECURITY-AUDIT.md), including fchown/`O_NOFOLLOW` in
-     `create_owned_dir_all`.
+   - `create_owned_dir_all`: `fchown` and `O_NOFOLLOW` instead of
+     path-based `chown`;
+   - fewer copies of the message buffer (peak memory is about 2× the
+     message size per session during DATA and up to 6× at end of data).
 8. **Assurance:** fuzz the SMTP framing, the header scanners, and the
    SPF/DMARC/DNS parsers; get an independent security review.
 
 ---
 
-## 3. Open findings index
+## 3. Open gaps index
 
-One line per open item; the detail is in DESIGN.md §13.
+One line per open item; DESIGN.md §13 has the impact of each.
 
-| ID | Summary | Planned in |
+| Gap | DESIGN §13 area | Planned in |
 |---|---|---|
-| N10 / F8 | No storage quotas or free-disk check | §2.4.1 |
-| F9 | Unlimited recipient probing per session | §2.4.2 |
-| F6 / M11 | Duplicate delivery if the cap fires after commit | §2.4.3 |
-| M2 | SPF budget over-counts MX/PTR lookups | §2.4.4 |
-| M5 | Relaxed alignment is a suffix test (no PSL) | §2.4.4 |
-| N16 | No SPF alignment for the null sender | §2.4.4 |
-| M9 | Catch-all copies collapse | §2.4.5 |
-| M7 | No `Authentication-Results:` | §2.4.6 |
-| N9 | Display-name spoofing | §2.4.6 |
-| M12, M14, M10, M17, L1–L9 | Robustness and conformance | §2.4.7 |
-| F10 / M16 | AUTH hardening | §2.3, §5 |
-| M6 (rest) | `quarantine` delivered as normal mail | Out of V1 scope (decided) |
+| No storage quotas or free-disk check | Abuse resistance | §2.4.1 |
+| Unlimited recipient probing per session | Abuse resistance | §2.4.2 |
+| Duplicate delivery if the connection cap fires after commit | Correctness and delivery | §2.4.3 |
+| SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.4 |
+| Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.4 |
+| No SPF alignment for the null sender | Correctness and delivery | §2.4.4 |
+| SPF `redirect=` to a domain without a record gives `None`, not PermError | Correctness and delivery | §2.4.4 |
+| Catch-all copies collapse | Correctness and delivery | §2.4.5 |
+| No `Authentication-Results:` | What users are shown | §2.4.6 |
+| Display-name spoofing | What users are shown | §2.4.6 |
+| Per-IP count release, maildir fsync and `tmp/`, pre-EHLO replies, DKIM tag checks, `chown` by path, memory copies | Abuse resistance; Correctness and delivery | §2.4.7 |
+| AUTH hardening | AUTH | §2.3, §6 |
+| SPF `a`/`mx` don't query AAAA; per-IP limits not aggregated per IPv6 /64 | Correctness; Abuse resistance | §6 (IPv6 readiness) |
+| `quarantine` delivered as normal mail | Correctness and delivery | Out of V1 scope (decided) |
 
 ---
 
-## 4. Feature work: hosted address service (Phase 12)
+## 4. Code quality
+
+From the design and code assessment in
+[docs/reviews/FINDINGS.md](docs/reviews/FINDINGS.md). None blocks the
+pilot; items 1–3 most reduce the kind of bug the reviews kept finding.
+
+| # | Change | Why | Effort |
+|---|---|---|---|
+| 1 | Split `mailserv/src/main.rs` (about 4,800 lines) into `config`, `server` (accept loop, limits, shutdown), `session` (`UserSession`), `headers` (From extraction, bare-CR check) and `tls` modules; introduce a `Transaction` type created at an accepted MAIL and dropped at end of data, RSET or abort | Per-message state is loose fields reset by hand in `clear_envelope`, which is how a DKIM verdict once leaked across messages | Medium |
+| 2 | One raw header scanner, in `mailparse`, used by DKIM, the From extraction and the bare-CR check; one shared mailbox-safe character set for RCPT validation and the maildir sink | Two scanners can disagree about line boundaries; two copies of a rule can drift | Small–medium |
+| 3 | Run DKIM canonicalisation and verification on the blocking pool (fetch keys first, async) | Attacker-controlled CPU work currently runs on async workers | Small |
+| 4 | Fuzz targets; make the `mailserv` integration tests use the mock DoT resolver instead of live 1.1.1.1; `cargo audit` in CI | No fuzzing; CI fails offline; dependencies unaudited | Small to set up |
+| 5 | Total lookup results (`Found / Absent / TempError`) for SPF and DKIM key lookups, matched exhaustively | Fail-closed is enforced case by case, not by the types | Medium |
+| 6 | Typed errors in `dns`/`spf`; `serde` enums with stable names for the verdicts in spool metadata (today `format!("{:?}")`) | Renaming a variant silently changes stored data | Small–medium |
+
+---
+
+## 5. Feature work: hosted address service
 
 The server is the **MX edge** of a platform. Which domains, users and
 addresses exist lives in the external console. Order: recipient authority
@@ -138,7 +175,7 @@ addresses exist lives in the external console. Order: recipient authority
 | **S3 final storage** (`DeliverySink`) | Not started; the seam is ready | An S3 sink keyed by (mailbox, queue ID), idempotent by construction |
 | **S3 spool backend** | Not started | Needs `SpoolQueue` (§2.2). Staged sync (below) |
 | **Per-user encryption at rest** | Designed (decision below), not started | Needs the ordering fix (§2.2). Then `PayloadEncryptor::encrypt` takes the recipient key set; keys are already carried in `SpoolRcpt` |
-| **Multiple MX hosts** (mx1, mx2 for the same domains) | Not started | Needs the shared S3 sink, the F6 fix, `Message-ID` + recipient deduplication in the shared store, and authority distribution (console resolver, or atomic publish to every host). Per-host limits are acceptable at first |
+| **Multiple MX hosts** (mx1, mx2 for the same domains) | Not started | Needs the shared S3 sink, the duplicate-on-timeout fix (§2.4.3), `Message-ID` + recipient deduplication in the shared store, and authority distribution (console resolver, or atomic publish to every host). Per-host limits are acceptable at first |
 | **Per-domain MX identities** (white-label) | Optional | The banner and EHLO come before RCPT, so identity must come from the listening address (needs several listeners; `--host` is one) or from SNI, which chooses the certificate (rustls `ResolvesServerCert`). `Received: by` can be per-domain. Most services use one shared MX hostname and don't need this |
 | **Verdict policy profiles** | Not started | Per-domain choice of reject versus accept-and-tag, instead of hard-coded MSA-style behaviour |
 
@@ -172,43 +209,52 @@ addresses exist lives in the external console. Order: recipient authority
 
 ---
 
-## 5. Later work
+## 6. Later work
 
 **Sending and submission (post-V1, low priority):**
 - DKIM signing.
 - Submission-only listener (587, implicit TLS 465); AUTH only there.
 - **Credential storage (decided):**
-  - **Now:** an interim secrets file, separate from the sender grants, with
-    argon2id hashes. It must be `0600`, and mailserv refuses to start if
-    others can read it. Credentials never go in argv. SIGHUP reloads it.
+  - **Done:** a credentials file separate from the sender grants
+    (`--auth-users-file`) holding argon2id hashes only, refused if other
+    users can read it; never in argv; per-session and per-IP attempt
+    limits.
+  - **Next:** reload on SIGHUP (so a login can be revoked without a
+    restart); optionally make the attempt limits configurable.
   - **Two seams:** `CredentialVerifier` (later backed by the console) and
     `SenderAuthorizer` (stays in the app).
   - **Backend constraints:** fail closed for AUTH only (never block inbound
     delivery), TTL cache, revocation without restart, and timeouts plus a
     circuit breaker.
-- AUTH hardening: attempt limiting, constant-time comparison,
-  case-insensitive mechanism names, reset LOGIN state on `*`.
+- AUTH hardening: case-insensitive mechanism names, reset LOGIN state on
+  `*`.
 - Sender grants from the console instead of `--auth-senders`.
 - OAUTHBEARER.
 
-**Protocol (Phase 9):**
+**Protocol:**
 - Advertise `8BITMIME`, `SMTPUTF8`, `PIPELINING`. Pipelining already works;
   add a test.
 - `VRFY` → `252`, `EXPN` → `502`. Both reply `250` today.
 - Refuse unadvertised ESMTP parameters with `555` (RFC 5321). Today
   everything except `SIZE=` is ignored.
 
-**Operations (Phase 10):**
+**Operations:**
 - DNS: resolver back-off when it's down, shared duplicate misses, IPv6
   resolver addresses, a second upstream.
 - IPv6 listener readiness: SPF AAAA lookups, and per-IP limits aggregated
   per /64.
-- TLS hot reload (L10), and SNI certificate selection.
+- TLS hot reload, and SNI certificate selection.
 - A metrics endpoint to replace the log-only `dns stats` and `drain pass`.
 
-**Standards and parsing (Phase 11):**
+**Standards and parsing:**
 - DMARC aggregate and failure reports (`rua`/`ruf`), `pct` sampling.
+- SPF `exp=` explanations (parsed and validated, not used).
 - ARC (needed before any forwarding role).
 - CHUNKING/BDAT, a Milter interface.
 - mailparse: RFC 2047 decoding, `Content-Disposition` (for user-facing
   tools).
+
+**Tools:**
+- `smtp-client` sends bare-LF line endings and doesn't read the greeting
+  first, so each printed reply belongs to the previous command.
+- `dnsq --tcp` is a no-op flag (TCP is already the default).

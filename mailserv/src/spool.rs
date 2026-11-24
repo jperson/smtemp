@@ -8,8 +8,9 @@
 //! under `tmp/` first, fsynced, and then renamed into `new/`, with the
 //! metadata file renamed **last**. A `{id}.json` in `new/` is therefore
 //! the commit point: a payload without metadata is an incomplete write
-//! from a crashed process, and [`DiskSpool::list`] (so the drain) ignores
-//! it.
+//! from a crashed process: [`DiskSpool::list`] (so the drain) ignores
+//! it, and the drain's [`DiskSpool::sweep_debris`] deletes it once it is
+//! old enough.
 //!
 //! [`SpoolWriter`] abstracts writes only: the drain's read side (list,
 //! load, record attempt, remove, dead-letter) uses [`DiskSpool`] directly,
@@ -415,6 +416,84 @@ impl DiskSpool {
         }
         Ok(())
     }
+
+    /// Remove crash debris older than `min_age` at `now` (Unix seconds):
+    /// every file in `tmp/`, and every `.eml` or `.attempts` file in
+    /// `new/` whose `.json` (the commit marker) is missing. None of these
+    /// is a committed message: the client never got a `250` for it (or,
+    /// for a sidecar, its message is already gone), so deleting it loses
+    /// nothing. `dead-letter/` is never touched.
+    ///
+    /// The age is taken from the file's change time (ctime), which a
+    /// rename updates, so a write in progress or a payload an operator
+    /// just moved back into `new/` (see the requeue procedure) is never
+    /// old enough to be swept; `min_age` must be far longer than any write
+    /// takes. Files whose age can't be read are left alone.
+    ///
+    /// Returns the paths removed. A file that disappears concurrently is
+    /// skipped silently.
+    ///
+    /// # Errors
+    ///
+    /// `tmp/` or `new/` cannot be listed, or a debris file exists but
+    /// cannot be removed. Files removed before the error stay removed.
+    pub fn sweep_debris(&self, now: u64, min_age: std::time::Duration) -> Result<Vec<PathBuf>> {
+        let old_enough = |path: &Path| {
+            changed_at(path).is_some_and(|at| now.saturating_sub(at) >= min_age.as_secs())
+        };
+        let mut candidates = Vec::new();
+        for entry in std::fs::read_dir(&self.tmp)
+            .with_context(|| format!("cannot read spool dir {}", self.tmp.display()))?
+        {
+            let path = entry.context("cannot list spool tmp dir")?.path();
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+        for entry in std::fs::read_dir(&self.new_dir)
+            .with_context(|| format!("cannot read spool dir {}", self.new_dir.display()))?
+        {
+            let path = entry.context("cannot list spool dir")?.path();
+            let is_part = path
+                .extension()
+                .is_some_and(|e| e == "eml" || e == "attempts");
+            if is_part && path.is_file() && !path.with_extension("json").exists() {
+                candidates.push(path);
+            }
+        }
+
+        let mut removed = Vec::new();
+        for path in candidates.into_iter().filter(|p| old_enough(p)) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot remove {}", path.display()));
+                }
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Returns when the file at `path` last changed, in Unix seconds: its
+/// ctime on Unix (updated by rename, write and chmod), its mtime
+/// elsewhere. `None` if it can't be read.
+fn changed_at(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        u64::try_from(meta.ctime()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        meta.modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    }
 }
 
 /// One committed message in the queue, as returned by [`DiskSpool::list`].
@@ -790,6 +869,50 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert!(names.is_empty(), "orphan payload left behind: {names:?}");
+    }
+
+    /// The debris sweep removes old uncommitted files (anything in tmp/,
+    /// `.eml`/`.attempts` without `.json` in new/), keeps committed
+    /// messages and dead letters, and never touches young files.
+    #[test]
+    fn sweep_removes_only_old_uncommitted_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = DiskSpool::open(dir.path(), None).unwrap();
+        let committed = spool.write(sample_meta(), b"payload").unwrap();
+        let (tmp, new) = (dir.path().join("tmp"), dir.path().join("new"));
+        let dead = dir.path().join("dead-letter");
+        std::fs::create_dir(&dead).unwrap();
+        for path in [
+            tmp.join("crashed.eml"),
+            tmp.join("crashed.json"),
+            new.join("orphan.eml"),
+            new.join("gone.attempts"),
+            dead.join("kept.eml"),
+        ] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        let hour = std::time::Duration::from_secs(3600);
+        let now = jiff::Timestamp::now().as_second() as u64;
+
+        // Everything was just written: too young to sweep.
+        assert!(spool.sweep_debris(now, hour).unwrap().is_empty());
+
+        // Two hours later, only the debris goes.
+        let mut removed: Vec<String> = spool
+            .sweep_debris(now + 2 * 3600, hour)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            ["crashed.eml", "crashed.json", "gone.attempts", "orphan.eml"]
+        );
+        assert!(new.join(format!("{committed}.eml")).exists());
+        assert!(new.join(format!("{committed}.json")).exists());
+        assert!(dead.join("kept.eml").exists());
+        assert_eq!(spool.list().unwrap().len(), 1);
     }
 
     /// `remove` (the [`SpoolWriter`] contract) tolerates unknown and

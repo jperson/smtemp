@@ -15,10 +15,9 @@ time, so the sender's server bounces it.
 | Document | What it covers |
 |---|---|
 | [DESIGN.md](DESIGN.md) | How the system works today, and its known gaps |
-| [PLAN.md](PLAN.md) | Remaining feature work and open findings |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | Readiness verdict and the go-live checklist |
-| [SECURITY-AUDIT.md](SECURITY-AUDIT.md) | Latest security audit and remediation status |
-| [FINDINGS.md](FINDINGS.md) | Design and code quality assessment, with recommended improvements |
+| [PLAN.md](PLAN.md) | Everything left to do: open gaps, code quality, features |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Readiness verdict, accepted pilot limitations, and the go-live checklist |
+| [docs/reviews/](docs/reviews/README.md) | Archived security and design reviews, with the current status of every finding |
 
 **Status:** ready for a limited, monitored pilot (see DEPLOYMENT.md §1),
 not yet for general production.
@@ -49,7 +48,7 @@ Without `--authority`, every local-part at `--domain` (and any
 `--local-domains`) is accepted. That's convenient for testing, but **never
 run an internet-facing server without `--authority`**.
 
-**Production** (receive-only: no `--auth-users`):
+**Production** (receive-only: no `--auth-users-file`):
 
 ```sh
 sudo mailserv \
@@ -147,12 +146,20 @@ Settings come from three sources; the first one that sets a value wins:
 
 | Flag / config key | Default | Description |
 |---|---|---|
-| `--auth-users` / `auth-users` | *(none)* | `user:password` pairs (comma-separated) for AUTH PLAIN/LOGIN, offered only over TLS. ⚠️ **Not for internet-facing V1 deployments.** Passwords are plaintext, failed attempts aren't limited, and AUTH is offered on any TLS listener, including port 25. |
-| `--auth-senders` / `auth-senders` | *(none)* | What each AUTH login may send as: `user=grant\|grant,…`, each grant an address (`alice@example.org`) or a whole domain (`@example.net`). An authenticated `MAIL FROM` outside the grants gets `553 5.7.1` (the null sender always does), and a `From:` author outside them gets `550 5.7.1`. A login with no grants can't send. Grants for an unknown login, or this flag without `--auth-users`, are startup errors. |
+| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read once at startup, before privileges are dropped, so it can be `root:root 0600`. A file other users can access is a startup error; a group-readable one is warned about. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). ⚠️ **Not for internet-facing V1 deployments:** AUTH is offered on any TLS listener, including port 25. The old inline `auth-users` key is a startup error. |
+| `--auth-senders` / `auth-senders` | *(none)* | What each AUTH login may send as: `user=grant\|grant,…`, each grant an address (`alice@example.org`) or a whole domain (`@example.net`). An authenticated `MAIL FROM` outside the grants gets `553 5.7.1` (the null sender always does), and a `From:` author outside them gets `550 5.7.1`. A login with no grants can't send. Grants for an unknown login, or this flag without `--auth-users-file`, are startup errors. |
 
 | Flag | Description |
 |---|---|
 | `--config <FILE>` | TOML configuration file. |
+
+To create a credentials file (the password is read without echo, twice;
+it can also be piped in):
+
+```sh
+install -m 0600 /dev/null /etc/mailserv/auth-users
+printf 'alice:%s\n' "$(mailserv hash-password)" >> /etc/mailserv/auth-users
+```
 
 ### Config file example
 
@@ -183,7 +190,7 @@ max-conn-duration-ms = 300000
 max-read-duration-ms = 15000
 shutdown-grace-ms = 60000
 
-# auth-users / auth-senders: leave unset (receive-only V1).
+# auth-users-file / auth-senders: leave unset (receive-only V1).
 ```
 
 ### Environment
@@ -261,7 +268,8 @@ Also:
 - **Delivery:** accepted mail is delivered at once. Failures are retried
   with backoff (1 minute, doubling to 1 hour) for **5 days**, then moved to
   `spool/dead-letter/` and logged at `error`. DEPLOYMENT.md H2 has the
-  requeue procedure.
+  requeue procedure. Files left behind by an interrupted write (they never
+  got a `250`) are removed from the spool once they're an hour old.
 
 ## Logging
 
@@ -283,7 +291,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 261 tests, 1 ignored
+cargo test --workspace          # 273 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```
@@ -295,7 +303,7 @@ The suite has four layers (DESIGN.md §12):
 4. **integration**, with a real rustls client against the real connection
    driver over loopback.
 
-Security regressions each have a test named after their finding.
+Every fixed security finding has a test that reproduces its attack.
 
 **Network caveat.** Tests are offline and deterministic, with two
 exceptions:
@@ -344,8 +352,8 @@ The workspace has two small tools:
   cargo run -p smtp-client -- --host 127.0.0.1 --port 2525
   ```
 - **`dnsq`** queries DNS over TCP (the default) or DNS-over-TLS
-  (`--tls`). Use it to inspect a sender's records the way the server sees
-  them:
+  (`--tls`), giving up after `--timeout-ms` (default 5000). Use it to
+  inspect a sender's records the way the server sees them:
   ```sh
   cargo run -p dnsq -- --domain _dmarc.example.com -q txt --tls --server 1.1.1.1
   ```
@@ -366,5 +374,3 @@ drill), see DEPLOYMENT.md Phase F.
 | `dns` | DNS wire codec and pipelined DNS-over-TLS client |
 | `dnsq` | DNS query CLI |
 | `smtp-client` | Demo SMTP client |
-
-claude --resume 9b13c4c1-1b39-4ce0-bc89-791acf9fc42a

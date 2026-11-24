@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 serde = { version = "1.0.210", features = ["derive"] }
 toml = "0.8"
 serde_json = "1.0.128"
+argon2 = { version = "0.5", features = ["std"] }
 
 [dev-dependencies]
 rcgen = "0.13"

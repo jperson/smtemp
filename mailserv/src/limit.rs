@@ -319,9 +319,121 @@ impl DnsLimiter {
     }
 }
 
+/// Failed AUTH attempts allowed per source IP within
+/// [`AUTH_FAILURE_WINDOW`] before AUTH is refused for that IP.
+pub const AUTH_FAILURES_PER_IP: u32 = 10;
+
+/// The fixed window over which [`AUTH_FAILURES_PER_IP`] is counted.
+pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// The most IPs [`AuthFailureLimiter`] tracks at once. Past it, expired
+/// entries are swept; if every entry is still live, a new IP is not
+/// tracked (its attempts are still bounded per session and by the
+/// verification concurrency cap).
+const AUTH_FAILURE_MAX_TRACKED: usize = 65_536;
+
+/// Per-source-IP budget of failed AUTH attempts, so a password-guessing
+/// client can't reset its budget by reconnecting.
+///
+/// A fixed window per IP: once an IP has [`AuthFailureLimiter::new`]'s
+/// `max_failures` failures within the window, [`is_blocked`] is true until
+/// the window started by its first failure ends. Successful logins don't
+/// reset the count (a login an attacker owns must not buy more guesses at
+/// other accounts). Synchronous and cheap: one map lookup under a mutex.
+///
+/// [`is_blocked`]: AuthFailureLimiter::is_blocked
+#[derive(Debug)]
+pub struct AuthFailureLimiter {
+    /// Failures allowed per IP per window.
+    max_failures: u32,
+    /// Length of the fixed window.
+    window: Duration,
+    /// IP -> (window start, failures in the window).
+    entries: std::sync::Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl AuthFailureLimiter {
+    /// A limiter allowing `max_failures` failed attempts per IP per
+    /// `window`.
+    pub fn new(max_failures: u32, window: Duration) -> Self {
+        AuthFailureLimiter {
+            max_failures,
+            window,
+            entries: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Lock the map, recovering it if a holder panicked (every update is
+    /// a single insert or field change, so it is always valid).
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, (Instant, u32)>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns whether `ip` has used up its failure budget for the current
+    /// window. Check it before verifying a password, so a blocked client
+    /// costs no hashing.
+    pub fn is_blocked(&self, ip: IpAddr) -> bool {
+        self.is_blocked_at(ip, Instant::now())
+    }
+
+    /// [`AuthFailureLimiter::is_blocked`] at time `now`.
+    fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
+        self.lock().get(&ip).is_some_and(|&(start, count)| {
+            now.duration_since(start) < self.window && count >= self.max_failures
+        })
+    }
+
+    /// Count one failed attempt from `ip`.
+    pub fn record_failure(&self, ip: IpAddr) {
+        self.record_failure_at(ip, Instant::now());
+    }
+
+    /// [`AuthFailureLimiter::record_failure`] at time `now`.
+    fn record_failure_at(&self, ip: IpAddr, now: Instant) {
+        let mut entries = self.lock();
+        if !entries.contains_key(&ip) && entries.len() >= AUTH_FAILURE_MAX_TRACKED {
+            let window = self.window;
+            entries.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if entries.len() >= AUTH_FAILURE_MAX_TRACKED {
+                return;
+            }
+        }
+        let entry = entries.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) >= self.window {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IP is blocked after its budget of failures, only for the rest of
+    /// the window, and other IPs are unaffected.
+    #[test]
+    fn auth_failures_block_per_ip_for_the_window() {
+        let limiter = AuthFailureLimiter::new(3, Duration::from_secs(60));
+        let (a, b) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        let t0 = Instant::now();
+        for _ in 0..2 {
+            limiter.record_failure_at(a, t0);
+        }
+        assert!(!limiter.is_blocked_at(a, t0), "two of three used");
+        limiter.record_failure_at(a, t0 + Duration::from_secs(10));
+        assert!(limiter.is_blocked_at(a, t0 + Duration::from_secs(10)));
+        assert!(!limiter.is_blocked_at(b, t0), "other IPs unaffected");
+
+        // The window is counted from the first failure.
+        assert!(limiter.is_blocked_at(a, t0 + Duration::from_secs(59)));
+        assert!(!limiter.is_blocked_at(a, t0 + Duration::from_secs(60)));
+        // A failure after the window starts a fresh count.
+        limiter.record_failure_at(a, t0 + Duration::from_secs(61));
+        assert!(!limiter.is_blocked_at(a, t0 + Duration::from_secs(61)));
+    }
 
     fn limiter(max_per_ip: u32, max_per_window: u32, window: Duration) -> ConnectionLimiter {
         ConnectionLimiter::new(max_per_ip, max_per_window, window)

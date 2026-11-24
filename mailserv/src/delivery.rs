@@ -291,7 +291,15 @@ pub struct DrainStats {
     pub dead_lettered: usize,
     /// Messages left untouched because their next retry is not due yet.
     pub deferred: usize,
+    /// Uncommitted crash-debris files removed by the sweep (see
+    /// [`DiskSpool::sweep_debris`]).
+    pub debris_removed: usize,
 }
+
+/// How old an uncommitted spool file must be before the drain removes it
+/// as crash debris. A write takes seconds, so an hour leaves a wide margin
+/// (and covers an operator mid-way through the requeue procedure).
+pub const DEBRIS_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The first retry interval after a failed delivery attempt. Each further
 /// failure doubles it, up to [`RETRY_MAX`].
@@ -333,7 +341,11 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 /// Run one pass of the queue drain over `spool` into `sink` at `now`
 /// (Unix seconds).
 ///
-/// For each committed message:
+/// First, crash debris older than [`DEBRIS_MIN_AGE`] is swept (see
+/// [`DiskSpool::sweep_debris`]); each removed file is logged at `warn`,
+/// and a sweep failure is logged without failing the pass.
+///
+/// Then, for each committed message:
 /// - not yet due (its last failure was less than [`retry_delay`] ago):
 ///   skipped, and its payload is not read;
 /// - payload unreadable (removed by a concurrent fast-path dequeue, or
@@ -357,6 +369,16 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 /// message; the caller logs the error and the next pass retries.
 pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<DrainStats> {
     let mut stats = DrainStats::default();
+    match spool.sweep_debris(now, DEBRIS_MIN_AGE) {
+        Ok(removed) => {
+            for path in &removed {
+                tracing::warn!(file = %path.display(), "removed uncommitted spool file (crash debris)");
+            }
+            stats.debris_removed = removed.len();
+        }
+        // Debris only costs disk space; never let it stop deliveries.
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "spool debris sweep failed"),
+    }
     for queued in spool.list()? {
         let meta = &queued.meta;
         if let Some(last) = queued.last_failure {

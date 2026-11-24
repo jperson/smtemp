@@ -700,9 +700,7 @@ fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailH
 
     for rule in item.into_inner() {
         match rule.as_rule() {
-            Rule::return_path => {
-                return_path = Some(field_value(&rule))
-            }
+            Rule::return_path => return_path = Some(field_value(&rule)),
             Rule::received => receiveds.push(rule),
             _ => continue,
         }
@@ -778,9 +776,8 @@ fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
 ///
 /// [`MailHeaderError::InvalidHeader`] for an unparseable date.
 fn resent_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    mh.resent_date.push(
-        rfc2822::parse(field_value(&item)).map_err(|_| MailHeaderError::InvalidHeader)?,
-    );
+    mh.resent_date
+        .push(rfc2822::parse(field_value(&item)).map_err(|_| MailHeaderError::InvalidHeader)?);
 
     Ok(())
 }
@@ -858,10 +855,8 @@ fn resent_sender<'p>(
 /// [`MailHeaderError::InvalidHeader`] for an unparseable date.
 fn orig_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.orig_date.is_none() {
-        mh.orig_date = Some(
-            rfc2822::parse(field_value(&item))
-                .map_err(|_| MailHeaderError::InvalidHeader)?,
-        )
+        mh.orig_date =
+            Some(rfc2822::parse(field_value(&item)).map_err(|_| MailHeaderError::InvalidHeader)?)
     }
     Ok(())
 }
@@ -1836,7 +1831,11 @@ VGVzdA==
             let date = mh.orig_date.as_ref().expect("Date parsed");
             assert_eq!(date.timestamp().as_second(), 1_637_446_921, "{sep:?}");
             assert_eq!(mh.resent_date.len(), 1, "{sep:?}");
-            assert!(mh.optional_field.is_empty(), "{sep:?}: {:?}", mh.optional_field);
+            assert!(
+                mh.optional_field.is_empty(),
+                "{sep:?}: {:?}",
+                mh.optional_field
+            );
         }
     }
 

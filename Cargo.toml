@@ -19,3 +19,11 @@ pest = "2.7.15"
 pest_derive = { version = "2.7.15", features = ["grammar-extras"] }
 jiff = "0.2.5"
 
+
+# argon2id is deliberately slow; unoptimized it is far slower still, which
+# makes debug builds (tests, `cargo run`) take seconds per AUTH attempt.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

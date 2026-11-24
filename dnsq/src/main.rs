@@ -87,6 +87,10 @@ struct Args {
     /// Resolver to send the query to.
     #[arg(long, default_value = "1.1.1.1")]
     server: Ipv4Addr,
+    /// Give up if the whole exchange (connect, handshake, answer) takes
+    /// longer than this many milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5000)]
+    timeout_ms: u64,
 }
 
 /// Send one DNS query as described by [`Args`] and print the parsed
@@ -101,14 +105,28 @@ async fn main() -> Result<()> {
     let _app_name = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")).to_string();
     let args = Args::parse();
     let query_type = args.query_type as u16;
+    let timeout = std::time::Duration::from_millis(args.timeout_ms);
 
-    if args.tls {
-        let dq = query_tls(&args.server, &args.domain, query_type, args.record_class).await?;
-        println!("{}", serde_json::to_string(&dq)?);
+    let dq = if args.tls {
+        query_tls(
+            &args.server,
+            &args.domain,
+            query_type,
+            args.record_class,
+            timeout,
+        )
+        .await?
     } else {
-        let dq = query_tcp(&args.server, &args.domain, query_type, args.record_class).await?;
-        println!("{}", serde_json::to_string(&dq)?);
-    }
+        query_tcp(
+            &args.server,
+            &args.domain,
+            query_type,
+            args.record_class,
+            timeout,
+        )
+        .await?
+    };
+    println!("{}", serde_json::to_string(&dq)?);
 
     Ok(())
 }

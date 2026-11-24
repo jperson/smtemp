@@ -8,7 +8,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use rand::prelude::*;
-use rand::rngs::StdRng;
 use rustls_pki_types::{CertificateDer, ServerName};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -68,100 +67,162 @@ fn validate_response(query: &DnsMessage, resp: &DnsMessage) -> Result<()> {
 /// Send one query for `domain` (`record_type`, `record_class`) to the
 /// resolver `dest` over DNS-over-TLS (port 853): the authenticated,
 /// preferred transport. A one-shot connection verified against the
-/// public webpki roots; no timeout is applied (long-running callers use
-/// [`DnsClient`]).
+/// public webpki roots (long-running callers use [`DnsClient`]).
+/// `timeout` bounds the whole exchange: connect, TLS handshake, query
+/// and response.
 ///
 /// Returns the response, validated (ID, QR, question echo, EDNS0
 /// conformance).
 ///
 /// # Errors
 ///
-/// An invalid name ([`proto::InvalidName`]), a connection, TLS or I/O
-/// failure, or a malformed or invalid response.
-pub async fn query_tls<'query>(
-    dest: &'query Ipv4Addr,
-    domain: &'query str,
+/// An invalid name ([`proto::InvalidName`]), the `timeout` elapsing, a
+/// connection, TLS or I/O failure, or a malformed or invalid response.
+pub async fn query_tls(
+    dest: &Ipv4Addr,
+    domain: &str,
     record_type: u16,
     record_class: u16,
+    timeout: Duration,
 ) -> Result<DnsMessage> {
-    let mut rng = StdRng::from_entropy();
-    let id: u16 = rng.gen();
-
-    let question = DnsQuestion {
-        name: Label::new(proto::normalize_name(domain)?.to_string()),
-        record_type,
-        record_class,
-    };
-
-    let msg = DnsMessage::new(id, vec![question]);
-    let query = msg.to_vec()?;
-
     let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
     root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
     let config = ClientConfig::builder()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-    let stream = TcpStream::connect(format!("{}:853", dest)).await?;
-    let dnsname = ServerName::try_from(dest.to_string()).unwrap().to_owned();
-
-    let mut stream = connector.connect(dnsname, stream).await?;
-
-    stream.write_u16(query.len() as u16).await?;
-    stream.write_all(query.as_slice()).await?;
-
-    let len: u16 = stream.read_u16().await?;
-    let mut buf = vec![0; len.into()];
-    let count = stream.read_exact(&mut buf).await?;
-
-    let (_, dq) = DnsMessage::from_bytes(&buf[0..count])?;
-    validate_response(&msg, &dq)?;
-    dq.edns0()?;
-    Ok(dq)
+    let endpoint = std::net::SocketAddr::from((*dest, 853));
+    query_tls_at(
+        endpoint,
+        Arc::new(config),
+        domain,
+        record_type,
+        record_class,
+        timeout,
+    )
+    .await
 }
 
 /// Send one query for `domain` (`record_type`, `record_class`) to the
-/// resolver `dest` over plain TCP (port 53). Unauthenticated and with no
-/// timeout; prefer [`query_tls`].
+/// resolver `dest` over plain TCP (port 53). Unauthenticated; prefer
+/// [`query_tls`]. `timeout` bounds the whole exchange: connect, query and
+/// response.
 ///
 /// Returns the response, validated (ID, QR, question echo, EDNS0
 /// conformance).
 ///
 /// # Errors
 ///
-/// An invalid name ([`proto::InvalidName`]), a connection or I/O
-/// failure, or a malformed or invalid response.
-pub async fn query_tcp<'query>(
-    dest: &'query Ipv4Addr,
-    domain: &'query str,
+/// An invalid name ([`proto::InvalidName`]), the `timeout` elapsing, a
+/// connection or I/O failure, or a malformed or invalid response.
+pub async fn query_tcp(
+    dest: &Ipv4Addr,
+    domain: &str,
     record_type: u16,
     record_class: u16,
+    timeout: Duration,
 ) -> Result<DnsMessage> {
-    let mut rng = rand::thread_rng();
-    let id: u16 = rng.gen();
+    let endpoint = std::net::SocketAddr::from((*dest, 53));
+    query_tcp_at(endpoint, domain, record_type, record_class, timeout).await
+}
 
+/// Build the one-shot query for `domain` (`record_type`,
+/// `record_class`) with a random transaction ID.
+///
+/// Returns the message (for validating the response) and its wire bytes.
+///
+/// # Errors
+///
+/// An invalid name ([`proto::InvalidName`]).
+fn one_shot_query(
+    domain: &str,
+    record_type: u16,
+    record_class: u16,
+) -> Result<(DnsMessage, Vec<u8>)> {
+    let id: u16 = rand::thread_rng().gen();
     let question = DnsQuestion {
         name: Label::new(proto::normalize_name(domain)?.to_string()),
         record_type,
         record_class,
     };
-
     let msg = DnsMessage::new(id, vec![question]);
-    let query = msg.to_vec()?;
-    let mut stream = TcpStream::connect(format!("{}:53", dest)).await?;
+    let bytes = msg.to_vec()?;
+    Ok((msg, bytes))
+}
 
-    stream.write_u16(query.len() as u16).await?;
-    stream.write_all(query.as_slice()).await?;
+/// Write the length-prefixed `query` to `stream`, read one
+/// length-prefixed response, and check that it answers `msg`.
+///
+/// # Errors
+///
+/// I/O failures, or a malformed or invalid response.
+async fn exchange_framed<S>(stream: &mut S, msg: &DnsMessage, query: &[u8]) -> Result<DnsMessage>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let len = u16::try_from(query.len()).context("DNS query too large")?;
+    stream.write_u16(len).await?;
+    stream.write_all(query).await?;
 
     let len: u16 = stream.read_u16().await?;
     let mut buf = vec![0; len.into()];
-    let count = stream.read_exact(&mut buf).await?;
+    stream.read_exact(&mut buf).await?;
 
-    let (_, dq) = DnsMessage::from_bytes(&buf[0..count])?;
-    validate_response(&msg, &dq)?;
-    dq.edns0()?;
-    Ok(dq)
+    let (_, resp) = DnsMessage::from_bytes(&buf)?;
+    validate_response(msg, &resp)?;
+    resp.edns0()?;
+    Ok(resp)
+}
+
+/// [`query_tls`] against an explicit `endpoint` with TLS configuration
+/// `config`; the certificate must name the endpoint's IP address. Test
+/// seam for a local resolver on an ephemeral port.
+///
+/// # Errors
+///
+/// As for [`query_tls`].
+async fn query_tls_at(
+    endpoint: std::net::SocketAddr,
+    config: Arc<ClientConfig>,
+    domain: &str,
+    record_type: u16,
+    record_class: u16,
+    timeout: Duration,
+) -> Result<DnsMessage> {
+    let (msg, query) = one_shot_query(domain, record_type, record_class)?;
+    let exchange = async {
+        let stream = TcpStream::connect(endpoint).await?;
+        let server_name = ServerName::from(endpoint.ip());
+        let mut stream = TlsConnector::from(config)
+            .connect(server_name, stream)
+            .await?;
+        exchange_framed(&mut stream, &msg, &query).await
+    };
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| anyhow!("DNS query to {endpoint} timed out after {timeout:?}"))?
+}
+
+/// [`query_tcp`] against an explicit `endpoint`. Test seam for a local
+/// resolver on an ephemeral port.
+///
+/// # Errors
+///
+/// As for [`query_tcp`].
+async fn query_tcp_at(
+    endpoint: std::net::SocketAddr,
+    domain: &str,
+    record_type: u16,
+    record_class: u16,
+    timeout: Duration,
+) -> Result<DnsMessage> {
+    let (msg, query) = one_shot_query(domain, record_type, record_class)?;
+    let exchange = async {
+        let mut stream = TcpStream::connect(endpoint).await?;
+        exchange_framed(&mut stream, &msg, &query).await
+    };
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| anyhow!("DNS query to {endpoint} timed out after {timeout:?}"))?
 }
 
 // -- Shared client: connection reuse + TTL result cache ---------------
@@ -1299,6 +1360,61 @@ mod tests {
         });
 
         (addr, cert_der, conns, queries)
+    }
+
+    /// A listener that accepts connections and never sends a byte (a
+    /// stalled resolver). Returns its address.
+    async fn spawn_silent_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // keep it open, never answer
+            }
+        });
+        addr
+    }
+
+    /// The one-shot DoT query answers through a real TLS exchange.
+    #[tokio::test]
+    async fn one_shot_tls_query_answers() {
+        let (addr, server_cert, _conns, queries) = spawn_mock_dot(None).await;
+        let mut roots = RootCertStore::empty();
+        roots.add(server_cert).unwrap();
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let resp = query_tls_at(addr, config, "a.test", 1, 1, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(matches!(resp.answers[0].rdata, QType::A(_)));
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Against a resolver that never answers, both one-shot transports
+    /// give up at their timeout instead of hanging: the TLS one during
+    /// the handshake, the TCP one waiting for the response.
+    #[tokio::test]
+    async fn one_shot_queries_time_out() {
+        let addr = spawn_silent_listener().await;
+        let timeout = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let err = query_tcp_at(addr, "a.test", 1, 1, timeout)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let started = Instant::now();
+        let err = query_tls_at(addr, default_client_config(), "a.test", 1, 1, timeout)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     /// `--resolver-ca`: extra roots are added to the

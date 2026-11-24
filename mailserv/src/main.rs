@@ -26,6 +26,7 @@ mod auth;
 mod authority;
 mod delivery;
 mod fsutil;
+mod hashpw;
 mod limit;
 mod privdrop;
 mod spool;
@@ -52,6 +53,10 @@ struct DkimSummary {
 #[derive(Parser, Debug, Clone, Default)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// A utility to run instead of the server.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Address to listen on (default 0.0.0.0).
     #[arg(long)]
     host: Option<String>,
@@ -104,11 +109,13 @@ struct Args {
     #[arg(long)]
     tls_key: Option<String>,
 
-    /// SASL credentials for AUTH PLAIN/LOGIN, as user:password pairs
-    /// (comma-separated). Only offered over TLS. Example:
-    /// --auth-users alice:secret,bob:hunter2
-    #[arg(long)]
-    auth_users: Option<String>,
+    /// File of SASL credentials for AUTH PLAIN/LOGIN: one user:hash per
+    /// line, where hash is an argon2id string from `mailserv
+    /// hash-password`; # comments allowed. Must not be accessible to other
+    /// users (chmod 600 or 640). Read at startup, before privileges are
+    /// dropped. AUTH is only offered over TLS.
+    #[arg(long, value_name = "FILE")]
+    auth_users_file: Option<String>,
 
     /// Addresses each AUTH login may send as (MAIL FROM and every From:
     /// author), as user=grant|grant entries (comma-separated); a grant is an
@@ -180,7 +187,7 @@ struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
-    /// tls-cert, tls-key, auth-users, auth-senders, resolver, resolver-ca,
+    /// tls-cert, tls-key, auth-users-file, auth-senders, resolver, resolver-ca,
     /// dns-connections, spool-dir, maildir-dir, max-connections,
     /// max-conn-per-ip, max-conn-rate-per-ip, max-dns-per-ip, user, group,
     /// shutdown-grace-ms, local-domains, authority); every key optional.
@@ -188,9 +195,17 @@ struct Args {
     config: Option<String>,
 }
 
-/// The TOML config file schema ([`Args::config`]). Every field mirrors
-/// the [`Args`] flag of the same name (kebab-case in the file) and is
-/// optional; unknown keys are ignored.
+/// Utilities run instead of the server.
+#[derive(clap::Subcommand, Debug, Clone)]
+enum Command {
+    /// Read a password from stdin (hidden when it's a terminal) and print
+    /// its argon2id hash for a line `user:<hash>` in --auth-users-file.
+    HashPassword,
+}
+
+/// The TOML config file schema ([`Args::config`]). Every field except
+/// `auth_users` mirrors the [`Args`] flag of the same name (kebab-case in
+/// the file) and is optional; unknown keys are ignored.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct FileConfig {
@@ -206,7 +221,11 @@ struct FileConfig {
     max_dns_per_ip: Option<usize>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
-    auth_users: Option<String>,
+    /// The removed inline-credentials key. Parsed only so that an old
+    /// config file is refused with a pointer to `auth-users-file`, rather
+    /// than silently ignored (which would turn AUTH off).
+    auth_users: Option<toml::Value>,
+    auth_users_file: Option<String>,
     auth_senders: Option<String>,
     resolver: Option<Ipv4Addr>,
     resolver_ca: Option<String>,
@@ -250,8 +269,8 @@ struct Config {
     tls_cert: Option<String>,
     /// PEM private key for STARTTLS.
     tls_key: Option<String>,
-    /// AUTH credentials (`auth::AuthConfig` users spec).
-    auth_users: Option<String>,
+    /// AUTH credentials file (see `auth::AuthConfig::from_credentials`).
+    auth_users_file: Option<String>,
     /// Sender grants for AUTH logins (`auth::SenderGrants` spec).
     auth_senders: Option<String>,
     /// DNS-over-TLS resolver address; always resolved (default 1.1.1.1).
@@ -359,9 +378,16 @@ const DEFAULT_MAILDIR_DIR: &str = "/var/lib/mailserv/maildir";
 /// # Errors
 ///
 /// No domain is configured, `max-dns-per-ip` is 0, `dns-connections` is
-/// outside `1..=dns::MAX_CONNECTIONS`, or a group is given without a
-/// user.
+/// outside `1..=dns::MAX_CONNECTIONS`, a group is given without a user,
+/// or the file uses the removed `auth-users` key.
 fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
+    if file.auth_users.is_some() {
+        anyhow::bail!(
+            "the auth-users config key has been removed: put one user:hash line per login \
+             (hash from `mailserv hash-password`) in a file readable only by root or the \
+             service user, and set auth-users-file"
+        );
+    }
     let cli_or_file_user_set = cli.user.is_some() || file.user.is_some();
     Ok(Config {
         host: cli
@@ -401,7 +427,7 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         },
         tls_cert: cli.tls_cert.or(file.tls_cert),
         tls_key: cli.tls_key.or(file.tls_key),
-        auth_users: cli.auth_users.or(file.auth_users),
+        auth_users_file: cli.auth_users_file.or(file.auth_users_file),
         auth_senders: cli.auth_senders.or(file.auth_senders),
         resolver: cli.resolver.or(file.resolver).unwrap_or_else(|| {
             DEFAULT_RESOLVER
@@ -455,6 +481,10 @@ const SENDER_NOT_OWNED: &[u8] = b"553 5.7.1 Sender address not owned by authenti
 /// An authenticated user's message has a `From:` author their login may
 /// not use (RFC 3463 5.7.1).
 const FROM_NOT_OWNED: &[u8] = b"550 5.7.1 From address not owned by authenticated user\r\n";
+/// AUTH refused without checking: this session or its source IP has used
+/// up its failure budget (RFC 4954 §6: temporary authentication failure).
+const AUTH_TOO_MANY_FAILURES: &[u8] =
+    b"454 4.7.0 Too many failed authentication attempts, try again later\r\n";
 /// Malformed address in a MAIL FROM path.
 const BAD_ADDRESS: &[u8] = b"501 5.1.7 Bad sender address syntax\r\n";
 /// Malformed or unacceptable address in a RCPT TO path (RFC 3463: 5.1.3
@@ -1111,6 +1141,9 @@ struct UserSession<'session> {
     auth: Option<Arc<auth::AuthConfig>>,
     /// The authenticated identity for this connection, if any.
     authenticated: Option<String>,
+    /// Failed AUTH attempts on this connection (capped at
+    /// [`auth::MAX_FAILURES_PER_SESSION`]; survives STARTTLS).
+    auth_failures: u32,
     /// AUTH LOGIN continuation state: the user name already received.
     auth_login_user: Option<String>,
     /// The mechanism of the in-progress AUTH continuation.
@@ -1169,6 +1202,7 @@ impl<'session> UserSession<'session> {
             starttls_available,
             auth: cfg.auth.clone(),
             authenticated: None,
+            auth_failures: 0,
             auth_login_user: None,
             auth_pending: None,
             authority: cfg.authority.clone(),
@@ -1242,28 +1276,39 @@ impl<'session> UserSession<'session> {
         smtp::Control::tempfail(EOD_DNS_TIMEOUT)
     }
 
-    /// Check `user`/`pass` against the credential store `users`; on a
-    /// match, the session becomes authenticated as `user`.
+    /// Check `user`/`pass` against `auth` (an argon2id check on the
+    /// blocking pool, rate-limited per source IP; see
+    /// [`auth::AuthConfig::check`]); on a match, the session becomes
+    /// authenticated as `user`.
     ///
-    /// Returns `235` on success, `535` otherwise.
-    fn verify_credentials(
+    /// Returns `235` on success and `535` on a mismatch. Once this
+    /// session has failed [`auth::MAX_FAILURES_PER_SESSION`] times, or
+    /// its IP has used up its failure budget, returns `454` without
+    /// checking anything.
+    async fn verify_credentials(
         &mut self,
-        users: &HashMap<String, String>,
+        auth: &Arc<auth::AuthConfig>,
         user: &str,
         pass: &str,
     ) -> smtp::Control {
-        // The comparison is a plain map lookup (local credential store, no
-        // remote timing oracle worth worrying about); never log the
-        // password.
-        match users.get(user) {
-            Some(p) if p == pass => {
+        if self.auth_failures >= auth::MAX_FAILURES_PER_SESSION {
+            return smtp::Control::tempfail(AUTH_TOO_MANY_FAILURES);
+        }
+        // Never log the password.
+        match auth.check(self.peer.ip(), user, pass).await {
+            auth::AuthCheck::Accepted => {
                 self.authenticated = Some(user.to_string());
                 info!(user = %user, "authenticated");
                 smtp::Control::accept(b"235 2.7.0 Authentication successful\r\n")
             }
-            _ => {
-                info!(user = %user, "authentication failed");
+            auth::AuthCheck::Rejected => {
+                self.auth_failures += 1;
+                info!(user = %user, failures = self.auth_failures, "authentication failed");
                 smtp::Control::reject(b"535 5.7.8 Authentication credentials invalid\r\n")
+            }
+            auth::AuthCheck::Blocked => {
+                warn!(user = %user, "authentication refused: too many failures from this address");
+                smtp::Control::tempfail(AUTH_TOO_MANY_FAILURES)
             }
         }
     }
@@ -1410,7 +1455,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                     .as_deref()
                     .and_then(smtp::decode_plain)
                 {
-                    Some((user, pass)) => self.verify_credentials(&users.credentials, &user, &pass),
+                    Some((user, pass)) => self.verify_credentials(&users, &user, &pass).await,
                     None => smtp::Control::reject(b"501 5.5.2 Invalid base64 data\r\n"),
                 }
             }
@@ -1442,13 +1487,13 @@ impl smtp::SmtpSession for UserSession<'_> {
         };
         match self.auth_pending.take() {
             Some("PLAIN") => match smtp::decode_plain(&data) {
-                Some((user, pass)) => self.verify_credentials(&users.credentials, &user, &pass),
+                Some((user, pass)) => self.verify_credentials(&users, &user, &pass).await,
                 None => smtp::Control::reject(b"501 5.5.2 Invalid PLAIN response\r\n"),
             },
             Some("LOGIN") => {
                 if let Some(user) = self.auth_login_user.take() {
                     let pass = String::from_utf8_lossy(&data).into_owned();
-                    self.verify_credentials(&users.credentials, &user, &pass)
+                    self.verify_credentials(&users, &user, &pass).await
                 } else {
                     self.auth_login_user = Some(String::from_utf8_lossy(&data).into_owned());
                     self.auth_pending = Some("LOGIN");
@@ -2114,7 +2159,9 @@ impl smtp::SmtpSession for UserSession<'_> {
 /// Start the server: set up logging, resolve the configuration, bind the
 /// listener (dropping root privileges right after), open the authority,
 /// spool and maildirs, start the drain and DNS-stats tasks, then accept
-/// connections until SIGTERM/SIGINT and shut down gracefully.
+/// connections until SIGTERM/SIGINT and shut down gracefully. With the
+/// `hash-password` subcommand, run that utility instead (see
+/// [`hashpw::run`]).
 ///
 /// # Errors
 ///
@@ -2125,6 +2172,13 @@ impl smtp::SmtpSession for UserSession<'_> {
 /// returned.
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+    // Utilities run before logging is set up, so stdout carries only
+    // their output.
+    if let Some(Command::HashPassword) = args.command {
+        return hashpw::run();
+    }
+
     let app_name = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")).to_string();
 
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
@@ -2142,7 +2196,6 @@ async fn main() -> Result<()> {
     // user. The spool and maildirs also set 0600/0700 explicitly.
     privdrop::restrict_umask();
 
-    let args = Args::parse();
     let file_config = match &args.config {
         Some(path) => {
             let raw = tokio::fs::read_to_string(path).await?;
@@ -2189,18 +2242,37 @@ async fn main() -> Result<()> {
         None => dns_client,
     });
 
-    let auth = match &config.auth_users {
-        Some(spec) if !spec.is_empty() => {
-            let auth = auth::AuthConfig::parse(spec, config.auth_senders.as_deref())?;
+    // AUTH credentials are read here, while still privileged, so the file
+    // can be root-owned and private.
+    let auth = match &config.auth_users_file {
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            let auth = auth::AuthConfig::load(path, config.auth_senders.as_deref())?;
+            if let Some(bits) = fsutil::shared_bits(path).filter(|b| b & 0o070 != 0) {
+                warn!(
+                    file = %path.display(),
+                    open_bits = %format!("{bits:03o}"),
+                    "credentials file is readable by its group; consider chmod 600"
+                );
+            }
             info!(
+                file = %path.display(),
                 "AUTH PLAIN/LOGIN available ({} user(s))",
-                auth.credentials.len()
+                auth.user_count()
             );
             let unable = auth.users_without_grants();
             if !unable.is_empty() {
                 warn!(
                     users = ?unable,
                     "AUTH users without --auth-senders grants can authenticate but not send"
+                );
+            }
+            let weak = auth.weak_hash_users();
+            if !weak.is_empty() {
+                warn!(
+                    users = ?weak,
+                    "AUTH password hashes below OWASP's minimum argon2id cost; \
+                     re-hash with `mailserv hash-password`"
                 );
             }
             Some(Arc::new(auth))
@@ -2211,7 +2283,7 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .is_some_and(|s| !s.is_empty())
             {
-                anyhow::bail!("--auth-senders needs --auth-users");
+                anyhow::bail!("--auth-senders needs --auth-users-file");
             }
             None
         }
@@ -2323,7 +2395,8 @@ async fn main() -> Result<()> {
     // The drain is the retry engine: it delivers whatever the fast path
     // could not (crashes, sink failures), removes fully delivered
     // messages, retries failures with backoff, and dead-letters messages
-    // still failing after the queue lifetime. The first pass runs
+    // still failing after the queue lifetime; each pass also sweeps old
+    // uncommitted crash debris from the spool. The first pass runs
     // immediately at startup (recovering anything queued before a
     // restart); later passes run every 60 s. Delivery failures inside a
     // pass leave the message queued; a spool I/O error ends that pass,
@@ -2351,6 +2424,7 @@ async fn main() -> Result<()> {
                             + stats.retrying
                             + stats.dead_lettered
                             + stats.deferred
+                            + stats.debris_removed
                             > 0 =>
                     {
                         info!(
@@ -2358,6 +2432,7 @@ async fn main() -> Result<()> {
                             retrying = stats.retrying,
                             deferred = stats.deferred,
                             dead_lettered = stats.dead_lettered,
+                            debris_removed = stats.debris_removed,
                             queued = stats.retrying + stats.deferred,
                             "drain pass"
                         );
@@ -3243,6 +3318,31 @@ mod tests {
         assert_eq!(resolved.group, None);
     }
 
+    /// `auth-users-file` resolves CLI > file, and a config file that still
+    /// uses the removed inline `auth-users` key is a startup error rather
+    /// than AUTH silently turning off. The CLI flag no longer exists.
+    #[test]
+    fn auth_users_file_resolution() {
+        use clap::Parser as _;
+        let args = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+        let file: FileConfig = toml::from_str(r#"auth-users-file = "/etc/a""#).unwrap();
+        let resolved = resolve_config(args(&[]), file.clone()).unwrap();
+        assert_eq!(resolved.auth_users_file.as_deref(), Some("/etc/a"));
+        let resolved = resolve_config(args(&["--auth-users-file", "/etc/b"]), file).unwrap();
+        assert_eq!(resolved.auth_users_file.as_deref(), Some("/etc/b"));
+
+        let old: FileConfig = toml::from_str(r#"auth-users = "alice:secret""#).unwrap();
+        let err = resolve_config(args(&[]), old).unwrap_err().to_string();
+        assert!(err.contains("auth-users-file"), "{err}");
+        assert!(!err.contains("secret"), "never echoes the old value: {err}");
+
+        assert!(Args::try_parse_from(["mailserv", "--auth-users", "a:b"]).is_err());
+    }
+
     /// `user`, `group` and `shutdown-grace-ms` resolve CLI > file;
     /// `group` without `user` is a configuration error.
     #[test]
@@ -3518,9 +3618,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let auth =
-            auth::AuthConfig::parse("alice:secret", Some("alice=alice@spfless-domain-xyz.test"))
-                .unwrap();
+        let auth = auth::AuthConfig::from_credentials(
+            &auth::test_credentials(&[("alice", "secret")]),
+            Some("alice=alice@spfless-domain-xyz.test"),
+        )
+        .unwrap();
         let addr = spawn_server(Some(acceptor), Some(Arc::new(auth)), None, None, None, None).await;
 
         // --- Plaintext: AUTH is neither advertised nor accepted.
@@ -4732,13 +4834,45 @@ mod from_validation_tests {
     fn session_cfg(dir: &std::path::Path) -> SessionConfig {
         let mut cfg = tests::size_limit_session(dir);
         cfg.auth = Some(Arc::new(
-            auth::AuthConfig::parse(
-                "alice:pw,carol:pw",
+            auth::AuthConfig::from_credentials(
+                &auth::test_credentials(&[("alice", "pw"), ("carol", "pw")]),
                 Some("alice=alice@example.org|@alice.example"),
             )
             .unwrap(),
         ));
         cfg
+    }
+
+    /// A session gets `MAX_FAILURES_PER_SESSION` wrong passwords; after
+    /// that every AUTH attempt, even with the right password, gets `454`
+    /// without a check, through both PLAIN and LOGIN.
+    #[tokio::test]
+    async fn auth_failures_are_limited_per_session() {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg(dir.path());
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.tls_active = true;
+
+        let wrong = b64("\0alice\0wrong");
+        for _ in 0..auth::MAX_FAILURES_PER_SESSION {
+            let reply = s.auth("PLAIN", Some(wrong.as_bytes())).await.into_reply();
+            assert_eq!(reply, b"535 5.7.8 Authentication credentials invalid\r\n");
+        }
+        let right = b64("\0alice\0pw");
+        assert_eq!(
+            s.auth("PLAIN", Some(right.as_bytes())).await.into_reply(),
+            AUTH_TOO_MANY_FAILURES
+        );
+        // LOGIN reaches the same check at its password step.
+        assert!(s.auth("LOGIN", None).await.reply().starts_with(b"334 "));
+        s.auth_line(b64("alice").as_bytes()).await;
+        assert_eq!(
+            s.auth_line(b64("pw").as_bytes()).await.into_reply(),
+            AUTH_TOO_MANY_FAILURES
+        );
+        assert_eq!(s.authenticated, None);
     }
 
     /// MAIL FROM of an authenticated session is limited to the login's

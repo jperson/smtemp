@@ -52,11 +52,6 @@ pub enum DkimError {
     #[error("unsupported hash or key algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
-    /// The DKIM-Signature header was not valid UTF-8. Not currently
-    /// produced: [`find_signatures`] skips such headers.
-    #[error("invalid UTF-8 in DKIM-Signature header")]
-    InvalidUtf8,
-
     /// The DNS query for the key record failed (resolver unreachable,
     /// timeout, invalid name).
     #[error("DNS lookup for the public key failed: {0}")]

@@ -18,7 +18,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum DmarcError {
     /// The record does not parse; the payload names the offending tag
-    /// (`v`, `v missing`, `p`, `adkim`, `aspf`, `pct`).
+    /// (`v`, `v missing`, `p`, `p missing`, `adkim`, `aspf`, `pct`).
     #[error("invalid DMARC record: {0}")]
     Invalid(&'static str),
     /// More than one parseable DMARC record at the name.
@@ -66,8 +66,8 @@ impl DmarcRecord {
     /// # Errors
     ///
     /// [`DmarcError::Invalid`] for a missing or wrong `v=`, a missing
-    /// `p=` (reported as `v`), or an unusable `p=`, `sp=`, `adkim=`,
-    /// `aspf=` or `pct=` value.
+    /// `p=`, or an unusable `p=`, `sp=`, `adkim=`, `aspf=` or `pct=`
+    /// value.
     pub fn parse(txt: &str) -> Result<Self, DmarcError> {
         let mut version = None;
         let mut policy = None;
@@ -117,6 +117,7 @@ impl DmarcRecord {
                 aspf_strict,
                 pct,
             }),
+            (Some("DMARC1"), None) => Err(DmarcError::Invalid("p missing")),
             (Some(_), _) => Err(DmarcError::Invalid("v")),
             (None, _) => Err(DmarcError::Invalid("v missing")),
         }
@@ -390,13 +391,19 @@ mod tests {
         assert_eq!(r.pct, 25);
     }
 
+    /// Invalid records are refused, and the error names the offending tag.
     #[test]
     fn parse_rejects_invalid_records() {
-        assert!(DmarcRecord::parse("v=SPF1; p=reject").is_err()); // wrong version
-        assert!(DmarcRecord::parse("p=reject").is_err()); // no version
-        assert!(DmarcRecord::parse("v=DMARC1").is_err()); // no policy
-        assert!(DmarcRecord::parse("v=DMARC1; p=nonsense").is_err());
-        assert!(DmarcRecord::parse("v=DMARC1; p=reject; adkim=x").is_err());
+        let tag = |txt: &str| match DmarcRecord::parse(txt) {
+            Err(DmarcError::Invalid(tag)) => tag,
+            other => panic!("{txt:?}: {other:?}"),
+        };
+        assert_eq!(tag("v=SPF1; p=reject"), "v");
+        assert_eq!(tag("p=reject"), "v missing");
+        assert_eq!(tag("v=DMARC1"), "p missing");
+        assert_eq!(tag("v=DMARC1; sp=reject"), "p missing");
+        assert_eq!(tag("v=DMARC1; p=nonsense"), "p");
+        assert_eq!(tag("v=DMARC1; p=reject; adkim=x"), "adkim");
     }
 
     #[test]

@@ -731,9 +731,11 @@ mod tests {
         ));
     }
 
-    /// Catch-all routes unknown addresses to the designated inbox; when
-    /// the inbox is not itself a known mailbox, its address doubles as
-    /// the user.
+    /// Catch-all routes unknown addresses to the designated inbox (adopting
+    /// its owner and key when it is a known mailbox; otherwise its address
+    /// doubles as the user), routes known live addresses to themselves,
+    /// and refuses known-but-expired addresses: an admin who expired an
+    /// address gets the refusal signal, not silent catch-all routing.
     #[test]
     fn catch_all_routes_unknown_and_refuses_expired() {
         let dir = tempfile::tempdir().unwrap();
@@ -751,6 +753,56 @@ mod tests {
                 mailbox: "admin@example.org".into(),
                 public_key: None,
                 key_generation: None,
+                max_message_bytes: None,
+            })
+        );
+
+        // A catch-all domain with known mailboxes: one live, one expired,
+        // and the designated inbox itself.
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "domains": {
+                    "catch.example.org": { "mode": "catch-all", "catch-all-mailbox": "inbox@catch.example.org" }
+                },
+                "mailboxes": {
+                    "inbox@catch.example.org": { "user": "owner", "public-key": "pk-owner", "key-generation": 4 },
+                    "live@catch.example.org": { "user": "carol", "expires": null },
+                    "gone@catch.example.org": { "user": "dave", "expires": "2020-01-01T00:00:00Z" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let authority = FileAuthority::open(&path).unwrap();
+
+        // Known-but-expired: refused, never silently caught.
+        assert_eq!(
+            authority.resolve("gone@catch.example.org").unwrap(),
+            Resolution::Refuse {
+                mode: PolicyMode::CatchAll,
+                reason: RefusalReason::Expired,
+            }
+        );
+        // Known and live: routes to itself, not to the inbox.
+        assert_eq!(
+            authority.resolve("live@catch.example.org").unwrap(),
+            Resolution::Accept(Recipient {
+                user: Some("carol".into()),
+                mailbox: "live@catch.example.org".into(),
+                public_key: None,
+                key_generation: None,
+                max_message_bytes: None,
+            })
+        );
+        // Unknown: the inbox, adopting its owner and key.
+        assert_eq!(
+            authority.resolve("whoever@catch.example.org").unwrap(),
+            Resolution::Accept(Recipient {
+                user: Some("owner".into()),
+                mailbox: "inbox@catch.example.org".into(),
+                public_key: Some("pk-owner".into()),
+                key_generation: Some(4),
                 max_message_bytes: None,
             })
         );

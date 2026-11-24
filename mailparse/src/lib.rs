@@ -52,10 +52,6 @@ pub enum MailHeaderError {
     #[error("InvalidMailbox")]
     InvalidMailbox,
 
-    /// Anything else. Not currently produced.
-    #[error("Unknown")]
-    Unknown,
-
     /// The message had no blank line separating headers from the body.
     #[error("Missing header/body separator")]
     MissingSeparator,
@@ -676,6 +672,18 @@ impl<'p> TryFrom<Pairs<'p, Rule>> for MailHeaders<'p> {
     }
 }
 
+/// Returns the value of the field `item` matched: everything after the
+/// first `:` (the one ending the field name), trimmed. The grammar only
+/// matches a field with its name and colon, so the colon is always there;
+/// an empty string is returned otherwise.
+fn field_value<'p>(item: &Pair<'p, Rule>) -> &'p str {
+    item.as_str()
+        .split_once(':')
+        .map(|(_, v)| v)
+        .unwrap_or("")
+        .trim()
+}
+
 // Field handlers: each takes the typed view `mh` being built and the
 // grammar pair `item` for one field, and records the field in `mh`.
 
@@ -693,13 +701,7 @@ fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailH
     for rule in item.into_inner() {
         match rule.as_rule() {
             Rule::return_path => {
-                return_path = Some(
-                    rule.as_str()
-                        .split_once(':')
-                        .map(|(_, v)| v)
-                        .unwrap_or("")
-                        .trim(),
-                )
+                return_path = Some(field_value(&rule))
             }
             Rule::received => receiveds.push(rule),
             _ => continue,
@@ -740,12 +742,7 @@ fn trace<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailH
 /// Record a standalone `Return-Path` header (not part of a trace block)
 /// as its own [`Trace`] entry. Never fails.
 fn return_path<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let value = item
-        .as_str()
-        .split_once(':')
-        .map(|(_, v)| v)
-        .unwrap_or("")
-        .trim();
+    let value = field_value(&item);
     mh.trace.push(Trace {
         return_path: Some(value),
         ..Default::default()
@@ -775,14 +772,14 @@ fn received<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Ma
     Ok(())
 }
 
-/// Append a `Resent-Date` value (the text after `Resent-Date: `).
+/// Append a `Resent-Date` value (see [`field_value`]).
 ///
 /// # Errors
 ///
 /// [`MailHeaderError::InvalidHeader`] for an unparseable date.
 fn resent_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     mh.resent_date.push(
-        rfc2822::parse(&item.as_str().trim()[13..]).map_err(|_| MailHeaderError::InvalidHeader)?,
+        rfc2822::parse(field_value(&item)).map_err(|_| MailHeaderError::InvalidHeader)?,
     );
 
     Ok(())
@@ -828,12 +825,7 @@ fn resent_msg_id<'p>(
 
 /// Append a `DKIM-Signature` header's trimmed tag list. Never fails.
 fn dkim_header<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    let raw = item
-        .as_str()
-        .split_once(':')
-        .map(|(_, v)| v)
-        .unwrap_or("")
-        .trim();
+    let raw = field_value(&item);
     mh.dkim.push(DkimHeader { raw });
     Ok(())
 }
@@ -858,7 +850,7 @@ fn resent_sender<'p>(
 
 // Originator fields
 
-/// Record the `Date` field (the text after `Date: `); a repeated `Date`
+/// Record the `Date` field (see [`field_value`]); a repeated `Date`
 /// is ignored.
 ///
 /// # Errors
@@ -867,7 +859,7 @@ fn resent_sender<'p>(
 fn orig_date<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.orig_date.is_none() {
         mh.orig_date = Some(
-            rfc2822::parse(&item.as_str().trim()[6..])
+            rfc2822::parse(field_value(&item))
                 .map_err(|_| MailHeaderError::InvalidHeader)?,
         )
     }
@@ -1032,14 +1024,14 @@ fn references<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), 
 
 // Informational fields
 
-/// Record the `Subject` text (after `Subject: `, trimmed).
+/// Record the `Subject` text (see [`field_value`]).
 ///
 /// # Errors
 ///
 /// [`MailHeaderError::InvalidHeader`] for a second `Subject`.
 fn subject<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
     if mh.subject.is_none() {
-        mh.subject = Some(item.as_str()[9..].trim());
+        mh.subject = Some(field_value(&item));
     } else {
         return Err(MailHeaderError::InvalidHeader);
     }
@@ -1047,15 +1039,15 @@ fn subject<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), Mai
     Ok(())
 }
 
-/// Append a `Comments` value (after `Comments:`, trimmed). Never fails.
+/// Append a `Comments` value (see [`field_value`]). Never fails.
 fn comments<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    mh.comments.push(item.as_str()[9..].trim());
+    mh.comments.push(field_value(&item));
     Ok(())
 }
 
-/// Append a `Keywords` value (after `Keywords: `, trimmed). Never fails.
+/// Append a `Keywords` value (see [`field_value`]). Never fails.
 fn keywords<'p>(mh: &mut MailHeaders<'p>, item: Pair<'p, Rule>) -> Result<(), MailHeaderError> {
-    mh.keywords.push(item.as_str()[10..].trim());
+    mh.keywords.push(field_value(&item));
     Ok(())
 }
 
@@ -1822,6 +1814,30 @@ VGVzdA==
         assert_eq!(folded.raw_value, b" one\n two");
 
         assert_eq!(msg.body, b"body line\nstill body\n");
+    }
+
+    /// Field values start right after the colon, whatever the spacing:
+    /// no space, several spaces, or a tab all give the same value, and
+    /// no value character is cut off.
+    #[test]
+    fn field_values_do_not_depend_on_spacing_after_the_colon() {
+        for sep in ["", " ", "   ", "\t"] {
+            let src = format!(
+                "Date:{sep}Sat, 20 Nov 2021 14:22:01 -0800\r\n\
+                 Subject:{sep}xyz\r\n\
+                 Comments:{sep}note\r\n\
+                 Keywords:{sep}alpha, beta\r\n\
+                 Resent-Date:{sep}Sun, 21 Nov 2021 10:00:00 +0000\r\n"
+            );
+            let mh = parse_headers(&src).unwrap_or_else(|e| panic!("{sep:?}: {e}"));
+            assert_eq!(mh.subject, Some("xyz"), "{sep:?}");
+            assert_eq!(mh.comments, vec!["note"], "{sep:?}");
+            assert_eq!(mh.keywords, vec!["alpha, beta"], "{sep:?}");
+            let date = mh.orig_date.as_ref().expect("Date parsed");
+            assert_eq!(date.timestamp().as_second(), 1_637_446_921, "{sep:?}");
+            assert_eq!(mh.resent_date.len(), 1, "{sep:?}");
+            assert!(mh.optional_field.is_empty(), "{sep:?}: {:?}", mh.optional_field);
+        }
     }
 
     #[test]

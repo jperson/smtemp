@@ -386,7 +386,7 @@ where
 /// Returns the first matching mechanism's qualified result, else the
 /// redirect target's evaluation, else `Neutral` (the default when nothing
 /// matches); `None` when the domain publishes no record, and `PermError`
-/// for a duplicate `redirect=`.
+/// for a duplicate `redirect=` or a redirect to a domain without a record.
 ///
 /// # Errors
 ///
@@ -447,7 +447,14 @@ where
             // the shared budget. Errors (including a spent budget)
             // propagate; callers map them to results.
             budget.spend()?;
-            return check_host_limited(resolver, peer, sender, m.value.clone(), helo, budget).await;
+            let target =
+                check_host_limited(resolver, peer, sender, m.value.clone(), helo, budget).await;
+            // RFC 7208 §6.1: a redirect to a domain with no SPF record is a
+            // PermError, not "no policy" (which would accept the mail).
+            return match target {
+                Ok(SpfResult::None) => Ok(SpfResult::PermError),
+                other => other,
+            };
         }
     }
 
@@ -1100,6 +1107,30 @@ mod tests {
 
         let result = check(&resolver, "192.0.2.1", "foo@a.example", "a.example").await;
         assert_eq!(SpfResult::PermError, result.unwrap_err().to_result());
+    }
+
+    /// RFC 7208 §6.1: a `redirect=` to a domain with no SPF record is a
+    /// PermError (never `None`, which would accept the mail), while a
+    /// redirect to a published record evaluates that record.
+    #[tokio::test]
+    async fn redirect_to_a_domain_without_a_record_is_permerror() {
+        let mut resolver = MockResolver::default();
+        resolver.txt.insert(
+            "a.example".to_string(),
+            vec!["v=spf1 redirect=nothing.example".to_string()],
+        );
+        resolver.txt.insert(
+            "b.example".to_string(),
+            vec!["v=spf1 redirect=c.example".to_string()],
+        );
+        resolver
+            .txt
+            .insert("c.example".to_string(), vec!["v=spf1 -all".to_string()]);
+
+        let result = check(&resolver, "192.0.2.1", "foo@a.example", "a.example").await;
+        assert_eq!(result.unwrap(), SpfResult::PermError);
+        let result = check(&resolver, "192.0.2.1", "foo@b.example", "b.example").await;
+        assert_eq!(result.unwrap(), SpfResult::Fail);
     }
 
     /// The 10-lookup budget: an eleventh DNS-consuming mechanism is a

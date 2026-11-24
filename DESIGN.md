@@ -20,8 +20,9 @@ mailserv is an inbound SMTP server (MX) in Rust. For every message it:
 
 **V1 scope is receive-only**: a hosted service for inbound mail to
 user-owned addresses on customer domains, with no relaying, sending or
-bounces. The AUTH and sender-grant code is kept for a future submission role
-but isn't part of V1 (§10).
+bounces. Optional submission listeners (587 STARTTLS, 465 implicit TLS)
+take authenticated mail for hosted recipients (§10); they're off unless
+configured.
 
 Design goals, in order:
 
@@ -113,12 +114,15 @@ small `TestSession` drives the whole state machine with no policy at all.
 ## 4. Connection lifecycle
 
 ```
-accept loop
+accept loop (MX port, plus submission-port and submissions-port when set;
+             one loop, so all share the limits below)
   canonical_peer(): ::ffff:a.b.c.d → a.b.c.d
   limits: server-wide semaphore, per-IP concurrency, per-IP rate (60 s window)
     over a limit → 421, sent from a bounded pool of 32 refusal tasks
   spawn: timeout_at(max-conn-duration) {
-    handle_connection:
+    handle_connection(mode):
+      Submissions (465): TLS handshake first, then run(TLS), banner over TLS
+      otherwise:
       run(plaintext)
         Upgrade → TLS handshake (rustls, 10 s cap)
                   buffered plaintext after STARTTLS is dropped
@@ -131,7 +135,7 @@ accept loop
 ```
 
 **Graceful shutdown** (SIGTERM or SIGINT):
-- the listener closes, so new connections are refused;
+- the listeners close, so new connections are refused;
 - sessions are signalled through `shutdown_signal`. The read loop acts on
   it only between transactions: idle sessions get `421 4.3.2`, and a session
   in DATA or AUTH finishes first;
@@ -165,8 +169,8 @@ accept loop
 
 | Step | Policy (`UserSession`) |
 |---|---|
-| **HELO/EHLO** | The argument must be a domain (letters, digits, `-`, `_`; 1–63-octet labels, ≤ 255 total) or an address literal, else `501 5.5.2`, refused *before* it is recorded, because it's copied into `Received:` (a bare CR there would inject a header). SPF is evaluated for the HELO identity under a per-IP DNS permit: Fail → `550`, anything else is just recorded. The EHLO reply advertises `SIZE`, `STARTTLS` (plaintext only) and `AUTH` (TLS only, and only when configured). |
-| **MAIL FROM** | The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
+| **HELO/EHLO** | The argument must be a domain (letters, digits, `-`, `_`; 1–63-octet labels, ≤ 255 total) or an address literal, else `501 5.5.2`, refused *before* it is recorded, because it's copied into `Received:` (a bare CR there would inject a header). SPF is evaluated for the HELO identity under a per-IP DNS permit: Fail → `550`, anything else is just recorded. On a submission listener HELO SPF isn't evaluated (clients send from any network). The EHLO reply advertises `SIZE`, `STARTTLS` (plaintext only) and `AUTH` (submission listeners only, over TLS, when configured). |
+| **MAIL FROM** | The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. A submission listener requires AUTH first (`530 5.7.0`). For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
 | **RCPT TO** | MAIL must come first, and at most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. |
 | **DATA** | Needs a sender and at least one recipient. Bytes are counted against the transaction's limit; going over it gets `552` and `Discard`. |
 | **End of data** | See below. |
@@ -218,6 +222,8 @@ How the ordering is constrained:
 - **Evaluation.** All mechanisms are supported.
   - The RFC 7208 §4.6.4 budget applies: 10 DNS-querying terms and 2 void
     lookups, shared across `include`/`redirect`.
+  - A `redirect=` to a domain with no SPF record is PermError (RFC 7208
+    §6.1), like an `include:` of one.
   - Macros are expanded per RFC 7208 §7.
   - A whole evaluation has a 20 s deadline (`EVALUATION_DEADLINE`).
   - DNS goes through the `SpfResolver` trait (TXT, A, MX, PTR). Production
@@ -316,19 +322,30 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
 - **Queue IDs** are `<hex seconds>.<uuid>`: sortable and globally unique.
 - **Metadata** holds the envelope, peer, HELO, verdicts, TLS state, the
   authenticated identity and the resolved recipients.
-- **Not yet wired:** `SpoolWriter` (`write`, `remove`) is the write seam,
-  and a `PayloadEncryptor` hook exists on it, but production configures no
-  encryptor (§13).
+- **Seams.** `SpoolWriter` (`write`, `remove`) is the write side, and
+  `SpoolQueue` (`list`, `load_payload`, `record_attempt`, `dequeue`,
+  `dead_letter`, `sweep_debris`) the read side the drain uses; `DiskSpool`
+  implements both. A `PayloadEncryptor` hook exists on the write side, but
+  production configures no encryptor (§13).
+- **The stored payload is the final message.** At end of data the queue ID
+  is assigned, the trace headers are prepended, and that is what is
+  written (and would be sealed). The fast path and the drain deliver it
+  verbatim, so delivery never touches the message bytes.
 
 **Delivery** (`DeliverySink`, `MaildirSink`, `--maildir-dir`):
 - **Path.** One maildir per routing mailbox: `{root}/{domain}/{local}/new`.
   The sink re-validates each path component, as defence in depth against
   path traversal.
-- **Idempotent** per (mailbox, queue ID): the target file name is derived
-  from both, so the fast path and the drain can race safely.
-- **Trace headers.** Each copy gets `Return-Path:` and a `Received:` (HELO,
-  peer, `by` host, ESMTP/ESMTPS, queue ID, `for <this recipient>` only).
-  Non-printable bytes in a stored HELO are replaced with `?`.
+- **Idempotent** per (envelope address, queue ID): the file name is
+  `{queue ID}.{address}.eml`, so the fast path and the drain can race
+  safely, and several catch-all addresses routed to one inbox get one copy
+  each. The sink receives the envelope address as metadata.
+- **Trace headers** (`with_trace_headers`), written once at acceptance:
+  `Return-Path:` and a `Received:` (HELO, peer, `by` host, queue ID, and
+  `ESMTP`/`ESMTPS`/`ESMTPA`/`ESMTPSA` per RFC 3848). There is **no `for`
+  clause**: one payload serves every recipient, so naming one would
+  disclose Bcc recipients to the others. Non-printable bytes in a stored
+  HELO are replaced with `?`.
 - **Fast path.** Delivery is attempted inside end-of-data, before the
   `250`. A failure is logged, and the message stays queued.
 
@@ -399,11 +416,22 @@ users produce a startup warning.
 
 ---
 
-## 10. AUTH and sender grants (not part of V1)
+## 10. Submission, AUTH and sender grants
 
-- **Mechanisms.** AUTH PLAIN and LOGIN (RFC 4954/4616), with challenge
-  continuation and `*` to abort. AUTH is advertised and accepted **only over
-  TLS** (`538` on plaintext; RFC 8310).
+- **Listeners.** `submission-port` (normally 587: plaintext, then STARTTLS;
+  RFC 6409) and `submissions-port` (normally 465: implicit TLS; RFC 8314).
+  Each needs `tls-cert`/`tls-key` and `auth-users-file`, and no two
+  listeners may share a port (startup errors). All are bound while still
+  privileged. Setting `auth-users-file` without a submission port is
+  warned about: the logins can't be used.
+- **Where AUTH is offered.** Only on submission listeners, and only over
+  TLS (`538` on plaintext; RFC 8310). The MX listener never advertises it
+  and answers `502 5.5.1`. On submission, MAIL FROM before AUTH gets `530
+  5.7.0`.
+- **Mechanisms.** AUTH PLAIN and LOGIN (RFC 4954/4616), matched
+  case-insensitively, with challenge continuation and `*` to abort. Each
+  AUTH command starts from a clean state, so an aborted LOGIN leaves
+  nothing behind.
 - **Credentials.** `--auth-users-file` names a file of `user:hash` lines
   (`#` comments allowed), read once at startup while still privileged.
   - Each hash is an argon2id PHC string, made with `mailserv
@@ -434,10 +462,8 @@ users produce a startup warning.
 - **Exemptions.** Authenticated sessions skip SPF and are exempt from DMARC
   rejection. Both apply only after the grant checks pass, so being
   authenticated never means "may use any From".
-- **Relay stays closed** even for authenticated sessions.
-
-AUTH is still unsuitable for an internet-facing MX (§13): it is advertised
-on any TLS listener, including port 25, rather than on a submission port.
+- **Relay stays closed** even for authenticated sessions: submitted mail
+  can go only to hosted recipients. Sending to other domains is post-V1.
 
 ---
 
@@ -522,56 +548,51 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | No storage quotas (per message, mailbox or domain) and no free-disk tempfail | A sender can fill the disk. Contained only by a dedicated filesystem and alerts | §2.4.1 |
 | No session-wide limit on refused RCPTs (`RSET` resets the 100 cap) | Unlimited probing for which addresses exist; a privacy problem for disposable addresses | §2.4.2 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
-| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.7 |
+| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.6 |
 
 ### Correctness and delivery
 
 | Gap | Impact | Plan |
 |---|---|---|
 | The connection cap can fire between the spool commit and the `250`; the fast path runs before the reply | The client retries, and the message is delivered twice | §2.4.3 |
-| Catch-all recipients in one transaction share a mailbox and queue ID | They collapse into one file recording one envelope address | §2.4.5 |
-| No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.7 |
+| No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.6 |
 | SPF budget charges MX-host and PTR-name address lookups against the 10-term limit | Large legitimate records can hit PermError → `550` | §2.4.4 |
 | Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | §2.4.4 |
 | No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | §2.4.4 |
-| SPF `redirect=` to a domain with no SPF record evaluates to `None` | Should be PermError (RFC 7208 §6.1); mail from such a misconfigured domain is accepted instead of refused | §2.4.4 |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
-| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.7 |
-| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.7 |
+| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.6 |
+| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.6 |
 | `quarantine` is delivered as normal mail | Out of V1 scope by decision | — |
 
 ### What users are shown
 
 | Gap | Impact | Plan |
 |---|---|---|
-| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | §2.4.6 |
-| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | §2.4.6 |
+| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | §2.4.5 |
+| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | §2.4.5 |
 
 ### Storage and encryption seams
 
 | Gap | Impact | Plan |
 |---|---|---|
-| The queue's read side is concrete: the drain takes `&DiskSpool` (list, load, record attempt, remove, dead-letter, sweep) | A second spool backend (S3) needs a `SpoolQueue` trait first | §2.2 |
-| `PayloadEncryptor` has no recipient parameter and isn't configured. If it were, the drain would prepend plaintext trace headers to ciphertext | Per-user encryption needs the seal/trace-header ordering fixed first | §2.2 |
-| The fast path writes plaintext to the maildir | It bypasses any encryption boundary | §2.2 |
+| `PayloadEncryptor` has no recipient parameter and isn't configured | Per-user encryption isn't available; mail is stored as plaintext | §5 |
 | Final storage is local maildir only | Blocks multiple MX hosts sharing mailboxes | §5 |
 
 ### Operations
 
 | Gap | Impact | Plan |
 |---|---|---|
-| One listener (`--host`), one identity (`--domain`), one certificate; no SNI selection; no TLS hot reload | A restart is needed to change certificates; there are no per-domain MX identities | §5, §6 |
+| One listen address (`--host`), one identity (`--domain`), one certificate; no SNI selection; no TLS hot reload | A restart is needed to change certificates; there are no per-domain MX identities | §5, §6 |
 | One IPv4 resolver; no back-off when it's down; concurrent misses aren't shared | A resolver outage defers all mail (safe, but nothing is received) | §6 |
 | Metrics are log lines only (`dns stats`, `drain pass`) | Monitoring has to parse logs | §6 |
 | No DNSSEC validation in mailserv | It relies on the resolver; use a validating local resolver | — |
 
-### AUTH (not part of V1)
+### Submission and AUTH
 
 | Gap | Impact | Plan |
 |---|---|---|
-| AUTH is advertised on port 25 (no submission-only listener) | Password guessing against the MX, bounded only by the attempt limits | §2.3, §6 |
-| The credentials file is read only at startup | Revoking a login needs a restart | §6 |
-| Mechanism names are case-sensitive; a client `*` abort leaves the LOGIN user name behind, so a later `AUTH LOGIN` takes its next line as the password for that old name | Conformance (same client, same connection) | §2.3 |
+| The credentials file is read only at startup | Revoking a login needs a restart | §2.3 |
+| Submitted mail can only go to hosted recipients | No outbound relay; not a full MSA | §6 |
 
 ### Parsing
 

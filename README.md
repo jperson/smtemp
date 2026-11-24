@@ -10,7 +10,8 @@ logged as structured JSON (bunyan format); message bodies never are.
 mail at addresses defined in the authority file (permanent, or with an
 optional expiry; disposable addresses are the flagship use case). It never
 relays, sends, or generates bounces: undeliverable mail is refused at RCPT
-time, so the sender's server bounces it.
+time, so the sender's server bounces it. Optional submission ports (587,
+465) take authenticated mail from mail clients for hosted recipients.
 
 | Document | What it covers |
 |---|---|
@@ -91,6 +92,8 @@ Settings come from three sources; the first one that sets a value wins:
 |---|---|---|
 | `--host` / `host` | `0.0.0.0` | Address to listen on. |
 | `--port` / `port` | `25` | Port to listen on. Use `2525` for unprivileged testing. |
+| `--submission-port` / `submission-port` | *(none)* | Also listen for message submission (normally `587`): plaintext, then STARTTLS. AUTH is offered only on submission ports, over TLS, and required before `MAIL FROM` (`530`). Needs `--tls-cert`, `--tls-key` and `--auth-users-file`. |
+| `--submissions-port` / `submissions-port` | *(none)* | Also listen for submission over implicit TLS (normally `465`, RFC 8314). Same rules and requirements as `submission-port`. |
 | `--domain` / `domain` | *(required)* | The server's own name: used in the `220` banner, EHLO replies and `Received: by`. Also a hosted domain when there's no `--authority`. |
 
 **Recipients**
@@ -132,7 +135,7 @@ Settings come from three sources; the first one that sets a value wins:
 | Flag / config key | Default | Description |
 |---|---|---|
 | `--spool-dir` / `spool-dir` | `/var/lib/mailserv/spool` | The queue. The `250` is sent only after a durable write there; a failed write gets `451`. |
-| `--maildir-dir` / `maildir-dir` | `/var/lib/mailserv/maildir` | Delivery root: one maildir per mailbox, `{root}/{domain}/{local}/new`. |
+| `--maildir-dir` / `maildir-dir` | `/var/lib/mailserv/maildir` | Delivery root: one maildir per mailbox, `{root}/{domain}/{local}/new`, one file per envelope address (`{queue-id}.{address}.eml`), so catch-all copies stay apart. |
 
 **Privileges and shutdown**
 
@@ -146,7 +149,7 @@ Settings come from three sources; the first one that sets a value wins:
 
 | Flag / config key | Default | Description |
 |---|---|---|
-| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read once at startup, before privileges are dropped, so it can be `root:root 0600`. A file other users can access is a startup error; a group-readable one is warned about. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). ⚠️ **Not for internet-facing V1 deployments:** AUTH is offered on any TLS listener, including port 25. The old inline `auth-users` key is a startup error. |
+| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only on the submission ports over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read once at startup, before privileges are dropped, so it can be `root:root 0600`. A file other users can access is a startup error; a group-readable one is warned about. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). Port 25 never offers AUTH (`502`); without a submission port the logins can't be used, which is warned about. Revoking a login needs a restart. The old inline `auth-users` key is a startup error. |
 | `--auth-senders` / `auth-senders` | *(none)* | What each AUTH login may send as: `user=grant\|grant,…`, each grant an address (`alice@example.org`) or a whole domain (`@example.net`). An authenticated `MAIL FROM` outside the grants gets `553 5.7.1` (the null sender always does), and a `From:` author outside them gets `550 5.7.1`. A login with no grants can't send. Grants for an unknown login, or this flag without `--auth-users-file`, are startup errors. |
 
 | Flag | Description |
@@ -291,7 +294,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 273 tests, 1 ignored
+cargo test --workspace          # 279 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```
@@ -322,6 +325,7 @@ The DMARC tests use a local mock DoT resolver.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo audit --deny warnings     # also weekly; accepted advisories: .cargo/audit.toml
 ```
 
 Warnings are errors, including `missing_docs`: every library crate has

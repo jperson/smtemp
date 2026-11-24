@@ -1,32 +1,32 @@
-//! Local delivery: the `DeliverySink` seam and the maildir
-//! implementation, plus the message fixing (trace headers) applied when
-//! a message leaves the queue and the drain/retry loop.
+//! Local delivery: the trace headers added at acceptance, the
+//! `DeliverySink` seam and its maildir implementation, and the
+//! drain/retry loop.
 //!
-//! Two layers:
-//!
-//! - [`DeliverySink`] — where mail goes. `MaildirSink` writes one
-//!   message copy per recipient into a per-recipient maildir
-//!   (`{root}/{domain}/{local}/new`). Implementations MUST be
-//!   idempotent per (recipient, queue_id): the session attempts
-//!   immediate delivery for low latency, and the drain loop re-attempts
-//!   queued messages periodically — both paths may race, and a retry
-//!   after partial failure must never duplicate mail.
+//! - [`with_trace_headers`] — at end-of-data, before the spool write,
+//!   the message gets `Return-Path:` (RFC 5321 §4.5.2) and a `Received:`
+//!   trace header (RFC 5321 §4.4). They are the same for every recipient
+//!   (no `for` clause), so the stored payload is the final message for
+//!   all of them and can be sealed as a whole. Each copy's envelope
+//!   address is delivery metadata, never part of the message.
+//! - [`DeliverySink`] — where mail goes. `MaildirSink` writes one copy per
+//!   envelope recipient into the routing mailbox's maildir
+//!   (`{root}/{domain}/{local}/new`). Implementations MUST be idempotent
+//!   per (envelope address, queue_id): the session attempts immediate delivery
+//!   for low latency, and the drain loop re-attempts queued messages
+//!   periodically — both paths may race, and a retry after partial
+//!   failure must never duplicate mail.
 //! - [`drain_once`] — the retry engine. Scans the committed spool,
-//!   delivers each message to each recipient, removes fully delivered
-//!   messages, retries failures with exponential backoff, and dead-letters
-//!   messages still undeliverable after `MAX_QUEUE_LIFETIME` (5 days).
-//!
-//! Message fixing happens in [`prepare_for_delivery`]: the final MTA
-//! prepends `Return-Path` (RFC 5321 §4.5.2) and a `Received:` trace
-//! header (RFC 5321 §4.4). The `for <rcpt>` clause names only the
-//! recipient of this copy, so other envelope recipients stay private.
+//!   delivers each stored payload verbatim to each recipient, removes
+//!   fully delivered messages, retries failures with exponential backoff,
+//!   and dead-letters messages still undeliverable after
+//!   `MAX_QUEUE_LIFETIME` (5 days).
 
 use anyhow::{Context, Result};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::spool::{DiskSpool, SpoolMeta};
+use crate::spool::{SpoolMeta, SpoolQueue, SpoolRcpt};
 
 /// Where accepted mail goes. Blocking methods (filesystem, and later
 /// object storage); callers run them on a blocking thread pool.
@@ -34,26 +34,29 @@ pub trait DeliverySink: Send + Sync {
     /// Returns the backend name for logs (e.g. `"maildir"`).
     fn name(&self) -> &str;
 
-    /// Deliver one copy of `message` (the final bytes, trace headers
-    /// included) to the routing mailbox `recipient`, for the queued
-    /// message `queue_id`.
+    /// Deliver one copy of `message` (the stored payload, delivered
+    /// verbatim) for the envelope recipient `rcpt` of the queued message
+    /// `queue_id`: into `rcpt.mailbox`, recording `rcpt.address` as the
+    /// copy's delivery metadata.
     ///
-    /// Idempotency contract: for a given (recipient, queue_id) pair this
-    /// MUST deliver at most once — calling again after success (or
-    /// racing a concurrent attempt) returns `Ok` without duplicating
-    /// mail.
+    /// Idempotency contract: for a given (envelope address, queue_id)
+    /// pair this MUST deliver at most once — calling again after success
+    /// (or racing a concurrent attempt) returns `Ok` without duplicating
+    /// mail. Two envelope addresses routed to one mailbox (catch-all) are
+    /// two copies.
     ///
     /// # Errors
     ///
     /// Delivery failed; the message stays queued and the drain loop
     /// retries.
-    fn deliver(&self, recipient: &str, queue_id: &str, message: &[u8]) -> Result<()>;
+    fn deliver(&self, rcpt: &SpoolRcpt, queue_id: &str, message: &[u8]) -> Result<()>;
 }
 
-/// Maildir delivery: one maildir per recipient address, under
+/// Maildir delivery: one maildir per routing mailbox, under
 /// `{root}/{domain}/{local}/` (both lowercased). Each copy is written to
 /// `tmp/`, fsynced, and renamed into `new/` as
-/// `{queue_id}.{sanitized-recipient}.eml`; the sink creates `tmp/` and
+/// `{queue_id}.{sanitized-envelope-address}.eml`, so the file name
+/// records which address the copy was for; the sink creates `tmp/` and
 /// `new/` on first delivery.
 #[derive(Debug, Clone)]
 pub struct MaildirSink {
@@ -83,9 +86,10 @@ impl DeliverySink for MaildirSink {
         "maildir"
     }
 
-    fn deliver(&self, recipient: &str, queue_id: &str, message: &[u8]) -> Result<()> {
-        let (local, domain) = split_recipient(recipient)
-            .with_context(|| format!("cannot deliver to malformed recipient {recipient:?}"))?;
+    fn deliver(&self, rcpt: &SpoolRcpt, queue_id: &str, message: &[u8]) -> Result<()> {
+        let mailbox = &rcpt.mailbox;
+        let (local, domain) = split_recipient(mailbox)
+            .with_context(|| format!("cannot deliver to malformed mailbox {mailbox:?}"))?;
         let maildir = self.root.join(&domain).join(&local);
         let tmp = maildir.join("tmp");
         let new = maildir.join("new");
@@ -94,16 +98,19 @@ impl DeliverySink for MaildirSink {
         crate::fsutil::create_private_dir_all(&new)
             .with_context(|| format!("cannot create maildir {}", maildir.display()))?;
 
-        // Idempotency is per (recipient, queue_id) as *addresses* — case
-        // variants of the same address must map to the same file, so the
-        // tag is built from the normalized address.
-        let normalized = format!("{local}@{domain}");
-        let filename = format!("{queue_id}.{}.eml", sanitize(&normalized));
+        // Idempotency is per (envelope address, queue_id), case-insensitive
+        // like recipient lookup, so the tag is the lowercased envelope
+        // address. Under catch-all that differs from the mailbox, and each
+        // address gets its own copy.
+        let filename = format!(
+            "{queue_id}.{}.eml",
+            sanitize(&rcpt.address.to_ascii_lowercase())
+        );
         let target = new.join(&filename);
 
-        // Idempotency: an existing delivery of this (recipient, queue_id)
-        // pair is success, not an error — the drain loop and the inline
-        // fast path may both attempt the same copy.
+        // An existing delivery of this pair is success, not an error — the
+        // drain loop and the inline fast path may both attempt the same
+        // copy.
         if target.exists() {
             return Ok(());
         }
@@ -223,17 +230,20 @@ fn rfc5322_date(ts: jiff::Timestamp) -> String {
     jiff::fmt::rfc2822::to_string(&zoned).unwrap_or_else(|_| ts.to_string())
 }
 
-/// Prepend the final-delivery trace headers to the raw message `raw`.
+/// Prepend the trace headers to the message `raw` as received, for the
+/// accepted message described by `meta` (whose `queue_id` must already be
+/// set). Called once, before the spool write.
 ///
-/// Returns one recipient's delivery copy: `Return-Path:` (the envelope
-/// sender from `meta` in `<>`, `<>` for the null sender), then a
-/// `Received:` header (from the HELO and peer IP, by
-/// `meta.server_domain`, with ESMTP or ESMTPS, the queue ID, and `for
-/// <recipient>`), then `raw` verbatim. RFC 5321 §4.4 allows exactly one
-/// path in `for`; naming only this copy's `recipient` keeps the other
-/// envelope recipients private. An unparseable `meta.received_at` is
-/// dated at the Unix epoch.
-pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Vec<u8> {
+/// Returns the final message, the same for every recipient:
+/// `Return-Path:` (the envelope sender in `<>`, `<>` for the null
+/// sender), then a `Received:` header (from the HELO and peer IP, by
+/// `meta.server_domain`, with `ESMTP`, plus `S` for TLS and `A` for an
+/// authenticated submission per RFC 3848, and the queue ID), then `raw`
+/// verbatim. There is no `for` clause (RFC 5321 §4.4 makes it optional):
+/// one message shared by all recipients can't name one without disclosing
+/// it to the others. An unparseable `meta.received_at` is dated at the
+/// Unix epoch.
+pub fn with_trace_headers(meta: &SpoolMeta, raw: &[u8]) -> Vec<u8> {
     let sender = match meta.mail_from.as_deref() {
         Some(addr) if !addr.is_empty() => format!("<{addr}>"),
         _ => "<>".to_string(),
@@ -245,7 +255,12 @@ pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Ve
         .rsplit_once(':')
         .map(|(ip, _)| ip)
         .unwrap_or(&meta.peer);
-    let protocol = if meta.tls_active { "ESMTPS" } else { "ESMTP" };
+    let protocol = match (meta.tls_active, meta.authenticated.is_some()) {
+        (false, false) => "ESMTP",
+        (true, false) => "ESMTPS",
+        (false, true) => "ESMTPA",
+        (true, true) => "ESMTPSA",
+    };
     // HELO is validated at the SMTP layer; this is defense in depth
     // against whatever the spooled metadata holds. Anything but printable
     // ASCII becomes `?`, so no CR/LF can split the header.
@@ -266,7 +281,7 @@ pub fn prepare_for_delivery(meta: &SpoolMeta, recipient: &str, raw: &[u8]) -> Ve
     out.extend_from_slice(format!("Return-Path: {sender}\r\n").as_bytes());
     out.extend_from_slice(
         format!(
-            "Received: from {helo} ({peer_ip})\r\n\tby {} ({}) with {protocol} id {}\r\n\tfor <{recipient}>; {date}\r\n",
+            "Received: from {helo} ({peer_ip})\r\n\tby {} ({}) with {protocol} id {};\r\n\t{date}\r\n",
             meta.server_domain,
             env!("CARGO_PKG_NAME"),
             meta.queue_id,
@@ -292,7 +307,7 @@ pub struct DrainStats {
     /// Messages left untouched because their next retry is not due yet.
     pub deferred: usize,
     /// Uncommitted crash-debris files removed by the sweep (see
-    /// [`DiskSpool::sweep_debris`]).
+    /// [`SpoolQueue::sweep_debris`]).
     pub debris_removed: usize,
 }
 
@@ -334,7 +349,7 @@ fn unix_now() -> u64 {
 /// Run one pass of the queue drain over `spool` into `sink` at the
 /// current time. See [`drain_at`] for the behavior, return value and
 /// errors.
-pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainStats> {
+pub fn drain_once(spool: &dyn SpoolQueue, sink: &dyn DeliverySink) -> Result<DrainStats> {
     drain_at(spool, sink, unix_now())
 }
 
@@ -342,7 +357,7 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 /// (Unix seconds).
 ///
 /// First, crash debris older than [`DEBRIS_MIN_AGE`] is swept (see
-/// [`DiskSpool::sweep_debris`]); each removed file is logged at `warn`,
+/// [`SpoolQueue::sweep_debris`]); each removed item is logged at `warn`,
 /// and a sweep failure is logged without failing the pass.
 ///
 /// Then, for each committed message:
@@ -350,9 +365,10 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 ///   skipped, and its payload is not read;
 /// - payload unreadable (removed by a concurrent fast-path dequeue, or
 ///   damaged): logged and skipped for this pass;
-/// - due: delivery is attempted to every recipient (idempotent per
-///   recipient, so recipients that already have their copy are not
-///   duplicated). A message delivered to every recipient is dequeued.
+/// - due: the stored payload is delivered verbatim to every recipient
+///   (idempotent per recipient, so recipients that already have their
+///   copy are not duplicated). A message delivered to every recipient is
+///   dequeued.
 /// - otherwise a failed attempt is recorded. If the message has been
 ///   failing for [`MAX_QUEUE_LIFETIME`], it is dead-lettered and logged
 ///   at `error`.
@@ -367,12 +383,12 @@ pub fn drain_once(spool: &DiskSpool, sink: &dyn DeliverySink) -> Result<DrainSta
 /// Spool I/O fails: listing the queue, removing a delivered message,
 /// recording an attempt, or dead-lettering. The pass stops at that
 /// message; the caller logs the error and the next pass retries.
-pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<DrainStats> {
+pub fn drain_at(spool: &dyn SpoolQueue, sink: &dyn DeliverySink, now: u64) -> Result<DrainStats> {
     let mut stats = DrainStats::default();
     match spool.sweep_debris(now, DEBRIS_MIN_AGE) {
         Ok(removed) => {
-            for path in &removed {
-                tracing::warn!(file = %path.display(), "removed uncommitted spool file (crash debris)");
+            for item in &removed {
+                tracing::warn!(file = %item, "removed uncommitted spool file (crash debris)");
             }
             stats.debris_removed = removed.len();
         }
@@ -388,7 +404,7 @@ pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<
             }
         }
         // Loaded only now, for a message that is due.
-        let payload = match queued.load_payload() {
+        let payload = match spool.load_payload(&queued) {
             Ok(payload) => payload,
             Err(e) => {
                 // Removed by a concurrent fast-path dequeue, or damaged.
@@ -399,11 +415,9 @@ pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<
         };
         let mut all_delivered = true;
         for rcpt in &meta.rcpt_to {
-            // The trace headers name the envelope address; the copy goes
-            // to the authority-resolved routing mailbox (which differs
-            // from the address only under catch-all).
-            let message = prepare_for_delivery(meta, &rcpt.address, &payload);
-            if let Err(e) = sink.deliver(&rcpt.mailbox, &meta.queue_id, &message) {
+            // The stored payload is the final message (trace headers
+            // included): deliver it as is.
+            if let Err(e) = sink.deliver(rcpt, &meta.queue_id, &payload) {
                 all_delivered = false;
                 tracing::warn!(
                     queue_id = %meta.queue_id,
@@ -416,7 +430,7 @@ pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<
         }
 
         if all_delivered {
-            spool.remove(&queued)?;
+            spool.dequeue(&queued)?;
             stats.delivered += 1;
             tracing::info!(queue_id = %meta.queue_id, "message delivered and dequeued");
             continue;
@@ -454,13 +468,24 @@ pub fn drain_at(spool: &DiskSpool, sink: &dyn DeliverySink, now: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::{SpoolMeta, SpoolRcpt, SpoolWriter as _};
+    use crate::spool::{DiskSpool, SpoolMeta, SpoolRcpt, SpoolWriter as _};
+
+    /// An envelope recipient `address` routed to `mailbox`.
+    fn rcpt(address: &str, mailbox: &str) -> SpoolRcpt {
+        SpoolRcpt {
+            address: address.into(),
+            mailbox: mailbox.into(),
+            user: None,
+            public_key: None,
+            key_generation: None,
+        }
+    }
 
     /// A metadata record with plausible values; tests override the
     /// fields they care about via struct update syntax.
     fn sample_meta() -> SpoolMeta {
         SpoolMeta {
-            queue_id: "00006b01.test.queue".into(),
+            queue_id: "0000000064f1.0123456789abcdef".into(),
             session_id: "session-1".into(),
             server_domain: "mail.test".into(),
             received_at: jiff::Timestamp::now().to_string(),
@@ -485,73 +510,77 @@ mod tests {
         }
     }
 
-    /// prepare_for_delivery prepends Return-Path and Received, keeps the
-    /// raw bytes verbatim, and puts the per-copy recipient in the `for`
-    /// clause only.
+    /// with_trace_headers prepends Return-Path and Received, keeps the raw
+    /// bytes verbatim, names no recipient (the message is shared by all of
+    /// them), and marks TLS and authentication in the protocol token.
     #[test]
-    fn delivery_copy_carries_trace_headers() {
+    fn trace_headers_are_message_level() {
         let raw = b"Subject: hi\r\n\r\nbody\r\n".to_vec();
         let meta = sample_meta();
-        let copy = prepare_for_delivery(&meta, "user@example.org", &raw);
-        let text = String::from_utf8(copy.clone()).unwrap();
+        let text = String::from_utf8(with_trace_headers(&meta, &raw)).unwrap();
 
         assert!(text.starts_with("Return-Path: <sender@example.test>\r\n"));
         assert!(text.contains("Received: from client.test (127.0.0.1)\r\n"));
-        assert!(text.contains("\tby mail.test (mailserv) with ESMTP id "));
-        assert!(text.contains("\tfor <user@example.org>; "));
-        assert!(text.contains(&meta.queue_id));
+        assert!(text.contains(&format!(
+            "\tby mail.test (mailserv) with ESMTP id {};\r\n\t",
+            meta.queue_id
+        )));
+        assert!(!text.contains("for <"), "no recipient is named: {text}");
+        assert!(!text.contains("user@example.org"));
         // Raw message follows verbatim after the trace headers.
-        assert!(text.ends_with("Subject: hi\r\n\r\nbody\r\n"));
+        assert!(text.ends_with("\r\nSubject: hi\r\n\r\nbody\r\n"));
 
         // Null sender renders as the empty path.
         let mut null = sample_meta();
         null.mail_from = Some(String::new());
-        let copy = prepare_for_delivery(&null, "user@example.org", &raw);
-        assert!(String::from_utf8(copy)
-            .unwrap()
-            .starts_with("Return-Path: <>\r\n"));
+        assert!(with_trace_headers(&null, &raw).starts_with(b"Return-Path: <>\r\n"));
 
-        // TLS upgrades the protocol token.
-        let mut tls = sample_meta();
-        tls.tls_active = true;
-        let copy = prepare_for_delivery(&tls, "user@example.org", &raw);
-        assert!(String::from_utf8(copy)
-            .unwrap()
-            .contains(" with ESMTPS id "));
+        // RFC 3848 protocol tokens.
+        for (tls, user, token) in [
+            (true, None, " with ESMTPS id "),
+            (false, Some("alice"), " with ESMTPA id "),
+            (true, Some("alice"), " with ESMTPSA id "),
+        ] {
+            let mut m = sample_meta();
+            m.tls_active = tls;
+            m.authenticated = user.map(String::from);
+            let text = String::from_utf8(with_trace_headers(&m, &raw)).unwrap();
+            assert!(text.contains(token), "{token}: {text}");
+        }
     }
 
     /// Defence in depth: a stored HELO containing a bare CR can't inject a
-    /// header into the delivered copy.
+    /// header into the message.
     #[test]
-    fn delivery_copy_neutralises_control_characters_in_helo() {
+    fn trace_headers_neutralise_control_characters_in_helo() {
         let mut meta = sample_meta();
         meta.helo = Some("evil.example\rX-Injected: yes".into());
-        let copy = prepare_for_delivery(&meta, "user@example.org", b"\r\nbody\r\n");
-        let text = String::from_utf8(copy).unwrap();
+        let text = String::from_utf8(with_trace_headers(&meta, b"\r\nbody\r\n")).unwrap();
         assert!(text.contains("Received: from evil.example?X-Injected:?yes (127.0.0.1)\r\n"));
         assert_eq!(text.matches('\r').count(), text.matches("\r\n").count());
     }
 
-    /// The maildir sink writes one copy per recipient under
-    /// {root}/{domain}/{local}/new, and redelivery of the same
-    /// (recipient, queue_id) is idempotent.
+    /// The maildir sink writes one copy per envelope address into the
+    /// routing mailbox's {root}/{domain}/{local}/new, named after the
+    /// address; redelivery of the same (address, queue_id) is idempotent,
+    /// case-insensitively, and the bytes are stored verbatim.
     #[tokio::test]
     async fn maildir_delivery_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let sink = MaildirSink::open(dir.path()).unwrap();
 
         let message = b"Return-Path: <s@x.test>\r\nReceived: ...\r\nSubject: hi\r\n".to_vec();
-        sink.deliver("User@Example.ORG", "q-1", &message).unwrap();
+        let user = rcpt("User@Example.ORG", "User@Example.ORG");
+        sink.deliver(&user, "q-1", &message).unwrap();
 
-        // Address is lowercased; file lands in new/ with a name built
-        // from the normalized address, so case variants share one file.
         let delivered = dir
             .path()
             .join("example.org/user/new/q-1.user_example.org.eml");
         assert_eq!(std::fs::read(&delivered).unwrap(), message);
 
         // Redelivery (crash recovery, drain race) does not duplicate.
-        sink.deliver("user@example.org", "q-1", &message).unwrap();
+        let lower = rcpt("user@example.org", "user@example.org");
+        sink.deliver(&lower, "q-1", &message).unwrap();
         let mut names = Vec::new();
         let mut rd = tokio::fs::read_dir(delivered.parent().unwrap())
             .await
@@ -560,6 +589,27 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names, vec!["q-1.user_example.org.eml"]);
+    }
+
+    /// Two catch-all addresses routed to one inbox get one copy each,
+    /// told apart by the envelope address in the file name.
+    #[tokio::test]
+    async fn catch_all_addresses_get_separate_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        for address in ["a@catch.example", "b@catch.example"] {
+            sink.deliver(&rcpt(address, "inbox@catch.example"), "q-1", b"msg")
+                .unwrap();
+        }
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("catch.example/inbox/new"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["q-1.a_catch.example.eml", "q-1.b_catch.example.eml"]
+        );
     }
 
     /// drain_once delivers every recipient copy of a queued message and
@@ -605,7 +655,8 @@ mod tests {
             }
         );
 
-        // Both copies exist with trace headers; the queue is empty.
+        // Both copies exist, each exactly the stored payload (the drain
+        // adds nothing); the queue is empty.
         for rcpt in ["a", "b"] {
             let path = dir.path().join(format!("maildir/example.org/{rcpt}/new"));
             let mut rd = tokio::fs::read_dir(&path).await.unwrap();
@@ -615,7 +666,7 @@ mod tests {
             }
             assert_eq!(names.len(), 1, "{path:?}: {names:?}");
             let bytes = std::fs::read(path.join(&names[0])).unwrap();
-            assert!(bytes.starts_with(b"Return-Path: <sender@example.test>\r\n"));
+            assert_eq!(bytes, raw, "delivered verbatim");
         }
         assert!(spool.list().unwrap().is_empty());
 
@@ -652,7 +703,7 @@ mod tests {
             "flaky"
         }
 
-        fn deliver(&self, _r: &str, _q: &str, _m: &[u8]) -> Result<()> {
+        fn deliver(&self, _r: &SpoolRcpt, _q: &str, _m: &[u8]) -> Result<()> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
                 Err(anyhow::anyhow!("disk on fire"))
@@ -722,7 +773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path().join("spool"), None).unwrap();
         let sink = FlakySink::failing();
-        let queue_id = spool.write(sample_meta(), b"payload").unwrap();
+        let queue_id = spool.write(sample_meta(), b"payload").unwrap().queue_id;
         let t0: u64 = 1_700_000_000;
         let lifetime = MAX_QUEUE_LIFETIME.as_secs();
 

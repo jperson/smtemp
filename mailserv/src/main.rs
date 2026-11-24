@@ -10,7 +10,8 @@ use tokio::io::BufReader;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::time::{timeout_at, Instant};
-use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, instrument, warn};
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
@@ -65,6 +66,17 @@ struct Args {
     #[arg(long)]
     port: Option<u16>,
 
+    /// Also listen for message submission with STARTTLS on this port
+    /// (normally 587). AUTH is offered only on submission ports, and is
+    /// required there; needs --tls-cert/--tls-key and --auth-users-file.
+    #[arg(long, value_name = "PORT")]
+    submission_port: Option<u16>,
+
+    /// Also listen for message submission over implicit TLS on this port
+    /// (normally 465, RFC 8314); same requirements as --submission-port.
+    #[arg(long, value_name = "PORT")]
+    submissions_port: Option<u16>,
+
     /// This server's domain, used in the greeting and `Received:` headers
     /// (required, here or in the config file).
     #[arg(long)]
@@ -113,7 +125,7 @@ struct Args {
     /// line, where hash is an argon2id string from `mailserv
     /// hash-password`; # comments allowed. Must not be accessible to other
     /// users (chmod 600 or 640). Read at startup, before privileges are
-    /// dropped. AUTH is only offered over TLS.
+    /// dropped. AUTH is only offered on the submission ports, over TLS.
     #[arg(long, value_name = "FILE")]
     auth_users_file: Option<String>,
 
@@ -185,7 +197,8 @@ struct Args {
     shutdown_grace_ms: Option<u64>,
 
     /// TOML configuration file; CLI flags override file values. Keys are
-    /// the same as the flags in kebab-case (host, port, domain,
+    /// the same as the flags in kebab-case (host, port, submission-port,
+    /// submissions-port, domain,
     /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users-file, auth-senders, resolver, resolver-ca,
     /// dns-connections, spool-dir, maildir-dir, max-connections,
@@ -211,6 +224,8 @@ enum Command {
 struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
+    submission_port: Option<u16>,
+    submissions_port: Option<u16>,
     domain: Option<String>,
     max_data_bytes: Option<usize>,
     max_conn_duration_ms: Option<u64>,
@@ -246,6 +261,10 @@ struct Config {
     host: String,
     /// Listen port (default [`DEFAULT_PORT`]).
     port: u16,
+    /// STARTTLS submission port, if enabled (normally 587).
+    submission_port: Option<u16>,
+    /// Implicit-TLS submission port, if enabled (normally 465).
+    submissions_port: Option<u16>,
     /// This server's domain.
     domain: String,
     /// Server-wide message size limit (default [`DEFAULT_MAX_DATA_BYTES`]).
@@ -379,7 +398,8 @@ const DEFAULT_MAILDIR_DIR: &str = "/var/lib/mailserv/maildir";
 ///
 /// No domain is configured, `max-dns-per-ip` is 0, `dns-connections` is
 /// outside `1..=dns::MAX_CONNECTIONS`, a group is given without a user,
-/// or the file uses the removed `auth-users` key.
+/// the file uses the removed `auth-users` key, or the listeners are
+/// inconsistent (see [`check_listeners`]).
 fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
     if file.auth_users.is_some() {
         anyhow::bail!(
@@ -389,12 +409,14 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         );
     }
     let cli_or_file_user_set = cli.user.is_some() || file.user.is_some();
-    Ok(Config {
+    let config = Config {
         host: cli
             .host
             .or(file.host)
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         port: cli.port.or(file.port).unwrap_or(DEFAULT_PORT),
+        submission_port: cli.submission_port.or(file.submission_port),
+        submissions_port: cli.submissions_port.or(file.submissions_port),
         domain: cli
             .domain
             .or(file.domain)
@@ -462,7 +484,43 @@ fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .shutdown_grace_ms
             .or(file.shutdown_grace_ms)
             .unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
-    })
+    };
+    check_listeners(&config)?;
+    Ok(config)
+}
+
+/// Check that the submission listeners in `config` can work: each needs
+/// a TLS certificate and key and a credentials file (AUTH is what they
+/// are for), and no two listeners may share a port.
+///
+/// # Errors
+///
+/// A submission port without TLS or without `auth-users-file`, or a
+/// port used twice.
+fn check_listeners(config: &Config) -> Result<()> {
+    let submission = [
+        ("submission-port", config.submission_port),
+        ("submissions-port", config.submissions_port),
+    ];
+    for (name, port) in submission {
+        if port.is_none() {
+            continue;
+        }
+        if config.tls_cert.is_none() || config.tls_key.is_none() {
+            anyhow::bail!("{name} needs tls-cert and tls-key");
+        }
+        if config.auth_users_file.is_none() {
+            anyhow::bail!("{name} needs auth-users-file (submission requires AUTH)");
+        }
+    }
+    let mut ports = vec![("port", config.port)];
+    ports.extend(submission.iter().filter_map(|&(n, p)| p.map(|p| (n, p))));
+    for (i, (name, port)) in ports.iter().enumerate() {
+        if let Some((other, _)) = ports[..i].iter().find(|(_, p)| p == port) {
+            anyhow::bail!("{name} and {other} are both {port}");
+        }
+    }
+    Ok(())
 }
 
 /// RFC 7208 Section 8: the sender is not authorized to use the domain.
@@ -1067,6 +1125,32 @@ struct DmarcSummary {
     action: String,
 }
 
+/// Which listener a connection arrived on, which decides its policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+enum ListenerMode {
+    /// The MX listener (port 25): inbound mail from other servers. AUTH
+    /// is never offered or accepted.
+    Mx,
+    /// Message submission with STARTTLS (port 587, RFC 6409): AUTH is
+    /// offered after STARTTLS and required before MAIL FROM; HELO SPF is
+    /// not evaluated (clients send from arbitrary networks).
+    Submission,
+    /// Message submission over implicit TLS (port 465, RFC 8314): as
+    /// [`ListenerMode::Submission`], with TLS from the first byte.
+    Submissions,
+}
+
+impl ListenerMode {
+    /// Whether this is a submission listener (587 or 465).
+    fn is_submission(self) -> bool {
+        self != ListenerMode::Mx
+    }
+}
+
+/// `530`: a submission listener requires AUTH before MAIL FROM (RFC 4954
+/// §6).
+const AUTH_REQUIRED: &[u8] = b"530 5.7.0 Authentication required\r\n";
+
 /// The state of one SMTP connection: the [`smtp::SmtpSession`]
 /// implementation that applies this server's policy (HELO and MAIL FROM
 /// SPF, recipient authority, size limits, AUTH, end-of-data DKIM/DMARC,
@@ -1141,6 +1225,9 @@ struct UserSession<'session> {
     auth: Option<Arc<auth::AuthConfig>>,
     /// The authenticated identity for this connection, if any.
     authenticated: Option<String>,
+    /// The listener this connection arrived on (set by the driver;
+    /// [`ListenerMode::Mx`] by default).
+    mode: ListenerMode,
     /// Failed AUTH attempts on this connection (capped at
     /// [`auth::MAX_FAILURES_PER_SESSION`]; survives STARTTLS).
     auth_failures: u32,
@@ -1202,6 +1289,7 @@ impl<'session> UserSession<'session> {
             starttls_available,
             auth: cfg.auth.clone(),
             authenticated: None,
+            mode: ListenerMode::Mx,
             auth_failures: 0,
             auth_login_user: None,
             auth_pending: None,
@@ -1335,7 +1423,10 @@ impl smtp::SmtpSession for UserSession<'_> {
         // HELO name itself, with the macro sender postmaster@HELO.
         // Address literals publish no SPF. A definitive Fail is
         // rejected; every other outcome defers to the MAIL FROM check.
-        self.spf_helo = if h.starts_with('[') {
+        // Not on submission listeners: a mail client sends from whatever
+        // network it is on, which no HELO record will authorize, and must
+        // be able to reach AUTH.
+        self.spf_helo = if h.starts_with('[') || self.mode.is_submission() {
             None
         } else {
             // The evaluation holds one of this source IP's DNS permits
@@ -1395,9 +1486,10 @@ impl smtp::SmtpSession for UserSession<'_> {
         if self.starttls_available && !self.tls_active {
             reply.push_str("250-STARTTLS\r\n");
         }
-        // RFC 8310 Section 2: only advertise (and accept) AUTH on an
-        // encrypted session — credentials must not traverse plaintext.
-        if self.tls_active && self.auth.is_some() {
+        // AUTH only on submission listeners, and (RFC 8310 Section 2) only
+        // on an encrypted session — credentials must not traverse
+        // plaintext. The MX never offers it.
+        if self.mode.is_submission() && self.tls_active && self.auth.is_some() {
             reply.push_str("250-AUTH PLAIN LOGIN\r\n");
         }
         reply.push_str("250 HELP\r\n");
@@ -1431,6 +1523,10 @@ impl smtp::SmtpSession for UserSession<'_> {
 
     #[instrument(skip(self), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     async fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> smtp::Control {
+        // The MX never takes credentials: AUTH is a submission feature.
+        if !self.mode.is_submission() {
+            return smtp::Control::reject(b"502 5.5.1 Authentication not supported\r\n");
+        }
         // RFC 8310 Section 2: credentials must not traverse an unencrypted
         // channel; only offer/accept AUTH on an established TLS session.
         if !self.tls_active {
@@ -1444,8 +1540,14 @@ impl smtp::SmtpSession for UserSession<'_> {
         let Some(users) = self.auth.clone() else {
             return smtp::Control::reject(b"502 5.5.1 Authentication not supported\r\n");
         };
+        // A new exchange starts clean, however the last one ended (a `*`
+        // abort or RSET mid-exchange never reaches the policy), so a stale
+        // LOGIN user name can never pair with this exchange's password.
+        self.auth_pending = None;
+        self.auth_login_user = None;
 
-        match mechanism {
+        // RFC 4954 §4: SASL mechanism names are case-insensitive.
+        match mechanism.to_ascii_uppercase().as_str() {
             "PLAIN" => {
                 let Some(initial) = initial else {
                     self.auth_pending = Some("PLAIN");
@@ -1508,6 +1610,10 @@ impl smtp::SmtpSession for UserSession<'_> {
     async fn mail_from(&mut self, path: &str) -> smtp::Control {
         if self.mail_from.is_some() {
             return smtp::Control::reject(UserSession::MULTI_MAIL);
+        }
+        // Submission is for authenticated users only (RFC 6409 §4.3).
+        if self.mode.is_submission() && self.authenticated.is_none() {
+            return smtp::Control::reject(AUTH_REQUIRED);
         }
 
         let Some((addr, params)) = clean_path(path) else {
@@ -2045,8 +2151,9 @@ impl smtp::SmtpSession for UserSession<'_> {
         // spool is a temporary failure — the client is invited to
         // retry, nothing is lost.
         if let Some(spool) = self.spool.clone() {
-            let mut meta = spool::SpoolMeta {
-                queue_id: String::new(), // assigned by the backend
+            let meta = spool::SpoolMeta {
+                // Assigned now, because the Received: header names it.
+                queue_id: spool::new_queue_id(),
                 session_id: self.session_id.to_string(),
                 server_domain: self.domain.to_string(),
                 received_at: jiff::Timestamp::now().to_string(),
@@ -2063,18 +2170,20 @@ impl smtp::SmtpSession for UserSession<'_> {
                 message_size: raw.len(),
                 encryption: None, // set by the backend's encryptor, if any
             };
-            // The backend runs on the blocking pool and takes owned
-            // data; the session keeps its copies for the delivery fast
-            // path below.
-            let write_meta = meta.clone();
-            let write_raw = raw.clone();
+            // The trace headers go in now, once, before the write: the
+            // stored payload is the final message for every recipient, so
+            // it can be sealed and is delivered verbatim (fast path and
+            // drain alike).
+            let message = delivery::with_trace_headers(&meta, &raw);
+            let queue_id = meta.queue_id.clone();
             let write_spool = spool.clone();
-            let write =
-                tokio::task::spawn_blocking(move || write_spool.write(write_meta, &write_raw));
-            match write.await {
-                Ok(Ok(queue_id)) => {
+            let write = tokio::task::spawn_blocking(move || write_spool.write(meta, &message));
+            // What the spool stored (sealed, with an encryptor): the bytes
+            // every recipient gets, shared by the delivery tasks below.
+            let stored: Arc<[u8]> = match write.await {
+                Ok(Ok(stored)) => {
                     info!(queue_id = %queue_id, recipients = self.rcpt_to.len(), "message spooled");
-                    meta.queue_id = queue_id;
+                    stored.payload.into()
                 }
                 Ok(Err(e)) => {
                     error!(error = %e, "spool write failed; refusing with a temporary error");
@@ -2092,50 +2201,48 @@ impl smtp::SmtpSession for UserSession<'_> {
                         b"451 4.3.0 Error: queueing failed, try again later\r\n",
                     );
                 }
-            }
+            };
 
             // Delivery fast path: attempt each recipient copy immediately
             // for low latency. Failures are not fatal — the message is
             // durably queued and the drain loop retries (delivery is
-            // idempotent per (recipient, queue_id), so overlapping
+            // idempotent per (envelope address, queue_id), so overlapping
             // attempts never duplicate mail). If every recipient copy is
             // delivered, dequeue immediately instead of waiting for the
             // next drain pass.
             if let Some(sink) = self.sink.clone() {
                 let mut delivered_count = 0usize;
                 for rcpt in self.rcpt_to.clone() {
-                    // Trace headers name the envelope address; the copy
-                    // goes to the authority-resolved routing mailbox.
-                    let message = delivery::prepare_for_delivery(&meta, &rcpt.address, &raw);
                     let logged_address = rcpt.address.clone();
                     let logged_mailbox = rcpt.mailbox.clone();
                     let attempt = tokio::task::spawn_blocking({
                         let sink = sink.clone();
-                        let queue_id = meta.queue_id.clone();
-                        move || sink.deliver(&rcpt.mailbox, &queue_id, &message)
+                        let queue_id = queue_id.clone();
+                        let stored = Arc::clone(&stored);
+                        move || sink.deliver(&rcpt, &queue_id, &stored)
                     })
                     .await;
                     match attempt {
                         Ok(Ok(())) => {
                             delivered_count += 1;
-                            info!(queue_id = %meta.queue_id, recipient = %logged_address, mailbox = %logged_mailbox, "message delivered");
+                            info!(queue_id = %queue_id, recipient = %logged_address, mailbox = %logged_mailbox, "message delivered");
                         }
                         Ok(Err(e)) => {
-                            warn!(queue_id = %meta.queue_id, recipient = %logged_address, error = %e, "fast-path delivery failed; queued for retry");
+                            warn!(queue_id = %queue_id, recipient = %logged_address, error = %e, "fast-path delivery failed; queued for retry");
                         }
                         Err(e) => {
-                            warn!(queue_id = %meta.queue_id, recipient = %logged_address, error = %e, "delivery task panicked; queued for retry");
+                            warn!(queue_id = %queue_id, recipient = %logged_address, error = %e, "delivery task panicked; queued for retry");
                         }
                     }
                 }
                 if delivered_count == self.rcpt_to.len() {
                     let _ = tokio::task::spawn_blocking({
                         let spool = spool.clone();
-                        let queue_id = meta.queue_id.clone();
+                        let queue_id = queue_id.clone();
                         move || spool.remove(&queue_id)
                     })
                     .await;
-                    info!(queue_id = %meta.queue_id, "all recipients delivered; dequeued");
+                    info!(queue_id = %queue_id, "all recipients delivered; dequeued");
                 }
             }
         }
@@ -2307,12 +2414,24 @@ async fn main() -> Result<()> {
     };
     let drop_to = privdrop::plan(privdrop::effective_uid(), target)?;
 
-    // Bind while still privileged: port 25 needs root or
+    // Bind while still privileged: ports 25, 465 and 587 need root or
     // CAP_NET_BIND_SERVICE. The TLS key, resolver CA and config file were
     // read above, also with the starting privileges.
-    let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot listen on {}:{}: {e}", config.host, config.port))?;
+    let listener = bind(&config.host, config.port).await?;
+    let submission = match config.submission_port {
+        Some(port) => Some(bind(&config.host, port).await?),
+        None => None,
+    };
+    let submissions = match config.submissions_port {
+        Some(port) => Some(bind(&config.host, port).await?),
+        None => None,
+    };
+    if auth.is_some() && submission.is_none() && submissions.is_none() {
+        warn!(
+            "auth-users-file is set but no submission port is: AUTH is only offered on \
+             submission-port/submissions-port, so these logins can't be used"
+        );
+    }
 
     if let Some(id) = &drop_to {
         // The service user must own the storage it writes: root creates
@@ -2412,7 +2531,7 @@ async fn main() -> Result<()> {
                 let pass = tokio::task::spawn_blocking({
                     let spool = spool.clone();
                     let sink = sink.clone();
-                    move || delivery::drain_once(&spool, &*sink)
+                    move || delivery::drain_once(&*spool, &*sink)
                 })
                 .await;
                 match pass {
@@ -2482,6 +2601,8 @@ async fn main() -> Result<()> {
     info!(
         host = %config.host,
         port = config.port,
+        submission_port = ?config.submission_port,
+        submissions_port = ?config.submissions_port,
         domain = %config.domain,
         resolver = %config.resolver,
         spool_dir = %config.spool_dir,
@@ -2499,10 +2620,14 @@ async fn main() -> Result<()> {
     let signal = loop {
         // A transient accept error (e.g. EMFILE under load) must not
         // terminate the server; back off briefly and keep going.
-        let accepted = tokio::select! {
+        // All listeners share one loop, so they share the connection
+        // limits below and stop together on shutdown.
+        let (accepted, mode) = tokio::select! {
             biased;
             signal = signals.recv() => break signal,
-            accepted = listener.accept() => accepted,
+            accepted = listener.accept() => (accepted, ListenerMode::Mx),
+            accepted = accept_on(submission.as_ref()) => (accepted, ListenerMode::Submission),
+            accepted = accept_on(submissions.as_ref()) => (accepted, ListenerMode::Submissions),
         };
         let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
@@ -2559,7 +2684,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let result = timeout_at(
                 Instant::now() + Duration::from_millis(config.max_conn_duration_ms),
-                handle_connection(stream, acceptor, max_read_ms, session_cfg),
+                handle_connection(stream, acceptor, max_read_ms, session_cfg, mode),
             )
             .await;
 
@@ -2581,6 +2706,8 @@ async fn main() -> Result<()> {
     // take the mail. Then tell every session: idle ones get 421 now, and
     // sessions mid-message finish it, get their reply, then the 421.
     drop(listener);
+    drop(submission);
+    drop(submissions);
     let _ = shutdown_tx.send(true);
     let max = config.max_connections;
     let active = |capacity: &tokio::sync::Semaphore| max as usize - capacity.available_permits();
@@ -2726,6 +2853,31 @@ struct SessionConfig {
     sink: Option<Arc<dyn delivery::DeliverySink>>,
 }
 
+/// Bind a TCP listener on `host`:`port`.
+///
+/// # Errors
+///
+/// The address can't be bound (in use, or a privileged port without the
+/// privilege); the message names the address.
+async fn bind(host: &str, port: u16) -> Result<TcpListener> {
+    TcpListener::bind(format!("{host}:{port}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on {host}:{port}: {e}"))
+}
+
+/// Accept the next connection on `listener`, or wait forever when there
+/// is none (a disabled listener in the accept loop's `select!`).
+///
+/// # Errors
+///
+/// As [`TcpListener::accept`].
+async fn accept_on(listener: Option<&TcpListener>) -> std::io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Returns `peer` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`,
 /// what a dual-stack `[::]` listener reports for IPv4 clients) turned back
 /// into plain IPv4; other addresses are unchanged. Without this, SPF `ip4:`/`a`/`mx`
@@ -2735,70 +2887,70 @@ fn canonical_peer(peer: SocketAddr) -> SocketAddr {
     SocketAddr::new(peer.ip().to_canonical(), peer.port())
 }
 
-/// Serve the connection `stream`, including a possible STARTTLS upgrade
-/// through `acceptor`: the protocol loop runs over the plaintext stream,
-/// pauses for the TLS handshake (10 s limit) when the policy upgrades,
-/// and resumes over the TLS stream. Each read may take at most
+/// Run the server side of a TLS handshake with `acceptor` on `stream`
+/// from `peer`, within 10 s.
+///
+/// Returns the TLS stream, or `None` (logged at `info`) when the
+/// handshake fails or times out.
+async fn tls_handshake(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> Option<tokio_rustls::server::TlsStream<TcpStream>> {
+    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => {
+            info!(peer = %peer, "TLS established");
+            Some(tls)
+        }
+        Ok(Err(e)) => {
+            info!(peer = %peer, error = %e, "TLS handshake failed");
+            None
+        }
+        Err(_) => {
+            info!(peer = %peer, "TLS handshake timed out");
+            None
+        }
+    }
+}
+
+/// Serve the connection `stream`, which arrived on a `mode` listener,
+/// with the TLS configuration `acceptor`. Each read may take at most
 /// `max_read_ms`; `cfg` configures the session. The session record is
 /// logged when the connection ends.
 ///
-/// A failed or timed-out TLS handshake ends the connection quietly
-/// (`Ok`).
+/// On an implicit-TLS listener ([`ListenerMode::Submissions`]) the TLS
+/// handshake comes first and the whole session runs over TLS. Otherwise
+/// the protocol loop runs over the plaintext stream, pauses for the TLS
+/// handshake when the policy accepts STARTTLS, and resumes over TLS.
+/// A failed or timed-out handshake ends the connection quietly (`Ok`).
 ///
 /// # Errors
 ///
-/// The peer address is unavailable, the protocol loop fails (I/O error),
-/// or the session record cannot be serialized.
+/// The peer address is unavailable, an implicit-TLS listener has no
+/// acceptor, the protocol loop fails (I/O error), or the session record
+/// cannot be serialized.
 async fn handle_connection(
     stream: TcpStream,
     acceptor: Option<Arc<TlsAcceptor>>,
     max_read_ms: u64,
     cfg: SessionConfig,
+    mode: ListenerMode,
 ) -> Result<()> {
     let peer = canonical_peer(stream.peer_addr()?);
-    let mut session = UserSession::new(peer, acceptor.is_some(), &cfg);
+    let implicit_tls = mode == ListenerMode::Submissions;
+    let mut session = UserSession::new(peer, acceptor.is_some() && !implicit_tls, &cfg);
+    session.mode = mode;
     let mut session_state = smtp::SessionState::default();
-    let mut stream = BufReader::new(stream);
 
-    let end = session
-        .run(
-            &mut stream,
-            &peer,
-            &cfg.domain,
-            &max_read_ms,
-            &mut session_state,
-        )
-        .await?;
-
-    if end == smtp::EndReason::TlsHandshake {
+    if implicit_tls {
         let Some(acceptor) = acceptor else {
-            // Unreachable: the policy only upgrades when an acceptor was
-            // provided.
-            anyhow::bail!("STARTTLS accepted without a TLS acceptor");
+            anyhow::bail!("implicit-TLS listener without a TLS acceptor");
         };
-        // Any pipelined plaintext after the STARTTLS command is discarded
-        // with the read buffer (RFC 3207 Section 4.1).
-        let plain = stream.into_inner();
-        let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(plain)).await
-        {
-            Ok(Ok(tls)) => tls,
-            Ok(Err(e)) => {
-                info!(peer = %peer, error = %e, "TLS handshake failed");
-                return Ok(());
-            }
-            Err(_) => {
-                info!(peer = %peer, "TLS handshake timed out");
-                return Ok(());
-            }
+        let Some(tls) = tls_handshake(&acceptor, stream, peer).await else {
+            return Ok(());
         };
-        info!(peer = %peer, "TLS established");
-
-        // RFC 3207 Section 4.2: the protocol restarts after the
-        // handshake — the client re-issues EHLO, no new banner.
+        // TLS from the first byte: the banner goes out over TLS.
         session.tls_established().await;
-        session_state.state = smtp::SmtpState::Idle;
-        session_state.greeted = true;
-
         let mut tls_stream = BufReader::new(tls);
         session
             .run(
@@ -2809,6 +2961,47 @@ async fn handle_connection(
                 &mut session_state,
             )
             .await?;
+    } else {
+        let mut stream = BufReader::new(stream);
+        let end = session
+            .run(
+                &mut stream,
+                &peer,
+                &cfg.domain,
+                &max_read_ms,
+                &mut session_state,
+            )
+            .await?;
+
+        if end == smtp::EndReason::TlsHandshake {
+            let Some(acceptor) = acceptor else {
+                // Unreachable: the policy only upgrades when an acceptor
+                // was provided.
+                anyhow::bail!("STARTTLS accepted without a TLS acceptor");
+            };
+            // Any pipelined plaintext after the STARTTLS command is
+            // discarded with the read buffer (RFC 3207 Section 4.1).
+            let Some(tls) = tls_handshake(&acceptor, stream.into_inner(), peer).await else {
+                return Ok(());
+            };
+
+            // RFC 3207 Section 4.2: the protocol restarts after the
+            // handshake — the client re-issues EHLO, no new banner.
+            session.tls_established().await;
+            session_state.state = smtp::SmtpState::Idle;
+            session_state.greeted = true;
+
+            let mut tls_stream = BufReader::new(tls);
+            session
+                .run(
+                    &mut tls_stream,
+                    &peer,
+                    &cfg.domain,
+                    &max_read_ms,
+                    &mut session_state,
+                )
+                .await?;
+        }
     }
 
     info!(
@@ -2857,9 +3050,9 @@ async fn load_resolver_ca(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 ///
 /// A malformed PEM section, or no certificate at all.
 fn resolver_ca_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
-    let mut cursor = std::io::Cursor::new(pem);
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cursor).collect::<std::result::Result<_, _>>()?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("malformed PEM: {e}"))?;
     if certs.is_empty() {
         anyhow::bail!("no PEM certificates found");
     }
@@ -2875,12 +3068,15 @@ fn resolver_ca_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
 /// Malformed PEM, no private key, or a certificate/key pair rustls
 /// rejects.
 fn tls_acceptor_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
-    let mut cert_cursor = std::io::Cursor::new(cert_pem);
-    let certs: Vec<CertificateDer> =
-        rustls_pemfile::certs(&mut cert_cursor).collect::<std::result::Result<_, _>>()?;
-    let mut key_cursor = std::io::Cursor::new(key_pem);
-    let key = rustls_pemfile::private_key(&mut key_cursor)?
-        .ok_or_else(|| anyhow::anyhow!("no private key found"))?;
+    let certs: Vec<CertificateDer> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("malformed certificate PEM: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| match e {
+        tokio_rustls::rustls::pki_types::pem::Error::NoItemsFound => {
+            anyhow::anyhow!("no private key found")
+        }
+        e => anyhow::anyhow!("malformed private key PEM: {e}"),
+    })?;
 
     let config = tokio_rustls::rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -3316,6 +3512,50 @@ mod tests {
         assert_eq!(resolved.shutdown_grace_ms, 60_000);
         assert_eq!(resolved.user, None);
         assert_eq!(resolved.group, None);
+        assert_eq!(resolved.submission_port, None);
+        assert_eq!(resolved.submissions_port, None);
+    }
+
+    /// Submission ports resolve CLI > file, and each needs TLS and a
+    /// credentials file; no two listeners may share a port.
+    #[test]
+    fn submission_listener_requirements() {
+        use clap::Parser as _;
+        let resolve = |argv: &[&str], file: FileConfig| {
+            let mut full = vec!["mailserv", "--domain", "d.example"];
+            full.extend_from_slice(argv);
+            resolve_config(Args::parse_from(full), file)
+        };
+        let tls = ["--tls-cert", "c.pem", "--tls-key", "k.pem"];
+        let file = FileConfig {
+            auth_users_file: Some("/etc/mailserv/users".into()),
+            submissions_port: Some(465),
+            ..FileConfig::default()
+        };
+
+        let ok = resolve(
+            &[&tls[..], &["--submission-port", "587"]].concat(),
+            file.clone(),
+        )
+        .unwrap();
+        assert_eq!(ok.submission_port, Some(587));
+        assert_eq!(ok.submissions_port, Some(465));
+
+        let err = resolve(&["--submission-port", "587"], file.clone()).unwrap_err();
+        assert!(
+            err.to_string().contains("needs tls-cert and tls-key"),
+            "{err}"
+        );
+
+        let no_auth = FileConfig {
+            auth_users_file: None,
+            ..file.clone()
+        };
+        let err = resolve(&tls, no_auth).unwrap_err();
+        assert!(err.to_string().contains("needs auth-users-file"), "{err}");
+
+        let err = resolve(&[&tls[..], &["--submission-port", "465"]].concat(), file).unwrap_err();
+        assert!(err.to_string().contains("are both 465"), "{err}");
     }
 
     /// `auth-users-file` resolves CLI > file, and a config file that still
@@ -3430,6 +3670,28 @@ mod tests {
         sink: Option<Arc<dyn delivery::DeliverySink>>,
         authority: Option<Arc<dyn authority::RecipientResolver>>,
     ) -> std::net::SocketAddr {
+        spawn_server_in(
+            ListenerMode::Mx,
+            acceptor,
+            auth,
+            local_domains,
+            spool,
+            sink,
+            authority,
+        )
+        .await
+    }
+
+    /// As [`spawn_server`], for a `mode` listener.
+    async fn spawn_server_in(
+        mode: ListenerMode,
+        acceptor: Option<Arc<TlsAcceptor>>,
+        auth: Option<Arc<auth::AuthConfig>>,
+        local_domains: Option<Vec<String>>,
+        spool: Option<Arc<dyn spool::SpoolWriter>>,
+        sink: Option<Arc<dyn delivery::DeliverySink>>,
+        authority: Option<Arc<dyn authority::RecipientResolver>>,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let authority: Arc<dyn authority::RecipientResolver> = match authority {
@@ -3467,6 +3729,7 @@ mod tests {
                         spool,
                         sink,
                     },
+                    mode,
                 )
                 .await;
             }
@@ -3604,7 +3867,70 @@ mod tests {
         client.write_all(b"QUIT\r\n").await.unwrap();
     }
 
-    /// AUTH over TLS: advertisement gating, both mechanisms, bad
+    /// The implicit-TLS submission listener (465) handshakes before the
+    /// banner, offers AUTH on the first EHLO, and never offers STARTTLS.
+    #[tokio::test]
+    async fn implicit_tls_submission() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let acceptor = Arc::new(
+            tls_acceptor_from_pem(
+                cert.cert.pem().as_bytes(),
+                cert.key_pair.serialize_pem().as_bytes(),
+            )
+            .unwrap(),
+        );
+        let auth = auth::AuthConfig::from_credentials(
+            &auth::test_credentials(&[("alice", "secret")]),
+            None,
+        )
+        .unwrap();
+        let addr = spawn_server_in(
+            ListenerMode::Submissions,
+            Some(acceptor),
+            Some(Arc::new(auth)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tls = TestTlsConnector::from(Arc::new(config))
+            .connect(
+                ServerName::try_from("localhost").unwrap(),
+                TestTcpStream::connect(addr).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut client = BufReader::new(tls);
+        assert!(read_reply(&mut client).await[0].starts_with("220 "));
+        client.write_all(b"EHLO client.test\r\n").await.unwrap();
+        let caps = read_reply(&mut client).await;
+        assert!(
+            caps.iter().any(|l| l == "250-AUTH PLAIN LOGIN\r\n"),
+            "{caps:?}"
+        );
+        assert!(!caps.iter().any(|l| l.contains("STARTTLS")), "{caps:?}");
+
+        use base64::Engine as _;
+        let plain = base64::engine::general_purpose::STANDARD.encode("\0alice\0secret");
+        client
+            .write_all(format!("AUTH PLAIN {plain}\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "235 2.7.0 Authentication successful\r\n"
+        );
+    }
+
+    /// AUTH on the STARTTLS submission listener: advertisement gating,
+    /// AUTH required before MAIL, both mechanisms, bad
     /// credentials, SPF exemption for authenticated senders, and relay
     /// denial for non-local recipients.
     #[tokio::test]
@@ -3623,7 +3949,16 @@ mod tests {
             Some("alice=alice@spfless-domain-xyz.test"),
         )
         .unwrap();
-        let addr = spawn_server(Some(acceptor), Some(Arc::new(auth)), None, None, None, None).await;
+        let addr = spawn_server_in(
+            ListenerMode::Submission,
+            Some(acceptor),
+            Some(Arc::new(auth)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
 
         // --- Plaintext: AUTH is neither advertised nor accepted.
         let tcp = TestTcpStream::connect(addr).await.unwrap();
@@ -3663,6 +3998,16 @@ mod tests {
         assert!(
             caps.iter().any(|l| l == "250-AUTH PLAIN LOGIN\r\n"),
             "caps: {caps:?}"
+        );
+
+        // Submission needs AUTH before a transaction.
+        client
+            .write_all(b"MAIL FROM:<alice@spfless-domain-xyz.test>\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await[0],
+            "530 5.7.0 Authentication required\r\n"
         );
 
         // Bad credentials (LOGIN dance).
@@ -3920,12 +4265,25 @@ mod tests {
         let id = names[0].trim_end_matches(".eml");
         assert_eq!(names[1], format!("{id}.json"));
 
-        // Payload is exactly the (unstuffed) DATA bytes.
+        // The payload is the final message: the trace headers (naming the
+        // queue ID, and no recipient), then exactly the unstuffed DATA
+        // bytes.
         let payload = tokio::fs::read(new.join(&names[0])).await.unwrap();
-        assert_eq!(
-            payload,
-            b"Subject: spool test\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nbody line\r\n"
+        let data =
+            b"Subject: spool test\r\nFrom: sender@spfless-domain-xyz.test\r\n\r\nbody line\r\n";
+        let text = String::from_utf8(payload.clone()).unwrap();
+        assert!(
+            text.starts_with(
+                "Return-Path: <sender@spfless-domain-xyz.test>\r\nReceived: from client.test"
+            ),
+            "{text}"
         );
+        assert!(text.contains(&format!(" with ESMTP id {id};")), "{text}");
+        assert!(
+            !text.contains("user@example.org"),
+            "no recipient named: {text}"
+        );
+        assert!(payload.ends_with(data));
 
         // Metadata is complete and consistent.
         let meta: serde_json::Value =
@@ -3935,7 +4293,11 @@ mod tests {
         assert_eq!(meta["mail_from"], "sender@spfless-domain-xyz.test");
         assert_eq!(meta["rcpt_to"][0]["address"], "user@example.org");
         assert_eq!(meta["rcpt_to"][0]["mailbox"], "user@example.org");
-        assert_eq!(meta["message_size"], payload.len());
+        assert_eq!(
+            meta["message_size"],
+            data.len(),
+            "the client's bytes, not the trace headers"
+        );
         assert!(meta["received_at"].is_string());
         assert!(meta["peer"].is_string());
     }
@@ -4138,8 +4500,9 @@ mod tests {
         assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
         client.write_all(b"QUIT\r\n").await.unwrap();
 
-        // ...and the mail lands in the admin's maildir, addressed to the
-        // envelope recipient in the trace headers.
+        // ...and the mail lands in the admin's maildir, the copy's file
+        // name recording the envelope address it was for (the message
+        // itself names no recipient).
         let inbox = dir.path().join("maildir/example.org/admin/new");
         let mut rd = tokio::fs::read_dir(&inbox).await.unwrap();
         let mut names = Vec::new();
@@ -4147,9 +4510,13 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names.len(), 1, "admin inbox: {names:?}");
+        assert!(
+            names[0].ends_with(".whatever-alias_example.org.eml"),
+            "{names:?}"
+        );
         let copy = std::fs::read(inbox.join(&names[0])).unwrap();
         let text = String::from_utf8(copy).unwrap();
-        assert!(text.contains("for <whatever-alias@example.org>"));
+        assert!(!text.contains("whatever-alias"), "{text}");
     }
 
     // -- Security properties -----------------------------------------------
@@ -4843,6 +5210,48 @@ mod from_validation_tests {
         cfg
     }
 
+    /// A LOGIN exchange aborted with `*` leaves nothing behind: a new
+    /// `AUTH LOGIN` (mechanism names are case-insensitive) asks for the
+    /// user name again, so a line meant as the user name can never be
+    /// taken as the aborted user's password.
+    #[tokio::test]
+    async fn aborted_login_state_does_not_carry_over() {
+        use base64::Engine as _;
+        let b64 = |s: &str| {
+            format!(
+                "{}\r\n",
+                base64::engine::general_purpose::STANDARD.encode(s)
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg(dir.path());
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.tls_active = true;
+        s.mode = ListenerMode::Submission;
+        let state = smtp::SmtpState::Ready;
+
+        let (reply, next) = s.handler(&state, b"AUTH LOGIN\r\n").await;
+        assert!(reply.starts_with(b"334 VXNlcm5hbWU6"), "username prompt");
+        let (reply, next) = s.handler(&next, b64("alice").as_bytes()).await;
+        assert!(reply.starts_with(b"334 UGFzc3dvcmQ6"), "password prompt");
+        let (reply, next) = s.handler(&next, b"*\r\n").await;
+        assert!(reply.starts_with(b"501"), "aborted");
+
+        let (reply, next) = s.handler(&next, b"auth login\r\n").await;
+        assert!(
+            reply.starts_with(b"334 VXNlcm5hbWU6"),
+            "fresh username prompt"
+        );
+        // alice's password, sent where the user name belongs.
+        let (reply, _) = s.handler(&next, b64("pw").as_bytes()).await;
+        assert!(
+            reply.starts_with(b"334 UGFzc3dvcmQ6"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(s.authenticated, None);
+    }
+
     /// A session gets `MAX_FAILURES_PER_SESSION` wrong passwords; after
     /// that every AUTH attempt, even with the right password, gets `454`
     /// without a check, through both PLAIN and LOGIN.
@@ -4854,6 +5263,7 @@ mod from_validation_tests {
         let cfg = session_cfg(dir.path());
         let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
         s.tls_active = true;
+        s.mode = ListenerMode::Submission;
 
         let wrong = b64("\0alice\0wrong");
         for _ in 0..auth::MAX_FAILURES_PER_SESSION {
@@ -4875,6 +5285,39 @@ mod from_validation_tests {
         assert_eq!(s.authenticated, None);
     }
 
+    /// Listener policy: the MX never takes AUTH, even over TLS, and
+    /// doesn't advertise it; a submission listener refuses MAIL FROM
+    /// until the client has authenticated.
+    #[tokio::test]
+    async fn auth_is_a_submission_feature() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = session_cfg(dir.path());
+        let right = base64::engine::general_purpose::STANDARD.encode("\0alice\0pw");
+
+        let mut mx = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        mx.tls_active = true;
+        assert_eq!(
+            mx.auth("PLAIN", Some(right.as_bytes())).await.into_reply(),
+            b"502 5.5.1 Authentication not supported\r\n"
+        );
+        assert_eq!(mx.authenticated, None);
+
+        let mut sub = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        sub.mode = ListenerMode::Submission;
+        sub.tls_active = true;
+        assert_eq!(
+            sub.mail_from("<alice@example.org>").await.into_reply(),
+            AUTH_REQUIRED
+        );
+        assert!(sub.mail_from.is_none());
+        assert!(sub
+            .auth("PLAIN", Some(right.as_bytes()))
+            .await
+            .reply()
+            .starts_with(b"235 "));
+    }
+
     /// MAIL FROM of an authenticated session is limited to the login's
     /// grants; the null sender and logins without grants are refused.
     /// Refusals happen before any DNS.
@@ -4883,6 +5326,7 @@ mod from_validation_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = session_cfg(dir.path());
         let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.mode = ListenerMode::Submission;
 
         s.authenticated = Some("alice".into());
         for refused in [

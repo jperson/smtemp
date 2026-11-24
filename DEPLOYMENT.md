@@ -1,7 +1,9 @@
 # DEPLOYMENT.md — Go-live checklist
 
 **Target:** a receive-only public MX on a single Linux VPS (systemd), V1
-scope per [DESIGN.md](DESIGN.md) §1. No outbound mail, no submission.
+scope per [DESIGN.md](DESIGN.md) §1. No outbound mail. Submission (587/465)
+exists but stays off for the pilot; [Enabling submission](#enabling-submission)
+says what changes if you turn it on.
 
 This document is the go/no-go record:
 1. the readiness verdict;
@@ -37,7 +39,8 @@ complete.
 - the release is built from a recorded commit (A1–A3);
 - mailserv runs with `authority` in `reject` mode, never the static
   fallback (C1, C2);
-- AUTH is not configured: no `auth-users-file` (C1);
+- submission is off: no `submission-port`, `submissions-port` or
+  `auth-users-file` (C1);
 - storage is on a dedicated filesystem, with disk alerts (B3, G1).
 
 ---
@@ -49,17 +52,14 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 | Limitation | Risk | Contained by | Fix |
 |---|---|---|---|
 | The static authority (no `authority` file) accepts every local-part | Any address at a hosted domain receives mail | C1, C2: always set `authority`, `reject` mode | Configuration |
-| AUTH, if configured, is advertised on port 25 | Password guessing against the MX (bounded by the attempt limits); a credential holder can send as their grants | C1: leave `auth-users-file` unset | PLAN §2.3 |
 | No storage quotas or free-disk check | A sender can fill the disk | B3 dedicated filesystem, G1 alerts, C2 `reject` mode, no `catch-all` | PLAN §2.4.1 |
 | Unlimited refused RCPTs per session | Probing which addresses exist | G1 `recipient refused` alert; firewall abusive sources | PLAN §2.4.2 |
 | The connection cap can fire after the spool commit, before the `250` | The sender retries and the message is delivered twice | C1 `max-conn-duration-ms = 300000`; G1 duration alert; restart in quiet periods (H4) | PLAN §2.4.3 |
 | SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.4 |
-| SPF `redirect=` to a domain without a record gives `None` instead of PermError | Mail from such a misconfigured domain is accepted | — (low impact; DMARC still applies) | PLAN §2.4.4 |
-| Catch-all recipients in one transaction collapse into one file | A catch-all inbox loses which address each copy was for | C2: no `catch-all` in the pilot | PLAN §2.4.5 |
-| No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.6 |
-| Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.7 |
-| Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.7 |
-| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.7 |
+| No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.5 |
+| Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.6 |
+| Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.6 |
+| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.6 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits are per address | IPv6 senders can fail SPF or escape limits | B4: IPv4-only MX | PLAN §6 |
 | No TLS certificate reload | A restart is needed to pick up a renewed certificate | D3 renewal hook | PLAN §6 |
 | Local-parts may contain shell metacharacters (`$`, `` ` ``, `|`, `&` are valid in addresses) | Operator scripts could misbehave on maildir paths | Never pass maildir paths through a shell unquoted | — |
@@ -78,8 +78,9 @@ did each one and when in §4.
   **Check:** all green. The `mailserv` integration tests need outbound
   DoT to 1.1.1.1 (README "Network caveat").
 - [ ] **A2. Audit dependencies:** `cargo install cargo-audit && cargo
-  audit`. **Check:** no unresolved advisories (or each is recorded with a
-  reason in §4).
+  audit --deny warnings` on the release commit (CI also runs it on every
+  push and weekly). **Check:** clean. Accepted advisories are listed with
+  their reasons in `.cargo/audit.toml`; copy any new one into §4.
 - [ ] **A3. Build and record the release:** `cargo build --release`, then
   record the commit hash and `sha256sum target/release/mailserv`.
   **Check:** the hash is in §4.
@@ -121,7 +122,8 @@ did each one and when in §4.
   - Outbound: allow `853/tcp` to the chosen public resolver (or, with a
     local resolver, whatever *it* needs upstream, typically `53` or `853`),
     and `80`/`443` for updates and ACME.
-  - Deny everything else, including `2525`.
+  - Deny everything else, including `2525`, and `587`/`465` unless
+    submission is enabled.
 
   **Check:** from an outside host, `nc -vz mx1.<domain> 25` succeeds and
   `nc -vz mx1.<domain> 2525` fails.
@@ -176,14 +178,15 @@ did each one and when in §4.
   spool-dir   = "/var/lib/mailserv/spool"
   maildir-dir = "/var/lib/mailserv/maildir"
   authority   = "/etc/mailserv/authority.json"  # never run without it
-  # auth-users-file / auth-senders: DO NOT SET (receive-only V1)
+  # submission-port / submissions-port / auth-users-file / auth-senders:
+  # not for the pilot (receive-only V1)
   ```
   **Check:** the startup log has `recipient authority ready` with
   `backend":"file"`, `STARTTLS available`, and **no** `AUTH PLAIN/LOGIN
   available` line.
 - [ ] **C2. Write `/etc/mailserv/authority.json`.**
   - Use `reject` mode for every domain: **no `catch-all`** in the pilot
-    (copies collapse, and there are no quotas).
+    (there are no storage quotas yet).
   - Include `postmaster@` (RFC 5321 §4.5.1 requires it for every domain
     the server accepts mail for) and `abuse@` for every hosted domain, and
     for the MX host's own domain if it is listed. Neither is added
@@ -447,6 +450,24 @@ Run the authority-dependent tests against a test domain listed in
   **the previous policy is still in force**, including any address you
   meant to expire. Fix the file immediately.
 
+### Enabling submission
+
+Not part of the pilot. When it is wanted:
+- Make the credentials file: `mailserv hash-password` per login, one
+  `user:hash` line each, `root:root 0600`. Set `auth-users-file` and
+  `auth-senders` (a login without grants can't send).
+- Set `submission-port = 587` and/or `submissions-port = 465`. Both need
+  `tls-cert`/`tls-key`; the startup check refuses them otherwise. AUTH is
+  never offered on port 25.
+- Open `587/tcp` and/or `465/tcp` in B5. The systemd unit's
+  `CAP_NET_BIND_SERVICE` already covers them.
+- Revoking a login means editing the file and restarting (no reload yet:
+  PLAN §2.3).
+- **Check:** `openssl s_client -connect mx1.<domain>:465 -quiet` then
+  `EHLO x` lists `AUTH PLAIN LOGIN`; on port 25 after STARTTLS it
+  doesn't, and `AUTH PLAIN` gets `502`; on 587, `MAIL FROM` before AUTH
+  gets `530`.
+
 ---
 
 ## 4. Go/no-go sign-off
@@ -457,7 +478,7 @@ Run the authority-dependent tests against a test domain listed in
 | A2 dependency audit clean (or exceptions recorded) | | | |
 | A3 release commit and binary hash | | | |
 | B1–B7 host ready (incl. B4 IPv4-only) | | | |
-| C1–C3 configuration reviewed (no `auth-users-file`, `authority` set, absolute paths) | | | |
+| C1–C3 configuration reviewed (no submission ports or `auth-users-file`, `authority` set, absolute paths) | | | |
 | D1–D3 DNS and TLS in place; D4 MX switched | | | |
 | E1–E2 unit hardened, files `0600` | | | |
 | F1–F13 smoke tests passed (incl. F6b) | | | |

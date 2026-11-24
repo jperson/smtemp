@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # New advisories are published without any change here: audit weekly too.
+  schedule:
+    - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,5 +43,18 @@ jobs:
         with:
           toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test (offline; the live-DNS test is #[ignore]d)
+      # The mailserv integration tests resolve through the real 1.1.1.1
+      # over DoT; the one live-DKIM-key test is #[ignore]d.
+      - name: cargo test
         run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Accepted advisories, each with its reason, are in .cargo/audit.toml.
+      - name: cargo audit (vulnerabilities, unmaintained and yanked crates)
+        run: cargo audit --deny warnings

@@ -1,0 +1,11 @@
+# cargo-audit configuration: advisories accepted on purpose, each with the
+# reason it doesn't apply. Revisit every entry when its crate is upgraded.
+
+[advisories]
+ignore = [
+    # rsa 0.9: "Marvin" timing side channel in RSA *private-key* operations
+    # (decryption and signing). mailserv only verifies DKIM signatures with
+    # public keys, and holds no RSA private key, so it isn't reachable.
+    # The fix is in rsa 0.10; upgrade when it is released as stable.
+    "RUSTSEC-2023-0071",
+]

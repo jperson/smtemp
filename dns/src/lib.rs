@@ -28,12 +28,94 @@ use tokio_rustls::TlsConnector;
 pub mod proto;
 use crate::proto::{DnsMessage, DnsQuestion, DnsResourceRecord, Label, QType};
 
-/// Returns whether `err` (from [`DnsClient::query`]) means the name
-/// itself is invalid ([`proto::InvalidName`]): nothing was sent, and
-/// retrying can't help. Callers treat it like a name that does not exist (RFC 7208 §4.3),
-/// not like a transient resolver failure.
-pub fn is_invalid_name(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<proto::InvalidName>().is_some()
+/// Why [`DnsClient::query`] got no response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryError {
+    /// The name has no valid wire form (an empty label, a label over 63
+    /// octets, or a name over 253). Refused before anything is sent;
+    /// RFC 7208 §4.3 treats such a name like one that doesn't exist.
+    InvalidName(proto::InvalidName),
+    /// No reply within the per-query timeout.
+    TimedOut,
+    /// The resolver couldn't be consulted: connect failure, connection
+    /// failure after the retry, or a protocol violation.
+    Failed(String),
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::InvalidName(e) => write!(f, "{e}"),
+            QueryError::TimedOut => f.write_str("DNS query timed out"),
+            QueryError::Failed(reason) => write!(f, "DNS query failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+/// The outcome of looking a name up, with the three cases a caller must
+/// tell apart to fail closed (see [`DnsClient::lookup`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup<T> {
+    /// At least one answer of the wanted type.
+    Found(Vec<T>),
+    /// Definitely nothing: NXDOMAIN, an empty NOERROR answer (NODATA),
+    /// no answer of the wanted type, or a name with no valid wire form.
+    Absent,
+    /// No definite answer: a failed or timed-out query, or a server
+    /// error (SERVFAIL, REFUSED, ...). The caller must treat it as
+    /// temporary, never as "absent".
+    TempError(String),
+}
+
+impl<T> Lookup<T> {
+    /// Classify the outcome of a query: `result` is what
+    /// [`DnsClient::query`] returned, and `answer` picks the wanted values
+    /// out of the answer records.
+    pub fn from_query(
+        result: std::result::Result<DnsMessage, QueryError>,
+        answer: impl Fn(QType) -> Option<T>,
+    ) -> Self {
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(QueryError::InvalidName(_)) => return Lookup::Absent,
+            Err(e) => return Lookup::TempError(e.to_string()),
+        };
+        match resp.header.rcode {
+            // NOERROR: answers, or NODATA.
+            0 => {
+                let found: Vec<T> = resp
+                    .answers
+                    .into_iter()
+                    .filter_map(|a| answer(a.rdata))
+                    .collect();
+                if found.is_empty() {
+                    Lookup::Absent
+                } else {
+                    Lookup::Found(found)
+                }
+            }
+            // NXDOMAIN.
+            3 => Lookup::Absent,
+            code => Lookup::TempError(format!("DNS server answered rcode {code}")),
+        }
+    }
+
+    /// Returns the found values, or an empty list when absent; `Err` with
+    /// the reason for a temporary error. For callers that treat
+    /// "nothing" and "absent" alike.
+    ///
+    /// # Errors
+    ///
+    /// [`Lookup::TempError`]'s reason.
+    pub fn into_result(self) -> std::result::Result<Vec<T>, String> {
+        match self {
+            Lookup::Found(v) => Ok(v),
+            Lookup::Absent => Ok(Vec::new()),
+            Lookup::TempError(reason) => Err(reason),
+        }
+    }
 }
 
 /// Verify that `resp` actually answers `query` (RFC 5452 hardening
@@ -951,11 +1033,15 @@ impl DnsClient {
     /// timeout elapsing. A name with no valid wire form (an empty label,
     /// a label over 63 octets, or a name over 253) is refused **before**
     /// anything is sent, with an [`InvalidName`](crate::proto::InvalidName)
-    /// error (see [`is_invalid_name`]). Such names are attacker-reachable
+    /// error ([`QueryError::InvalidName`]). Such names are attacker-reachable
     /// (SPF records, DKIM `d=`/`s=`), and public resolvers silently drop
     /// the malformed query, so sending one would cost the full timeout.
-    pub async fn query(&self, domain: &str, qtype: u16) -> Result<DnsMessage> {
-        let domain = proto::normalize_name(domain).map_err(anyhow::Error::new)?;
+    pub async fn query(
+        &self,
+        domain: &str,
+        qtype: u16,
+    ) -> std::result::Result<DnsMessage, QueryError> {
+        let domain = proto::normalize_name(domain).map_err(QueryError::InvalidName)?;
         let stats = &self.stats;
         stats.queries.fetch_add(1, Ordering::Relaxed);
         let key = (domain.to_ascii_lowercase(), qtype);
@@ -990,9 +1076,10 @@ impl DnsClient {
 
         let claim = self.claim_slot().await;
         for attempt in 0..2 {
-            let pipeline = self.get_or_connect(claim.slot).await?;
+            let failed = |e: anyhow::Error| QueryError::Failed(format!("{e:#}"));
+            let pipeline = self.get_or_connect(claim.slot).await.map_err(failed)?;
             let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-            let reason = match pipeline.submit(domain, qtype, token)? {
+            let reason = match pipeline.submit(domain, qtype, token).map_err(failed)? {
                 None => "DNS connection closed".to_string(),
                 Some((reply, _pending)) => match tokio::time::timeout(self.timeout, reply).await {
                     Ok(Ok(Outcome::Response(resp))) => {
@@ -1006,7 +1093,7 @@ impl DnsClient {
                     // usable and a late reply is discarded.
                     Err(_) => {
                         stats.timeouts.fetch_add(1, Ordering::Relaxed);
-                        return Err(anyhow!("DNS query timed out"));
+                        return Err(QueryError::TimedOut);
                     }
                 },
             };
@@ -1014,10 +1101,23 @@ impl DnsClient {
             // (the slot replaces a closed connection on the next use).
             stats.exchange_errors.fetch_add(1, Ordering::Relaxed);
             if attempt == 1 {
-                return Err(anyhow!("DNS query failed: {reason}"));
+                return Err(QueryError::Failed(reason));
             }
         }
         unreachable!("the second attempt always returns")
+    }
+
+    /// Look up `domain` (type `qtype`) and classify the outcome (see
+    /// [`Lookup::from_query`]): `answer` picks the wanted values out of the
+    /// answer records. This is the one place where rcodes and errors
+    /// become found / absent / temporary.
+    pub async fn lookup<T>(
+        &self,
+        domain: &str,
+        qtype: u16,
+        answer: impl Fn(QType) -> Option<T>,
+    ) -> Lookup<T> {
+        Lookup::from_query(self.query(domain, qtype).await, answer)
     }
 
     /// Claim the least-loaded slot (ties: the lowest index); the returned
@@ -1158,6 +1258,73 @@ async fn connect(endpoint: &str, config: &Arc<ClientConfig>) -> Result<DotStream
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one classification of query outcomes: answers are Found;
+    /// NOERROR without wanted answers, NXDOMAIN and invalid names are
+    /// Absent; every other rcode, a timeout and a failure are TempError.
+    #[test]
+    fn lookup_classifies_every_outcome() {
+        let reply = |rcode: u8, answer: bool| {
+            let mut m = DnsMessage::new(1, Vec::new());
+            m.header.rcode = rcode;
+            if answer {
+                m.answers.push(DnsResourceRecord {
+                    name: Label::new(String::new()),
+                    record_type: 1,
+                    record_class: 1,
+                    ttl: 60,
+                    rdlength: 4,
+                    rdata: QType::A("192.0.2.1".parse().unwrap()),
+                });
+            }
+            Ok(m)
+        };
+        let a = |q: QType| match q {
+            QType::A(ip) => Some(ip),
+            _ => None,
+        };
+        let txt = |q: QType| match q {
+            QType::TXT(t) => Some(t),
+            _ => None,
+        };
+        assert_eq!(
+            Lookup::from_query(reply(0, true), a),
+            Lookup::Found(vec!["192.0.2.1".parse().unwrap()])
+        );
+        assert_eq!(
+            Lookup::from_query(reply(0, false), a),
+            Lookup::Absent,
+            "NODATA"
+        );
+        assert_eq!(
+            Lookup::from_query(reply(0, true), txt),
+            Lookup::Absent,
+            "no answer of the type"
+        );
+        assert_eq!(
+            Lookup::from_query(reply(3, false), a),
+            Lookup::Absent,
+            "NXDOMAIN"
+        );
+        for rcode in [1u8, 2, 4, 5] {
+            assert!(
+                matches!(
+                    Lookup::from_query(reply(rcode, false), a),
+                    Lookup::TempError(_)
+                ),
+                "rcode {rcode}"
+            );
+        }
+        let invalid = proto::normalize_name("a..b").unwrap_err();
+        assert_eq!(
+            Lookup::from_query(Err(QueryError::InvalidName(invalid)), a),
+            Lookup::Absent
+        );
+        assert!(matches!(
+            Lookup::from_query(Err(QueryError::TimedOut), a),
+            Lookup::TempError(_)
+        ));
+    }
 
     /// Build a response message in memory (no wire roundtrip needed
     /// for cache-semantics tests).
@@ -1511,7 +1678,7 @@ mod tests {
             String::new(),
         ] {
             let err = client.query(&bad, 16).await.unwrap_err();
-            assert!(is_invalid_name(&err), "{err:#}");
+            assert!(matches!(err, QueryError::InvalidName(_)), "{err}");
         }
         assert!(started.elapsed() < Duration::from_secs(1));
         let stats = client.stats();
@@ -1999,7 +2166,7 @@ mod tests {
         let client = mock_client(&mock, Duration::from_millis(300)).with_connections(1);
 
         let err = client.query("late.test", 1).await.unwrap_err();
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(err, QueryError::TimedOut);
         client.query("fast.test", 1).await.unwrap();
 
         // The late reply arrives ~800 ms after it was sent.

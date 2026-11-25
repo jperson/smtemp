@@ -131,13 +131,25 @@ pub struct RawHeader<'m> {
     /// excluding the final line terminator. Embedded CRLF/LF of folded
     /// continuation lines and all whitespace are preserved verbatim.
     pub raw_value: &'m [u8],
+    /// Where the whole field lies in the header block it was scanned from:
+    /// from the first byte of its name to just past the line terminator of
+    /// its last (folded) line. Removing exactly these bytes removes the
+    /// field and nothing else.
+    pub span: std::ops::Range<usize>,
 }
 
 impl RawHeader<'_> {
     /// Returns whether this header's name equals `name`, ignoring ASCII
-    /// case (header field names are case-insensitive per RFC 5322).
+    /// case (header field names are case-insensitive per RFC 5322) and
+    /// any whitespace before the colon (the obsolete `From :` form, RFC
+    /// 5322 §4.5).
     pub fn name_eq(&self, name: &str) -> bool {
-        self.name.eq_ignore_ascii_case(name.as_bytes())
+        let end = self
+            .name
+            .iter()
+            .rposition(|&b| b != b' ' && b != b'\t')
+            .map_or(0, |p| p + 1);
+        self.name[..end].eq_ignore_ascii_case(name.as_bytes())
     }
 }
 
@@ -270,36 +282,39 @@ pub fn split_message(raw: &[u8]) -> Result<(&[u8], &[u8]), MailHeaderError> {
     if raw.is_empty() {
         return Ok((&[], &[]));
     }
-    if let Some(body) = raw.strip_prefix(b"\r\n") {
-        return Ok((&[], body));
-    }
-    if let Some(body) = raw.strip_prefix(b"\n") {
-        return Ok((&[], body));
-    }
+    let (header_len, body_start) = find_separator(raw).ok_or(MailHeaderError::MissingSeparator)?;
+    Ok((&raw[..header_len], &raw[body_start..]))
+}
 
-    for i in 0..raw.len() {
-        if raw[i] != b'\n' {
-            continue;
-        }
-        match raw.get(i + 1) {
-            // Last header ended with LF; the blank line is a bare LF.
-            Some(b'\n') => return Ok((&raw[..i + 1], &raw[i + 2..])),
-            // Last header ended with CRLF (or LF); the blank line is CRLF.
-            Some(b'\r') if raw.get(i + 2) == Some(&b'\n') => {
-                return Ok((&raw[..i + 1], &raw[i + 3..]));
-            }
-            _ => {}
-        }
+/// Find the blank line that ends the header block of `raw` (an empty line,
+/// terminated by CRLF or LF, at the start of `raw` or after a line's LF).
+/// This is the one definition of where headers end: [`split_message`] and
+/// every header scan use it.
+///
+/// Returns `(header_len, body_start)`: the header block is
+/// `raw[..header_len]` (including its last header's terminator) and the
+/// body `raw[body_start..]`. `None` when there is no blank line.
+pub fn find_separator(raw: &[u8]) -> Option<(usize, usize)> {
+    let blank_at = |i: usize| match raw.get(i) {
+        Some(b'\n') => Some(i + 1),
+        Some(b'\r') if raw.get(i + 1) == Some(&b'\n') => Some(i + 2),
+        _ => None,
+    };
+    if let Some(body) = blank_at(0) {
+        return Some((0, body));
     }
-
-    Err(MailHeaderError::MissingSeparator)
+    (0..raw.len())
+        .filter(|&i| raw[i] == b'\n')
+        .find_map(|i| blank_at(i + 1).map(|body| (i + 1, body)))
 }
 
 /// Split `header_block` into [`RawHeader`]s, preserving order,
 /// duplicates, folding, and exact bytes. Never fails.
 ///
-/// Lines that neither contain a colon nor continue a previous header are
-/// malformed and skipped.
+/// A line starting with a space or tab continues the field before it. A
+/// line that has no colon and isn't a continuation is malformed: it is
+/// skipped, and it ends the field before it, so continuation lines after
+/// it belong to no field (they are skipped too).
 pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
     /// A header being accumulated across its folded lines.
     struct HeaderAcc<'a> {
@@ -309,10 +324,17 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
         value_start: usize,
         /// Offset just past the value's last line content.
         value_end: usize,
+        /// Offset of the field's first byte.
+        start: usize,
+        /// Offset just past the field's last line terminator.
+        end: usize,
     }
 
     let mut acc: Vec<HeaderAcc> = Vec::new();
     let mut line_start = 0usize;
+    // Whether continuation lines extend the last field (false after a
+    // malformed line).
+    let mut open = false;
 
     for (i, &b) in header_block.iter().enumerate() {
         if b != b'\n' {
@@ -327,15 +349,21 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
 
         if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
             // Folded continuation: extend the previous header's raw value.
-            if let Some(last) = acc.last_mut() {
+            if let Some(last) = acc.last_mut().filter(|_| open) {
                 last.value_end = content_end;
+                last.end = i + 1;
             }
         } else if let Some(colon) = line.iter().position(|&c| c == b':') {
             acc.push(HeaderAcc {
                 name: &header_block[line_start..line_start + colon],
                 value_start: line_start + colon + 1,
                 value_end: content_end,
+                start: line_start,
+                end: i + 1,
             });
+            open = true;
+        } else {
+            open = false;
         }
 
         line_start = i + 1;
@@ -345,14 +373,17 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
     if line_start < header_block.len() {
         let line = &header_block[line_start..];
         if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
-            if let Some(last) = acc.last_mut() {
+            if let Some(last) = acc.last_mut().filter(|_| open) {
                 last.value_end = header_block.len();
+                last.end = header_block.len();
             }
         } else if let Some(colon) = line.iter().position(|&c| c == b':') {
             acc.push(HeaderAcc {
                 name: &header_block[line_start..line_start + colon],
                 value_start: line_start + colon + 1,
                 value_end: header_block.len(),
+                start: line_start,
+                end: header_block.len(),
             });
         }
     }
@@ -361,6 +392,7 @@ pub fn extract_raw_headers(header_block: &[u8]) -> Vec<RawHeader<'_>> {
         .map(|h| RawHeader {
             name: h.name,
             raw_value: &header_block[h.value_start..h.value_end],
+            span: h.start..h.end,
         })
         .collect()
 }
@@ -1235,6 +1267,56 @@ fn optional_field<'p>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each field's span covers exactly its bytes, folded lines and the
+    /// terminator included, so cutting it removes that field only.
+    #[test]
+    fn raw_header_spans_cover_whole_fields() {
+        let block = b"A: 1\r\nB: 2\r\n\tcontinued\r\nC: 3\n";
+        let headers = extract_raw_headers(block);
+        let spans: Vec<&[u8]> = headers.iter().map(|h| &block[h.span.clone()]).collect();
+        assert_eq!(
+            spans,
+            [&b"A: 1\r\n"[..], b"B: 2\r\n\tcontinued\r\n", b"C: 3\n"]
+        );
+        assert_eq!(headers[1].raw_value, b" 2\r\n\tcontinued");
+    }
+
+    /// A line with no colon ends the field before it: a continuation line
+    /// after it is not appended there (it belongs to no field).
+    #[test]
+    fn malformed_line_ends_the_previous_field() {
+        let block = b"From: a@x.example\r\ngarbage\r\n more@y.example\r\nSubject: s\r\n";
+        let headers = extract_raw_headers(block);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].raw_value, b" a@x.example");
+        assert_eq!(&block[headers[0].span.clone()], b"From: a@x.example\r\n");
+        assert!(headers[1].name_eq("subject"));
+    }
+
+    /// The obsolete `From :` form (space before the colon) is still From.
+    #[test]
+    fn name_eq_ignores_space_before_the_colon() {
+        let headers = extract_raw_headers(b"From : a@x.example\r\n");
+        assert!(headers[0].name_eq("from"));
+        assert!(!headers[0].name_eq("from "));
+    }
+
+    /// The separator is the first empty line, after CRLF or LF, or at the
+    /// very start; there may be none.
+    #[test]
+    fn find_separator_finds_the_first_blank_line() {
+        assert_eq!(find_separator(b"A: 1\r\n\r\nbody"), Some((6, 8)));
+        assert_eq!(find_separator(b"A: 1\n\nbody"), Some((5, 6)));
+        assert_eq!(find_separator(b"A: 1\n\r\nbody"), Some((5, 7)));
+        assert_eq!(find_separator(b"\r\nbody"), Some((0, 2)));
+        assert_eq!(find_separator(b"A: 1\r\nB: 2\r\n"), None);
+        assert_eq!(
+            find_separator(b"A: 1\r\n \r\n\r\nb"),
+            Some((9, 11)),
+            "a WSP line is a continuation"
+        );
+    }
 
     #[test]
     fn trace_headers() {

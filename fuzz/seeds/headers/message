@@ -1,0 +1,7 @@
+DKIM-Signature: v=1; a=rsa-sha256; d=x.example; s=s; h=From; bh=AAAA; b=AAAA
+From: "ceo@victim.example" <x@attacker.example>
+Subject: =?utf-8?B?aGk=?=
+ folded
+Authentication-Results: mx.example.org; dmarc=pass
+
+body

@@ -333,6 +333,7 @@ async fn dkim_verdicts_do_not_leak_across_messages() {
         signature_ok: true,
         verified: true,
         error: None,
+        temporary: false,
     });
 
     // Message 2: an unsigned spoof of the same domain.
@@ -948,4 +949,44 @@ Subject: wire the money\r\n\r\nbody\r\n"
         meta["display_name_claims"],
         serde_json::json!(["victim.example"])
     );
+}
+
+/// A transient DNS failure must never turn into a permanent refusal: a
+/// `p=reject` domain's message whose DKIM key lookup gets SERVFAIL is
+/// deferred (451, the sender retries), while the same message whose key
+/// definitely doesn't exist (NXDOMAIN) is rejected (550).
+#[tokio::test]
+async fn dkim_key_servfail_defers_instead_of_rejecting() {
+    let message =
+        b"DKIM-Signature: v=1; a=rsa-sha256; d=victim.example; s=sel; h=From; bh=AAAA; b=AAAA\r\n\
+From: ceo@victim.example\r\nSubject: s\r\n\r\nbody\r\n";
+    for (key_rcode, expect_temp) in [(2u8, true), (3u8, false)] {
+        let dns = spawn_mock_resolver(
+            move |name, qtype| match (name, qtype) {
+                (n, 16) if n.starts_with("_dmarc.") => MockAnswer::Txt("v=DMARC1; p=reject"),
+                ("sel._domainkey.victim.example", 16) => MockAnswer::Rcode(key_rcode),
+                _ => MockAnswer::Rcode(3),
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SessionConfig {
+            dns,
+            ..size_limit_session(dir.path())
+        };
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        session.begin("x@sender.example");
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+        session.t().data = message.to_vec();
+        let reply = session.end_data().await;
+        if expect_temp {
+            assert_eq!(reply, smtp::Control::tempfail(DMARC_TEMPFAIL), "SERVFAIL");
+        } else {
+            assert!(
+                matches!(reply, smtp::Control::Reject(_)),
+                "NXDOMAIN: {reply:?}"
+            );
+        }
+    }
 }

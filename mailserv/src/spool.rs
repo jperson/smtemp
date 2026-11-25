@@ -71,6 +71,9 @@ pub trait SpoolWriter: Send + Sync {
     /// [`new_queue_id`]), otherwise under a new ID. The backend sets
     /// [`SpoolMeta::encryption`] when it seals the payload.
     ///
+    /// Takes the payload by value, so a backend that stores it as given
+    /// hands the same buffer back instead of copying it.
+    ///
     /// Returns the queue ID and the stored payload once the message is
     /// committed.
     ///
@@ -80,7 +83,7 @@ pub trait SpoolWriter: Send + Sync {
     /// be observable through the backend (partial staging files are
     /// acceptable debris, a committed message is not). Callers treat
     /// `Err` as a temporary failure and refuse the message with `451`.
-    fn write(&self, meta: SpoolMeta, payload: &[u8]) -> Result<StoredMessage>;
+    fn write(&self, meta: SpoolMeta, payload: Vec<u8>) -> Result<StoredMessage>;
 
     /// Remove the fully handled message `queue_id` from the backend (all
     /// recipients delivered).
@@ -233,9 +236,9 @@ pub struct SpoolMeta {
     pub rcpt_to: Vec<SpoolRcpt>,
     /// SPF verdict for the MAIL FROM identity; `None` for authenticated
     /// submissions, where SPF is skipped.
-    pub spf_result: Option<String>,
+    pub spf_result: Option<spf::SpfResult>,
     /// SPF verdict for the HELO/EHLO identity.
-    pub spf_helo: Option<String>,
+    pub spf_helo: Option<spf::SpfResult>,
     /// Per-signature DKIM verdicts for this message.
     pub dkim: Vec<DkimSummary>,
     /// DMARC verdict, if a From-domain was determinable.
@@ -441,7 +444,7 @@ impl SpoolWriter for DiskSpool {
         "disk"
     }
 
-    fn write(&self, mut meta: SpoolMeta, raw: &[u8]) -> Result<StoredMessage> {
+    fn write(&self, mut meta: SpoolMeta, raw: Vec<u8>) -> Result<StoredMessage> {
         if meta.queue_id.is_empty() {
             meta.queue_id = new_queue_id();
         }
@@ -456,11 +459,13 @@ impl SpoolWriter for DiskSpool {
         // was written and there is nothing to roll back.
         let payload = match &self.encryptor {
             Some(e) => {
-                let sealed = e.encrypt(raw).context("spool payload encryption failed")?;
+                let sealed = e.encrypt(&raw).context("spool payload encryption failed")?;
                 meta.encryption = Some(e.id());
                 sealed
             }
-            None => raw.to_vec(),
+            // Stored as given: the same buffer goes to disk and back to
+            // the caller, uncopied.
+            None => raw,
         };
 
         // Payload first. A failure here leaves at most a staging file in
@@ -603,7 +608,8 @@ impl SpoolQueue for DiskSpool {
     /// files that disappear concurrently, are skipped.
     fn sweep_debris(&self, now: u64, min_age: Duration) -> Result<Vec<String>> {
         let old_enough = |path: &Path| {
-            changed_at(path).is_some_and(|at| now.saturating_sub(at) >= min_age.as_secs())
+            crate::fsutil::changed_at(path)
+                .is_some_and(|at| now.saturating_sub(at) >= min_age.as_secs())
         };
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(&self.tmp)
@@ -640,26 +646,6 @@ impl SpoolQueue for DiskSpool {
     }
 }
 
-/// Returns when the file at `path` last changed, in Unix seconds: its
-/// ctime on Unix (updated by rename, write and chmod), its mtime
-/// elsewhere. `None` if it can't be read.
-fn changed_at(path: &Path) -> Option<u64> {
-    let meta = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        u64::try_from(meta.ctime()).ok()
-    }
-    #[cfg(not(unix))]
-    {
-        meta.modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-    }
-}
-
 /// Write `bytes` to a new private file at `path` (truncating any
 /// existing file), fsync it, and only then return: callers can rely on
 /// the bytes surviving a crash once this returns `Ok`.
@@ -685,6 +671,39 @@ mod tests {
 
     /// A metadata record with plausible values; tests override the
     /// fields they care about via struct update syntax.
+    /// Metadata written by an older version (verdicts as Rust variant
+    /// names, no `display_name_claims`, DKIM without `temporary`) still
+    /// loads, and is written back under the stable names.
+    #[test]
+    fn metadata_from_older_versions_loads() {
+        let old = r#"{
+            "queue_id": "0000000064f1.0123456789abcdef", "session_id": "s",
+            "server_domain": "mail.test", "received_at": "2026-11-20T00:00:00Z",
+            "peer": "192.0.2.1:25", "helo": "h.example", "mail_from": "a@b.example",
+            "rcpt_to": [], "spf_result": "SoftFail", "spf_helo": "Pass",
+            "dkim": [{"domain": "b.example", "selector": "s", "body_hash_ok": true,
+                      "signature_ok": false, "verified": false, "error": "x"}],
+            "dmarc": {"from_domain": "b.example", "policy": "Reject", "spf_aligned": false,
+                      "dkim_aligned": false, "pass": false, "action": "Quarantine"},
+            "authenticated": null, "tls_active": true, "message_size": 10, "encryption": null
+        }"#;
+        let meta: SpoolMeta = serde_json::from_str(old).unwrap();
+        assert_eq!(meta.spf_result, Some(spf::SpfResult::SoftFail));
+        assert_eq!(meta.spf_helo, Some(spf::SpfResult::Pass));
+        assert!(!meta.dkim[0].temporary);
+        assert!(meta.display_name_claims.is_empty());
+        let dmarc = meta.dmarc.as_ref().unwrap();
+        assert_eq!(
+            (dmarc.policy, dmarc.action),
+            (dmarc::DmarcPolicy::Reject, dmarc::Action::Quarantine)
+        );
+
+        let new = serde_json::to_value(&meta).unwrap();
+        assert_eq!(new["spf_result"], "softfail");
+        assert_eq!(new["dmarc"]["policy"], "reject");
+        assert_eq!(new["dmarc"]["action"], "quarantine");
+    }
+
     fn sample_meta() -> SpoolMeta {
         SpoolMeta {
             queue_id: String::new(),
@@ -701,7 +720,7 @@ mod tests {
                 public_key: None,
                 key_generation: None,
             }],
-            spf_result: Some("Pass".into()),
+            spf_result: Some(spf::SpfResult::Pass),
             spf_helo: None,
             dkim: Vec::new(),
             dmarc: None,
@@ -757,7 +776,7 @@ mod tests {
                     message_size: raw.len(),
                     ..sample_meta()
                 },
-                &raw,
+                raw.clone(),
             )
             .unwrap();
         assert_eq!(payload, raw, "write returns the stored bytes");
@@ -796,7 +815,7 @@ mod tests {
         .unwrap();
         assert_eq!(meta["queue_id"], queue_id.as_str());
         assert_eq!(meta["rcpt_to"][0]["address"], "user@example.org");
-        assert_eq!(meta["spf_result"], "Pass");
+        assert_eq!(meta["spf_result"], "pass", "the stable name");
         assert_eq!(meta["message_size"], raw.len());
         assert!(meta["encryption"].is_null());
     }
@@ -816,7 +835,7 @@ mod tests {
                     message_size: raw.len(),
                     ..sample_meta()
                 },
-                &raw,
+                raw.clone(),
             )
             .unwrap();
 
@@ -845,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path(), Some(Arc::new(FailingEncryptor))).unwrap();
 
-        let result = spool.write(sample_meta(), b"payload");
+        let result = spool.write(sample_meta(), b"payload".to_vec());
         assert!(result.is_err());
 
         for sub in ["new", "tmp"] {
@@ -865,8 +884,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path(), None).unwrap();
         let raw: Vec<u8> = b"payload".to_vec();
-        let a = spool.write(sample_meta(), &raw).unwrap().queue_id;
-        let b = spool.write(sample_meta(), &raw).unwrap().queue_id;
+        let a = spool.write(sample_meta(), raw.clone()).unwrap().queue_id;
+        let b = spool.write(sample_meta(), raw.clone()).unwrap().queue_id;
         assert_ne!(a, b);
     }
 
@@ -899,7 +918,10 @@ mod tests {
     fn sweep_removes_only_old_uncommitted_files() {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path(), None).unwrap();
-        let committed = spool.write(sample_meta(), b"payload").unwrap().queue_id;
+        let committed = spool
+            .write(sample_meta(), b"payload".to_vec())
+            .unwrap()
+            .queue_id;
         let (tmp, new) = (dir.path().join("tmp"), dir.path().join("new"));
         let dead = dir.path().join("dead-letter");
         std::fs::create_dir(&dead).unwrap();
@@ -955,7 +977,7 @@ mod tests {
 
         // Removing twice: the second call finds nothing and still succeeds.
         let raw = b"payload".to_vec();
-        let id = spool.write(sample_meta(), &raw).unwrap().queue_id;
+        let id = spool.write(sample_meta(), raw.clone()).unwrap().queue_id;
         SpoolWriter::remove(&spool, &id).unwrap();
         assert!(spool.list().unwrap().is_empty());
         SpoolWriter::remove(&spool, &id).unwrap();

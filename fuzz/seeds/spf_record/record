@@ -1,0 +1,1 @@
+v=spf1 include:_spf.%{d} a:%{l1r+-}.example mx/24 ip4:192.0.2.0/24 ip6:2001:db8::/32 exists:%{ir}.%{v}.x redirect=%{o} -all

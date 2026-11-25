@@ -120,10 +120,15 @@ pub fn organizational_domain(domain: &str) -> Option<String> {
 }
 
 /// Trim `domain`, drop a trailing dot and lowercase it; `None` if nothing
-/// is left or a label is empty.
+/// is left, a label is empty, or it has a character no DNS hostname label
+/// has (only letters, digits, `-` and `_` are kept; IDNs arrive in their
+/// `xn--` form). A name like that (an attacker-chosen DKIM `d=`, say) has
+/// no organizational domain, so it can only align with itself.
 fn normalize(domain: &str) -> Option<String> {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if domain.is_empty() || domain.split('.').any(str::is_empty) {
+    let label_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
+    if domain.is_empty() || domain.split('.').any(str::is_empty) || !domain.bytes().all(label_char)
+    {
         return None;
     }
     Some(domain)
@@ -281,5 +286,9 @@ mod tests {
         // Malformed input.
         assert_eq!(org(""), None);
         assert_eq!(org("a..b.com"), None);
+        // Characters no hostname has (found by fuzzing: a form feed made
+        // the result unstable): no organizational domain.
+        assert_eq!(org("\x0c\x0cx.p["), None);
+        assert_eq!(org("a b.example.com"), None);
     }
 }

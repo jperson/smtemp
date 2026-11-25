@@ -12,6 +12,7 @@ members = [
     "dkim",
     "mailparse",
 ]
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 thiserror = "2.0.12"

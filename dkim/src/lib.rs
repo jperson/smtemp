@@ -101,6 +101,47 @@ pub enum DkimError {
     /// The RSA key is shorter than RFC 8301's 1024-bit minimum.
     #[error("RSA key too short: {0} bits (RFC 8301 requires at least 1024)")]
     WeakKey(usize),
+
+    /// A tag name occurs twice in a signature or key record, which makes
+    /// the whole tag list invalid (RFC 6376 §3.2).
+    #[error("duplicate tag: {0}")]
+    DuplicateTag(String),
+
+    /// The key record's `k=` is not the key algorithm of the signature's
+    /// `a=` (RFC 6376 §6.1.2).
+    #[error("key type {key} does not match the signature algorithm {signature}")]
+    KeyTypeMismatch {
+        /// The key algorithm named by the signature's `a=`.
+        signature: String,
+        /// The key record's `k=`.
+        key: String,
+    },
+}
+
+impl DkimError {
+    /// Whether this outcome may change on retry: only a key lookup that
+    /// got no definite answer ([`DkimError::KeyLookupFailed`]). A verifier
+    /// must not treat such a signature as having failed for good (a
+    /// DMARC rejection over it would refuse legitimate mail for a DNS
+    /// hiccup); every other error is permanent.
+    pub fn is_temporary(&self) -> bool {
+        matches!(self, DkimError::KeyLookupFailed(_))
+    }
+}
+
+/// Check the tag name `name` of a tag list against the names already in
+/// `seen`, recording it.
+///
+/// # Errors
+///
+/// [`DkimError::DuplicateTag`] when `name` was already seen (RFC 6376
+/// §3.2).
+fn note_tag<'t>(seen: &mut Vec<&'t str>, name: &'t str) -> Result<(), DkimError> {
+    if seen.contains(&name) {
+        return Err(DkimError::DuplicateTag(name.to_string()));
+    }
+    seen.push(name);
+    Ok(())
 }
 
 /// A parsed `DKIM-Signature` header (RFC 6376 Section 3.5).
@@ -164,12 +205,14 @@ impl<'a> DkimSignature<'a> {
         let mut timestamp = None;
         let mut expiry = None;
 
+        let mut seen = Vec::new();
         for segment in raw.split(';') {
             let Some((name, value)) = segment.split_once('=') else {
                 continue;
             };
             let name = trim_fws(name);
             let value = trim_fws(value);
+            note_tag(&mut seen, name)?;
             match name {
                 "v" => version = Some(value),
                 "a" => algorithm = Some(value),
@@ -276,6 +319,18 @@ impl<'a> DkimSignature<'a> {
         self.algorithm
             .rsplit_once('-')
             .map(|(_, hash)| hash)
+            .ok_or_else(|| DkimError::UnsupportedAlgorithm(self.algorithm.to_string()))
+    }
+
+    /// Returns the key algorithm of `a=` (`rsa` in `rsa-sha256`).
+    ///
+    /// # Errors
+    ///
+    /// [`DkimError::UnsupportedAlgorithm`] when `a=` has no `-`.
+    fn key_algorithm(&self) -> Result<&'a str, DkimError> {
+        self.algorithm
+            .rsplit_once('-')
+            .map(|(key, _)| key)
             .ok_or_else(|| DkimError::UnsupportedAlgorithm(self.algorithm.to_string()))
     }
 }
@@ -1078,7 +1133,34 @@ PGh0bWw+PGhlYWQ+PC9oZWFkPjxib2R5PjxkaXYgZGlyPSJhdXRvPlRlc3Q8L2Rpdj48L2JvZHk
         .unwrap();
         let r3 = verify_with_key(&msg, parsed, &wrong_type, 0);
         assert!(!r3.signature_ok);
-        assert!(matches!(r3.error, Some(DkimError::InvalidKey(_))));
+        assert_eq!(
+            r3.error,
+            Some(DkimError::KeyTypeMismatch {
+                signature: "ed25519".into(),
+                key: "rsa".into()
+            }),
+            "refused before any cryptography (RFC 6376 section 6.1.2)"
+        );
+    }
+
+    /// RFC 6376 section 3.2: a tag that occurs twice invalidates the whole
+    /// tag list, in a signature (where two `d=` could be read differently)
+    /// and in a key record.
+    #[test]
+    fn duplicate_tags_invalidate_the_tag_list() {
+        let sig = "v=1; a=rsa-sha256; d=good.example; s=s; h=From; bh=x; b=y; d=evil.example";
+        assert_eq!(
+            DkimSignature::parse(sig).unwrap_err(),
+            DkimError::DuplicateTag("d".into())
+        );
+        assert!(
+            DkimSignature::parse("v=1; a=rsa-sha256; d=good.example; s=s; h=From; bh=x; b=y")
+                .is_ok()
+        );
+        assert_eq!(
+            DkimKeyRecord::parse("v=DKIM1; k=rsa; p=AAAA; p=BBBB").unwrap_err(),
+            DkimError::DuplicateTag("p".into())
+        );
     }
 
     /// A signature made by a different key must not verify: the body
@@ -1293,7 +1375,8 @@ impl DkimKeyRecord {
     ///
     /// # Errors
     ///
-    /// [`DkimError::InvalidKey`] when there is no `p=` tag.
+    /// [`DkimError::InvalidKey`] when there is no `p=` tag, and
+    /// [`DkimError::DuplicateTag`] when a tag occurs twice.
     pub fn parse(raw: &str) -> Result<Self, DkimError> {
         let mut version = String::new();
         let mut key_type = String::new();
@@ -1302,12 +1385,14 @@ impl DkimKeyRecord {
         let mut flags = Vec::new();
         let mut hashes = Vec::new();
 
+        let mut seen = Vec::new();
         for segment in raw.split(';') {
             let Some((name, value)) = segment.split_once('=') else {
                 continue;
             };
             let name = name.trim();
             let value = value.trim();
+            note_tag(&mut seen, name)?;
             match name {
                 "v" => version = value.to_string(),
                 "k" => key_type = value.to_string(),
@@ -1372,27 +1457,30 @@ impl DkimKeyRecord {
 ///
 /// # Errors
 ///
-/// [`DkimError::KeyLookupFailed`] when the query fails,
-/// [`DkimError::NoKeyRecord`] when no answer parses.
+/// [`DkimError::KeyLookupFailed`] when the lookup gave no definite answer
+/// (a failed or timed-out query, or a server error such as SERVFAIL): a
+/// temporary condition, see [`DkimError::is_temporary`].
+/// [`DkimError::NoKeyRecord`] when the name definitely has no key: no
+/// such name, no TXT records, or none that parses.
 pub async fn fetch_public_key(
     resolver: &DnsClient,
     sig: &DkimSignature<'_>,
 ) -> Result<DkimKeyRecord, DkimError> {
     let name = sig.key_query_name();
-    let resp = resolver
-        .query(&name, 0x10)
+    let txts = match resolver
+        .lookup(&name, 0x10, |r| match r {
+            dns::proto::QType::TXT(txt) => Some(txt),
+            _ => None,
+        })
         .await
-        .map_err(|e| DkimError::KeyLookupFailed(e.to_string()))?;
-
-    for ans in &resp.answers {
-        if let dns::proto::QType::TXT(txt) = &ans.rdata {
-            if let Ok(key) = DkimKeyRecord::parse(txt.trim()) {
-                return Ok(key);
-            }
-        }
-    }
-
-    Err(DkimError::NoKeyRecord(name))
+    {
+        dns::Lookup::Found(txts) => txts,
+        dns::Lookup::Absent => return Err(DkimError::NoKeyRecord(name)),
+        dns::Lookup::TempError(reason) => return Err(DkimError::KeyLookupFailed(reason)),
+    };
+    txts.iter()
+        .find_map(|txt| DkimKeyRecord::parse(txt.trim()).ok())
+        .ok_or(DkimError::NoKeyRecord(name))
 }
 
 /// Whether the signature's AUID (`i=`) domain aligns with the signing
@@ -1465,6 +1553,15 @@ pub fn verify_signature(
         return Err(DkimError::RevokedKey);
     }
 
+    // RFC 6376 §6.1.2: the key must be of the signature's algorithm
+    // (otherwise an ed25519 key could be offered for an rsa-sha256 tag).
+    let sig_key = sig.key_algorithm()?;
+    if !sig_key.eq_ignore_ascii_case(&key.key_type) {
+        return Err(DkimError::KeyTypeMismatch {
+            signature: sig_key.to_string(),
+            key: key.key_type.clone(),
+        });
+    }
     let hash = sig.hash_algorithm()?;
     // RFC 8301: SHA-1 is deprecated. Only SHA-256 is implemented, for both
     // rsa-sha256 (RFC 6376) and ed25519-sha256 (RFC 8463).

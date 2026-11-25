@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { version = "1.0.207", features = ["derive"] }
 spf = { path = "../spf" }
 
 anyhow = "1.0.86"

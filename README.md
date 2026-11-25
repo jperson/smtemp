@@ -308,7 +308,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 312 tests, 1 ignored
+cargo test --workspace          # 328 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```
@@ -325,6 +325,12 @@ Every fixed security finding has a test that reproduces its attack.
 **Network.** The tests need nothing beyond loopback: every DNS-backed test
 runs against a local mock DNS-over-TLS resolver. The one exception is the
 `#[ignore]`d DKIM test, which fetches a live key.
+
+### Fuzzing
+
+`fuzz/` holds libFuzzer targets for every parser that takes attacker
+bytes (SMTP framing, headers, DKIM, SPF, DMARC, DNS). CI runs each for 30
+seconds; see [fuzz/README.md](fuzz/README.md) for longer runs.
 
 ### Lints (enforced by CI)
 

@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-use dns::proto::{DnsMessage, QType};
+use dns::proto::QType;
 use dns::DnsClient;
+pub use dns::Lookup;
 
 /// The public module for the lexer and AST parser.
 pub mod parser;
@@ -27,22 +28,51 @@ use crate::parser::parser::{
 };
 
 /// The result of an SPF evaluation (RFC 7208 Section 2.6).
-#[derive(Debug, Eq, PartialEq, Clone, Serialize)]
+///
+/// Serialized under its RFC 7208/8601 result name (`pass`, `softfail`,
+/// `temperror`, ...; see [`SpfResult::as_str`]), a stable name stored
+/// data can rely on; the variant names written by older versions (`Pass`,
+/// `SoftFail`) are still read.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpfResult {
     /// No SPF record published for the checked domain.
+    #[serde(alias = "None")]
     None,
     /// The domain explicitly asserts no opinion (`?all`).
+    #[serde(alias = "Neutral")]
     Neutral,
     /// The sending IP is authorized.
+    #[serde(alias = "Pass")]
     Pass,
     /// The sending IP is explicitly not authorized (`-all`).
+    #[serde(alias = "Fail")]
     Fail,
     /// The sending IP is probably not authorized (`~all`).
+    #[serde(alias = "SoftFail")]
     SoftFail,
     /// A transient DNS error; evaluation may be retried.
+    #[serde(alias = "TempError")]
     TempError,
     /// The record (or the evaluation) is unusable.
+    #[serde(alias = "PermError")]
     PermError,
+}
+
+impl SpfResult {
+    /// Returns the result's RFC 7208 §2.6 / RFC 8601 name, as used in
+    /// `Authentication-Results:` and stored data.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpfResult::None => "none",
+            SpfResult::Neutral => "neutral",
+            SpfResult::Pass => "pass",
+            SpfResult::Fail => "fail",
+            SpfResult::SoftFail => "softfail",
+            SpfResult::TempError => "temperror",
+            SpfResult::PermError => "permerror",
+        }
+    }
 }
 
 /// Why an SPF evaluation could not produce a normal result. The variants
@@ -149,22 +179,51 @@ impl Budget {
 /// The DNS lookups SPF evaluation needs, abstracted so evaluations can run
 /// against recorded fixtures in tests instead of live DNS.
 ///
-/// Implementations return an empty vector for a name that does not exist
-/// (NXDOMAIN) and an `Err` for transient lookup failures.
+/// Every lookup has three outcomes ([`Lookup`]): found, absent (NXDOMAIN,
+/// no records of the type, or a name with no valid wire form) and a
+/// temporary error, which callers must never mistake for "absent".
 pub trait SpfResolver {
     /// TXT lookup (qtype 16): all strings concatenated by the codec,
     /// which is what SPF records need (they live in one TXT record but
-    /// DKIM keys span multiple strings). NXDOMAIN is an empty result.
-    fn txt(&self, domain: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
+    /// DKIM keys span multiple strings).
+    fn txt(&self, domain: &str) -> impl Future<Output = Lookup<String>> + Send;
     /// A lookup (qtype 1): the IPv4 addresses of the domain.
-    /// NXDOMAIN is an empty result.
-    fn a(&self, domain: &str) -> impl Future<Output = Result<Vec<Ipv4Addr>>> + Send;
-    /// MX lookup (qtype 15): (preference, exchange) pairs in record
-    /// order. NXDOMAIN is an empty result.
-    fn mx(&self, domain: &str) -> impl Future<Output = Result<Vec<(u16, String)>>> + Send;
-    /// PTR lookup (qtype 12): the reverse-lookup names. NXDOMAIN is an
-    /// empty result.
-    fn ptr(&self, domain: &str) -> impl Future<Output = Result<Vec<String>>> + Send;
+    fn a(&self, domain: &str) -> impl Future<Output = Lookup<Ipv4Addr>> + Send;
+    /// MX lookup (qtype 15): (preference, exchange) pairs in record order.
+    fn mx(&self, domain: &str) -> impl Future<Output = Lookup<(u16, String)>> + Send;
+    /// PTR lookup (qtype 12): the reverse-lookup names.
+    fn ptr(&self, domain: &str) -> impl Future<Output = Lookup<String>> + Send;
+}
+
+/// Unwrap the lookup of a DNS-querying term (the mechanism's own query):
+/// found values, or nothing (one void lookup, RFC 7208 §4.6.4).
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a temporary error, and the budget's void limit.
+fn term_lookup<T>(lookup: Lookup<T>, budget: &mut Budget) -> std::result::Result<Vec<T>, SpfError> {
+    match lookup {
+        Lookup::Found(values) => Ok(values),
+        Lookup::Absent => {
+            budget.record_void()?;
+            Ok(Vec::new())
+        }
+        Lookup::TempError(_) => Err(SpfError::Temp),
+    }
+}
+
+/// Unwrap a lookup that isn't a term (a record fetch, or an address
+/// lookup behind `mx`/`ptr`): found values, or nothing.
+///
+/// # Errors
+///
+/// [`SpfError::Temp`] for a temporary error.
+fn plain_lookup<T>(lookup: Lookup<T>) -> std::result::Result<Vec<T>, SpfError> {
+    match lookup {
+        Lookup::Found(values) => Ok(values),
+        Lookup::Absent => Ok(Vec::new()),
+        Lookup::TempError(_) => Err(SpfError::Temp),
+    }
 }
 
 /// [`SpfResolver`] over DNS-over-TLS. Each query is bounded by the
@@ -206,88 +265,54 @@ impl DotResolver {
     pub fn client(&self) -> Arc<DnsClient> {
         Arc::clone(&self.client)
     }
-
-    /// One DNS query for `domain`/`qtype` through the shared client
-    /// (pipelined connections, TTL cache).
-    ///
-    /// Returns the response, or `None` when the name has no valid wire
-    /// form (an empty label, a label over 63 octets, or a name over 253):
-    /// nothing is sent, and RFC 7208 §4.3 says a malformed domain is
-    /// treated like one that does not exist. As a transient error it would
-    /// give TempError (`451`) and an endless retry for a name that can
-    /// never resolve.
-    ///
-    /// # Errors
-    ///
-    /// The client's timeout and connection failures, which the
-    /// [`SpfResolver`] methods pass on as transient failures.
-    async fn query(&self, domain: &str, qtype: u16) -> Result<Option<DnsMessage>> {
-        match self.client.query(domain, qtype).await {
-            Ok(resp) => Ok(Some(resp)),
-            Err(e) if dns::is_invalid_name(&e) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
 }
 
-/// Collect the answers of `resp` that `f` maps to a value, treating
-/// NXDOMAIN (and an invalid name, `None`) as an empty result.
-///
-/// # Errors
-///
-/// Any rcode other than NOERROR or NXDOMAIN (a transient failure).
-fn take_answers<T>(resp: Option<DnsMessage>, f: impl Fn(QType) -> Option<T>) -> Result<Vec<T>> {
-    let Some(resp) = resp else {
-        return Ok(Vec::new());
-    };
-    match resp.header.rcode {
-        0x00 => Ok(resp
-            .answers
-            .into_iter()
-            .filter_map(|a| f(a.rdata))
-            .collect()),
-        0x03 => Ok(Vec::new()),
-        code => Err(anyhow::anyhow!("DNS lookup failed with rcode {code}")),
-    }
-}
-
+/// A name with no valid wire form (an empty label, a label over 63
+/// octets, or a name over 253) is looked up as [`Lookup::Absent`] without
+/// sending anything: RFC 7208 §4.3 treats a malformed domain like one
+/// that does not exist. As a temporary error it would give TempError
+/// (`451`) and an endless retry for a name that can never resolve.
 impl SpfResolver for DotResolver {
     // The A qtype is checked on the wire against a mock DoT server by
     // `wire::a_lookups_query_type_1_over_the_wire`.
-    async fn txt(&self, domain: &str) -> Result<Vec<String>> {
+    async fn txt(&self, domain: &str) -> Lookup<String> {
         // 0x10 = TXT.
-        let resp = self.query(domain, 0x10).await?;
-        take_answers(resp, |r| match r {
-            QType::TXT(s) => Some(s),
-            _ => None,
-        })
+        self.client
+            .lookup(domain, 0x10, |r| match r {
+                QType::TXT(s) => Some(s),
+                _ => None,
+            })
+            .await
     }
 
-    async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
+    async fn a(&self, domain: &str) -> Lookup<Ipv4Addr> {
         // 0x01 = A.
-        let resp = self.query(domain, 0x01).await?;
-        take_answers(resp, |r| match r {
-            QType::A(ip) => Some(ip),
-            _ => None,
-        })
+        self.client
+            .lookup(domain, 0x01, |r| match r {
+                QType::A(ip) => Some(ip),
+                _ => None,
+            })
+            .await
     }
 
-    async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>> {
+    async fn mx(&self, domain: &str) -> Lookup<(u16, String)> {
         // 0x0F = MX.
-        let resp = self.query(domain, 0x0F).await?;
-        take_answers(resp, |r| match r {
-            QType::MX(pref, label) => Some((pref, String::from(&label))),
-            _ => None,
-        })
+        self.client
+            .lookup(domain, 0x0F, |r| match r {
+                QType::MX(pref, label) => Some((pref, String::from(&label))),
+                _ => None,
+            })
+            .await
     }
 
-    async fn ptr(&self, domain: &str) -> Result<Vec<String>> {
+    async fn ptr(&self, domain: &str) -> Lookup<String> {
         // 0x0C = PTR.
-        let resp = self.query(domain, 0x0C).await?;
-        take_answers(resp, |r| match r {
-            QType::PTR(label) => Some(String::from(&label)),
-            _ => None,
-        })
+        self.client
+            .lookup(domain, 0x0C, |r| match r {
+                QType::PTR(label) => Some(String::from(&label)),
+                _ => None,
+            })
+            .await
     }
 }
 
@@ -309,7 +334,7 @@ pub async fn query_spf_record<R: SpfResolver + Sync>(
     // NOTE: no hostname-syntax validation here: underscore-prefixed names
     // (`_spf.example.com`, `selector._domainkey.example.com`) are valid in
     // DNS and routinely appear in SPF includes.
-    let txts = resolver.txt(domain).await.map_err(|_| SpfError::Temp)?;
+    let txts = plain_lookup(resolver.txt(domain).await)?;
 
     // RFC 7208 Section 3.2: a domain with more than one v=spf1 record is a
     // permanent error, and a record that does not parse is one too.
@@ -490,7 +515,7 @@ fn qualify(q: &SpfQualifier) -> SpfResult {
 /// otherwise (and always `None` for an IPv6 peer).
 fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
-        IpAddr::V4(ip4) if ip.contains(&ip4) => Some(result.clone()),
+        IpAddr::V4(ip4) if ip.contains(&ip4) => Some(*result),
         _ => None,
     }
 }
@@ -500,7 +525,7 @@ fn check_ipv4(peer: IpAddr, ip: &Ipv4Net, result: &SpfResult) -> Option<SpfResul
 /// otherwise (and always `None` for an IPv4 peer).
 fn check_ipv6(peer: IpAddr, ip: &Ipv6Net, result: &SpfResult) -> Option<SpfResult> {
     match peer {
-        IpAddr::V6(ip6) if ip.contains(&ip6) => Some(result.clone()),
+        IpAddr::V6(ip6) if ip.contains(&ip6) => Some(*result),
         _ => None,
     }
 }
@@ -525,10 +550,7 @@ async fn check_a_record<R: SpfResolver + Sync>(
     budget: &mut Budget,
 ) -> std::result::Result<Option<SpfResult>, SpfError> {
     budget.spend()?;
-    let ips = resolver.a(d).await.map_err(|_| SpfError::Temp)?;
-    if ips.is_empty() {
-        budget.record_void()?;
-    }
+    let ips = term_lookup(resolver.a(d).await, budget)?;
 
     for ip in ips {
         // The mechanism's ip4-cidr-length applies to every address.
@@ -561,10 +583,7 @@ async fn check_mx_record<R: SpfResolver + Sync>(
     budget: &mut Budget,
 ) -> std::result::Result<Option<SpfResult>, SpfError> {
     budget.spend()?;
-    let mxs = resolver.mx(d).await.map_err(|_| SpfError::Temp)?;
-    if mxs.is_empty() {
-        budget.record_void()?;
-    }
+    let mxs = term_lookup(resolver.mx(d).await, budget)?;
 
     // Checked before any address lookup: an MX set that can't be
     // evaluated within the cap is PermError whatever it would match.
@@ -572,7 +591,7 @@ async fn check_mx_record<R: SpfResolver + Sync>(
         return Err(SpfError::AddressLimit(MAX_ADDRESS_LOOKUPS));
     }
     for (_, exchange) in mxs {
-        let ips = resolver.a(&exchange).await.map_err(|_| SpfError::Temp)?;
+        let ips = plain_lookup(resolver.a(&exchange).await)?;
         for ip in ips {
             let ipn = Ipv4Net::new(ip, cidr.v4).map_err(|_| SpfError::Perm)?;
             if let Some(r) = check_ipv4(peer, &ipn, m) {
@@ -612,23 +631,20 @@ async fn check_ptr_record<R: SpfResolver + Sync>(
     let o = ip4.octets();
     let rev = format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0]);
     budget.spend()?;
-    let names = resolver.ptr(&rev).await.map_err(|_| SpfError::Temp)?;
-    if names.is_empty() {
-        budget.record_void()?;
-    }
+    let names = term_lookup(resolver.ptr(&rev).await, budget)?;
 
     let target = if d.is_empty() { current_domain } else { d };
     let target = target.to_ascii_lowercase();
 
     for name in names.into_iter().take(MAX_ADDRESS_LOOKUPS) {
         // Forward-confirm: the PTR name's A records must contain the IP.
-        let ips = resolver.a(&name).await.map_err(|_| SpfError::Temp)?;
+        let ips = plain_lookup(resolver.a(&name).await)?;
         if !ips.contains(&ip4) {
             continue;
         }
         let name = name.to_ascii_lowercase();
         if name == target || name.ends_with(&format!(".{target}")) {
-            return Ok(Some(m.clone()));
+            return Ok(Some(*m));
         }
     }
     Ok(None)
@@ -649,9 +665,8 @@ async fn check_exists<R: SpfResolver + Sync>(
     budget: &mut Budget,
 ) -> std::result::Result<Option<SpfResult>, SpfError> {
     budget.spend()?;
-    let ips = resolver.a(d).await.map_err(|_| SpfError::Temp)?;
+    let ips = term_lookup(resolver.a(d).await, budget)?;
     if ips.is_empty() {
-        budget.record_void()?;
         return Ok(None);
     }
     Ok(Some(SpfResult::Pass))
@@ -746,20 +761,36 @@ mod tests {
         a: HashMap<String, Vec<Ipv4Addr>>,
         mx: HashMap<String, Vec<(u16, String)>>,
         ptr: HashMap<String, Vec<String>>,
+        /// Names whose every lookup is a temporary error (SERVFAIL).
+        failing: std::collections::HashSet<String>,
+    }
+
+    impl MockResolver {
+        /// The lookup of `domain` in `table`: a temporary error for a
+        /// failing name, otherwise found or absent.
+        fn answer<T: Clone>(&self, table: &HashMap<String, Vec<T>>, domain: &str) -> Lookup<T> {
+            if self.failing.contains(domain) {
+                return Lookup::TempError("SERVFAIL".into());
+            }
+            match table.get(domain) {
+                Some(values) if !values.is_empty() => Lookup::Found(values.clone()),
+                _ => Lookup::Absent,
+            }
+        }
     }
 
     impl SpfResolver for MockResolver {
-        async fn txt(&self, domain: &str) -> Result<Vec<String>> {
-            Ok(self.txt.get(domain).cloned().unwrap_or_default())
+        async fn txt(&self, domain: &str) -> Lookup<String> {
+            self.answer(&self.txt, domain)
         }
-        async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
-            Ok(self.a.get(domain).cloned().unwrap_or_default())
+        async fn a(&self, domain: &str) -> Lookup<Ipv4Addr> {
+            self.answer(&self.a, domain)
         }
-        async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>> {
-            Ok(self.mx.get(domain).cloned().unwrap_or_default())
+        async fn mx(&self, domain: &str) -> Lookup<(u16, String)> {
+            self.answer(&self.mx, domain)
         }
-        async fn ptr(&self, domain: &str) -> Result<Vec<String>> {
-            Ok(self.ptr.get(domain).cloned().unwrap_or_default())
+        async fn ptr(&self, domain: &str) -> Lookup<String> {
+            self.answer(&self.ptr, domain)
         }
     }
 
@@ -825,19 +856,19 @@ mod tests {
     }
 
     impl SpfResolver for SlowResolver {
-        async fn txt(&self, domain: &str) -> Result<Vec<String>> {
+        async fn txt(&self, domain: &str) -> Lookup<String> {
             tokio::time::sleep(self.delay).await;
             self.inner.txt(domain).await
         }
-        async fn a(&self, domain: &str) -> Result<Vec<Ipv4Addr>> {
+        async fn a(&self, domain: &str) -> Lookup<Ipv4Addr> {
             tokio::time::sleep(self.delay).await;
             self.inner.a(domain).await
         }
-        async fn mx(&self, domain: &str) -> Result<Vec<(u16, String)>> {
+        async fn mx(&self, domain: &str) -> Lookup<(u16, String)> {
             tokio::time::sleep(self.delay).await;
             self.inner.mx(domain).await
         }
-        async fn ptr(&self, domain: &str) -> Result<Vec<String>> {
+        async fn ptr(&self, domain: &str) -> Lookup<String> {
             tokio::time::sleep(self.delay).await;
             self.inner.ptr(domain).await
         }
@@ -1204,6 +1235,50 @@ mod tests {
         );
     }
 
+    /// Each result is stored under its RFC name, the same one
+    /// `Authentication-Results:` uses, and the variant names older
+    /// versions stored still load.
+    #[test]
+    fn results_have_stable_names() {
+        for r in [
+            SpfResult::None,
+            SpfResult::Neutral,
+            SpfResult::Pass,
+            SpfResult::Fail,
+            SpfResult::SoftFail,
+            SpfResult::TempError,
+            SpfResult::PermError,
+        ] {
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(json, format!("\"{}\"", r.as_str()));
+            let old = format!("\"{r:?}\"");
+            assert_eq!(serde_json::from_str::<SpfResult>(&old).unwrap(), r, "{old}");
+        }
+    }
+
+    /// Fail closed: a temporary DNS error (SERVFAIL) anywhere the result
+    /// depends on is TempError, never "no record" or "no match", whether
+    /// it hits the record itself, an include, or a mechanism's lookup.
+    #[tokio::test]
+    async fn temporary_errors_are_temperror_everywhere() {
+        let mut resolver = MockResolver::default();
+        resolver.failing.insert("down.example".into());
+        resolver.failing.insert("inc-down.example".into());
+        resolver.failing.insert("host.example".into());
+        for (domain, record) in [
+            ("inc.example", "v=spf1 include:inc-down.example -all"),
+            ("a.example", "v=spf1 a:host.example -all"),
+            ("mx.example", "v=spf1 mx:host.example -all"),
+        ] {
+            resolver.txt.insert(domain.into(), vec![record.into()]);
+        }
+        for domain in ["down.example", "inc.example", "a.example", "mx.example"] {
+            let result = check(&resolver, "192.0.2.1", &format!("x@{domain}"), domain).await;
+            let verdict = result.unwrap_or_else(|e| e.to_result());
+            assert_eq!(verdict, SpfResult::TempError, "{domain}");
+        }
+    }
+
     /// RFC 7208 §4.6.4 for `ptr`: only the first 10 PTR names are
     /// forward-confirmed, the rest ignored, and the confirmations aren't
     /// charged against the 10-term budget.
@@ -1392,7 +1467,10 @@ mod tests {
         );
         let start = std::time::Instant::now();
         let result = resolver.txt("example.test").await;
-        assert!(result.is_err(), "the stalled query must fail");
+        assert!(
+            matches!(result, Lookup::TempError(_)),
+            "the stalled query must fail: {result:?}"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the query must give up after the timeout, not hang"
@@ -1403,7 +1481,7 @@ mod tests {
 #[cfg(test)]
 mod wire {
     use super::*;
-    use dns::proto::{DnsResourceRecord, Label};
+    use dns::proto::{DnsMessage, DnsResourceRecord, Label};
     use dns::DnsClient;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -1493,16 +1571,10 @@ mod wire {
         let long = format!("{}.example.com", "x".repeat(64));
 
         let started = std::time::Instant::now();
-        assert_eq!(resolver.txt(&long).await.unwrap(), Vec::<String>::new());
-        assert_eq!(
-            resolver.a("a..b.example").await.unwrap(),
-            Vec::<Ipv4Addr>::new()
-        );
-        assert_eq!(
-            resolver.mx(&long).await.unwrap(),
-            Vec::<(u16, String)>::new()
-        );
-        assert_eq!(resolver.ptr(&long).await.unwrap(), Vec::<String>::new());
+        assert_eq!(resolver.txt(&long).await, Lookup::Absent);
+        assert_eq!(resolver.a("a..b.example").await, Lookup::Absent);
+        assert_eq!(resolver.mx(&long).await, Lookup::Absent);
+        assert_eq!(resolver.ptr(&long).await, Lookup::Absent);
 
         // A MAIL FROM domain with an over-long label: SPF None, at once.
         let peer: IpAddr = "192.0.2.1".parse().unwrap();
@@ -1537,8 +1609,11 @@ mod wire {
         );
         let resolver = DotResolver::shared(Arc::new(client));
 
-        let ips = resolver.a("example.test").await.unwrap();
-        assert_eq!(ips, vec!["192.0.2.1".parse::<Ipv4Addr>().unwrap()]);
+        let ips = resolver.a("example.test").await;
+        assert_eq!(
+            ips,
+            Lookup::Found(vec!["192.0.2.1".parse::<Ipv4Addr>().unwrap()])
+        );
         assert_eq!(
             qtypes.load(Ordering::SeqCst),
             1,
@@ -1563,26 +1638,35 @@ mod record_edge_case_tests {
         txt: HashMap<String, Vec<String>>,
     }
 
-    impl SpfResolver for Dns {
-        async fn txt(&self, d: &str) -> Result<Vec<String>> {
-            Ok(self.txt.get(d).cloned().unwrap_or_default())
+    /// Found when `values` has any, absent otherwise.
+    fn found_or_absent<T>(values: Vec<T>) -> Lookup<T> {
+        if values.is_empty() {
+            Lookup::Absent
+        } else {
+            Lookup::Found(values)
         }
-        async fn a(&self, d: &str) -> Result<Vec<Ipv4Addr>> {
-            Ok(match d {
+    }
+
+    impl SpfResolver for Dns {
+        async fn txt(&self, d: &str) -> Lookup<String> {
+            found_or_absent(self.txt.get(d).cloned().unwrap_or_default())
+        }
+        async fn a(&self, d: &str) -> Lookup<Ipv4Addr> {
+            found_or_absent(match d {
                 "v.example" | "mx.v.example" | "other.example" => {
                     vec!["192.0.2.1".parse().unwrap()]
                 }
                 _ => vec![],
             })
         }
-        async fn mx(&self, d: &str) -> Result<Vec<(u16, String)>> {
-            Ok(match d {
+        async fn mx(&self, d: &str) -> Lookup<(u16, String)> {
+            found_or_absent(match d {
                 "v.example" => vec![(10, "mx.v.example".to_string())],
                 _ => vec![],
             })
         }
-        async fn ptr(&self, _: &str) -> Result<Vec<String>> {
-            Ok(vec![])
+        async fn ptr(&self, _: &str) -> Lookup<String> {
+            Lookup::Absent
         }
     }
 

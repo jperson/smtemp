@@ -63,10 +63,18 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
 /// process owns the spool and maildir trees it must write. Directories
 /// that already exist are left alone, whoever owns them.
 ///
+/// Ownership is changed through a handle, never by path: each new
+/// directory is opened with `O_DIRECTORY | O_NOFOLLOW`, checked to be
+/// owned by the current user (the directory just made), and `fchown`ed.
+/// A directory swapped for a symlink between the `mkdir` and the `chown`
+/// therefore can't make root hand some other file to `uid`.
+///
 /// # Errors
 ///
-/// Any I/O error from creating or `chown`ing a directory. A directory
-/// created concurrently (`AlreadyExists`) is not an error.
+/// Any I/O error from creating, opening or `fchown`ing a directory; a
+/// path that is no longer a directory (a symlink: `ELOOP`), or one not
+/// owned by the current user, is refused. A directory created
+/// concurrently (`AlreadyExists`) is not an error.
 #[cfg(unix)]
 pub fn create_owned_dir_all(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -88,9 +96,38 @@ pub fn create_owned_dir_all(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-        std::os::unix::fs::chown(dir, Some(uid), Some(gid))?;
+        hand_over_dir(dir, uid, gid)?;
     }
     Ok(())
+}
+
+/// Give the directory just created at `dir` to `uid`:`gid` through an
+/// open handle (see [`create_owned_dir_all`]).
+///
+/// # Errors
+///
+/// `dir` can't be opened as a directory without following a symlink, or
+/// isn't owned by the current user, or `fchown` fails.
+#[cfg(unix)]
+fn hand_over_dir(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    // SAFETY: geteuid has no preconditions and can't fail.
+    let me = unsafe { libc::geteuid() };
+    let meta = handle.metadata()?;
+    if !meta.is_dir() || meta.uid() != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} changed after it was created; not changing its owner",
+                dir.display()
+            ),
+        ));
+    }
+    std::os::unix::fs::fchown(&handle, Some(uid), Some(gid))
 }
 
 /// Check whether `path` is accessible to group or other users, for the
@@ -113,6 +150,26 @@ pub fn shared_bits(path: &Path) -> Option<u32> {
     {
         let _ = path;
         None
+    }
+}
+
+/// Returns when the file at `path` last changed, in Unix seconds: its
+/// ctime on Unix (updated by rename, write and chmod), its mtime
+/// elsewhere. `None` if it can't be read.
+pub fn changed_at(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        u64::try_from(meta.ctime()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        meta.modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
     }
 }
 
@@ -142,6 +199,38 @@ mod tests {
 
     /// The free space of an existing directory is reported; a missing
     /// path is an error.
+    /// New directories, parents included, are created private and handed
+    /// over through a handle (to our own ids here, unprivileged); a symlink
+    /// standing where a new directory should be is refused, not followed.
+    #[cfg(unix)]
+    #[test]
+    fn owned_dirs_are_handed_over_without_following_symlinks() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let nested = dir.path().join("a/b/c");
+        create_owned_dir_all(&nested, uid, gid).unwrap();
+        for p in [dir.path().join("a"), dir.path().join("a/b"), nested.clone()] {
+            let meta = std::fs::metadata(&p).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{}", p.display());
+        }
+        create_owned_dir_all(&nested, uid, gid).unwrap();
+
+        let target = dir.path().join("precious");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.path().join("swapped");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Refused before anything changes hands; with O_DIRECTORY |
+        // O_NOFOLLOW Linux reports ENOTDIR or ELOOP.
+        let refused = |e: io::Error| matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR));
+        assert!(refused(hand_over_dir(&link, uid, gid).unwrap_err()));
+        let dir_link = dir.path().join("swapped-dir");
+        std::os::unix::fs::symlink(dir.path().join("a"), &dir_link).unwrap();
+        assert!(refused(hand_over_dir(&dir_link, uid, gid).unwrap_err()));
+    }
+
     #[test]
     fn free_bytes_reports_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();

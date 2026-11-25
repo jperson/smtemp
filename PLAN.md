@@ -1,6 +1,6 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-24:** 312 tests pass (1 ignored) with no network beyond
+**As of 2026-11-24:** 328 tests pass (1 ignored) with no network beyond
 loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
@@ -23,7 +23,7 @@ optional. Send-side work is post-V1 (§6).
 | SMTP core, STARTTLS, framing and smuggling defences | ✅ Done |
 | SPF, DKIM, DMARC verification (fail-closed) | ✅ Done: RFC 7208 lookup limits, PSL-based relaxed alignment, bounce alignment; our `Authentication-Results:` and display-name warnings on delivered mail |
 | Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
-| Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: maildir fsync and `tmp/` debris (§2.4) |
+| Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done, maildir directories fsynced and their `tmp/` swept |
 | Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Recipient probing limited per connection and per IP |
 | Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file reloaded on SIGHUP, attempt limits |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
@@ -89,20 +89,18 @@ Fix these after the pilot starts and before GA, in this order:
    organization (tagged, never refused, since list software does it).
    Open: lookalike display names without an address (`PayPal Support`),
    and lookalike Unicode characters.
-5. **Robustness:**
-   - an RAII guard for the per-IP connection count;
-   - fsync the maildir directory after the rename, and sweep old files from
-     the maildirs' `tmp/` (the spool's debris is already swept);
-   - `503` for commands before EHLO; allow long AUTH PLAIN initial
-     responses;
-   - refuse duplicate DKIM tags; check the key's `k=` against the
-     signature's `a=`;
-   - `create_owned_dir_all`: `fchown` and `O_NOFOLLOW` instead of
-     path-based `chown`;
-   - fewer copies of the message buffer (peak memory is about 2× the
-     message size per session during DATA and up to 6× at end of data).
-6. **Assurance:** fuzz the SMTP framing, the header scanners, and the
-   SPF/DMARC/DNS parsers; get an independent security review.
+5. **Robustness.** Done: a drop guard for the per-IP connection count;
+   maildir directory fsync after each delivery and an hourly `tmp/`
+   sweep; `503` for MAIL/RCPT/DATA before EHLO and 12288-octet AUTH lines;
+   duplicate DKIM tags and `k=`/`a=` mismatches refused; ownership handed
+   over with `fchown` through an `O_NOFOLLOW` handle; end of data down
+   from about 5 copies of a message to about 3 at peak.
+6. **Assurance.** Done: libFuzzer targets for the SMTP framing, the
+   header scanner and end-of-data checks, DKIM, SPF, DMARC (with the PSL)
+   and the DNS decoder (`fuzz/`), run for 30 s each in CI; the first runs
+   found one bug (an unstable organizational domain for names with
+   control characters, fixed). Open: an independent security review, and
+   longer fuzzing campaigns (with AddressSanitizer, on a nightly host).
 
 ---
 
@@ -114,7 +112,6 @@ One line per open item; DESIGN.md §13 has the impact of each.
 |---|---|---|
 | Quotas are soft and don't count queued mail; no per-domain total | Abuse resistance | §2.4.1 |
 | Display names without an address, and lookalike characters, aren't checked | What users are shown | §2.4.4 |
-| Per-IP count release, maildir fsync and `tmp/`, pre-EHLO replies, DKIM tag checks, `chown` by path, memory copies | Abuse resistance; Correctness and delivery | §2.4.5 |
 | Sender grants read only at startup | Submission and AUTH | §6 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits not aggregated per IPv6 /64 | Correctness; Abuse resistance | §6 (IPv6 readiness) |
 | `quarantine` delivered as normal mail | Correctness and delivery | Out of V1 scope (decided) |
@@ -124,21 +121,26 @@ One line per open item; DESIGN.md §13 has the impact of each.
 ## 4. Code quality
 
 From the design and code assessment in
-[docs/reviews/FINDINGS.md](docs/reviews/FINDINGS.md). None blocks the
-pilot; items 1 and 2 most reduce the kind of bug the reviews kept finding.
+[docs/reviews/FINDINGS.md](docs/reviews/FINDINGS.md). Done:
 
-Done: `mailserv/src/main.rs` is split into `config`, `server`, `session`
-(with `session/message.rs` for end of data), `address`, `headers`, `tls`
-and `verdict` (DESIGN §2); the `mailserv` tests are hermetic; per-message
-state is one `Transaction` value; DKIM verification runs on the blocking
-pool.
+- `mailserv/src/main.rs` split into `config`, `server`, `session` (with
+  `session/message.rs` for end of data), `address`, `headers`, `tls` and
+  `verdict` (DESIGN §2); per-message state is one `Transaction` value;
+  DKIM verification runs on the blocking pool; the tests are hermetic.
+- One raw header scanner (`mailparse::extract_raw_headers` and
+  `find_separator`) for DKIM, the From scan, the bare-CR check and
+  verdict stripping; one mailbox-safe character set
+  (`address::is_mailbox_safe`) for RCPT and the maildir sink.
+- Every DNS lookup is a `dns::Lookup` (found / absent / temporary error),
+  classified in one place and matched exhaustively by SPF, DMARC and the
+  DKIM key fetch. This fixed a fail-open: a DKIM key lookup that got
+  SERVFAIL was "no key", so a `p=reject` domain's legitimate mail got a
+  permanent `550` over a DNS hiccup; it is now deferred.
+- Typed DNS errors (`dns::QueryError`), and verdicts stored under stable
+  names (`pass`, `softfail`, `reject`, ...; older spool files still load).
+- Fuzz targets (`fuzz/`, §2.4.6).
 
-| # | Change | Why | Effort |
-|---|---|---|---|
-| 1 | One raw header scanner, in `mailparse`, used by DKIM, the From extraction and the bare-CR check; one shared mailbox-safe character set for RCPT validation and the maildir sink | Two scanners can disagree about line boundaries; two copies of a rule can drift | Small–medium |
-| 2 | Fuzz targets | No fuzzing | Small to set up |
-| 3 | Total lookup results (`Found / Absent / TempError`) for SPF and DKIM key lookups, matched exhaustively | Fail-closed is enforced case by case, not by the types | Medium |
-| 4 | Typed errors in `dns`/`spf`; `serde` enums with stable names for the verdicts in spool metadata (today `format!("{:?}")`) | Renaming a variant silently changes stored data | Small–medium |
+Nothing is open in this section.
 
 ---
 

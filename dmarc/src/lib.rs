@@ -15,7 +15,7 @@
 
 pub mod psl;
 
-use spf::SpfResolver;
+use spf::{Lookup, SpfResolver};
 use thiserror::Error;
 
 /// Errors from DMARC record fetching and parsing.
@@ -34,15 +34,33 @@ pub enum DmarcError {
     Temp,
 }
 
-/// The `p=` (and `sp=`) policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The `p=` (and `sp=`) policy. Serialized under its tag value (`none`,
+/// `quarantine`, `reject`), a stable name for stored data; the variant
+/// names older versions wrote are still read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DmarcPolicy {
     /// `p=none` — monitor only; mail is not quarantined or rejected.
+    #[serde(alias = "None")]
     None,
     /// `p=quarantine` — flag failing mail for the spam pipeline.
+    #[serde(alias = "Quarantine")]
     Quarantine,
     /// `p=reject` — refuse failing mail.
+    #[serde(alias = "Reject")]
     Reject,
+}
+
+impl DmarcPolicy {
+    /// Returns the policy's tag value (`none`, `quarantine`, `reject`), the
+    /// name it is stored and logged under.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DmarcPolicy::None => "none",
+            DmarcPolicy::Quarantine => "quarantine",
+            DmarcPolicy::Reject => "reject",
+        }
+    }
 }
 
 /// A parsed `_dmarc.<domain>` TXT record.
@@ -240,14 +258,32 @@ fn dkim_aligned(record: &DmarcRecord, dkim_domain: &str, from_domain: &str) -> b
 }
 
 /// What the verifier does with the message (RFC 7489 Section 7.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialized as `pass`, `quarantine` or `reject` (older variant names are
+/// still read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Accepted normally.
+    #[serde(alias = "Pass")]
     Pass,
     /// Accepted but flagged for the spam/quarantine pipeline.
+    #[serde(alias = "Quarantine")]
     Quarantine,
     /// Rejected at end-of-data.
+    #[serde(alias = "Reject")]
     Reject,
+}
+
+impl Action {
+    /// Returns the action's name (`pass`, `quarantine`, `reject`), as stored
+    /// and logged.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Action::Pass => "pass",
+            Action::Quarantine => "quarantine",
+            Action::Reject => "reject",
+        }
+    }
 }
 
 /// Decide what to do with a message given its `evaluation` and the
@@ -361,7 +397,11 @@ async fn fetch_one<R: SpfResolver + Sync>(
     resolver: &R,
     name: &str,
 ) -> Result<Option<DmarcRecord>, DmarcError> {
-    let txts = resolver.txt(name).await.map_err(|_| DmarcError::Temp)?;
+    let txts = match resolver.txt(name).await {
+        Lookup::Found(txts) => txts,
+        Lookup::Absent => return Ok(None),
+        Lookup::TempError(_) => return Err(DmarcError::Temp),
+    };
     let mut found: Option<DmarcRecord> = None;
     for txt in txts {
         // A TXT record that parses as DMARC is a candidate; unrelated TXT
@@ -531,21 +571,24 @@ mod tests {
     }
 
     impl SpfResolver for MockResolver {
-        async fn txt(&self, domain: &str) -> anyhow::Result<Vec<String>> {
+        async fn txt(&self, domain: &str) -> Lookup<String> {
             self.queried.lock().unwrap().push(domain.to_string());
             if self.fail.contains(domain) {
-                anyhow::bail!("SERVFAIL");
+                return Lookup::TempError("SERVFAIL".into());
             }
-            Ok(self.txt.get(domain).cloned().unwrap_or_default())
+            match self.txt.get(domain) {
+                Some(txts) if !txts.is_empty() => Lookup::Found(txts.clone()),
+                _ => Lookup::Absent,
+            }
         }
-        async fn a(&self, _domain: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
-            Ok(vec![])
+        async fn a(&self, _domain: &str) -> Lookup<std::net::Ipv4Addr> {
+            Lookup::Absent
         }
-        async fn mx(&self, _domain: &str) -> anyhow::Result<Vec<(u16, String)>> {
-            Ok(vec![])
+        async fn mx(&self, _domain: &str) -> Lookup<(u16, String)> {
+            Lookup::Absent
         }
-        async fn ptr(&self, _domain: &str) -> anyhow::Result<Vec<String>> {
-            Ok(vec![])
+        async fn ptr(&self, _domain: &str) -> Lookup<String> {
+            Lookup::Absent
         }
     }
 
@@ -600,21 +643,24 @@ mod discovery_tests {
     }
 
     impl SpfResolver for Dns {
-        async fn txt(&self, domain: &str) -> anyhow::Result<Vec<String>> {
+        async fn txt(&self, domain: &str) -> Lookup<String> {
             self.queried.lock().unwrap().push(domain.to_string());
             if self.fail.contains(domain) {
-                anyhow::bail!("SERVFAIL");
+                return Lookup::TempError("SERVFAIL".into());
             }
-            Ok(self.txt.get(domain).cloned().unwrap_or_default())
+            match self.txt.get(domain) {
+                Some(txts) if !txts.is_empty() => Lookup::Found(txts.clone()),
+                _ => Lookup::Absent,
+            }
         }
-        async fn a(&self, _: &str) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
-            Ok(vec![])
+        async fn a(&self, _: &str) -> Lookup<std::net::Ipv4Addr> {
+            Lookup::Absent
         }
-        async fn mx(&self, _: &str) -> anyhow::Result<Vec<(u16, String)>> {
-            Ok(vec![])
+        async fn mx(&self, _: &str) -> Lookup<(u16, String)> {
+            Lookup::Absent
         }
-        async fn ptr(&self, _: &str) -> anyhow::Result<Vec<String>> {
-            Ok(vec![])
+        async fn ptr(&self, _: &str) -> Lookup<String> {
+            Lookup::Absent
         }
     }
 

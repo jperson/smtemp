@@ -202,6 +202,17 @@ enum Line {
     Overflow { terminated: bool, last: Option<u8> },
 }
 
+/// Whether the command-state line `line` may exceed
+/// [`SmtpSession::MAX_CMD_LINE`] (up to [`SmtpSession::MAX_AUTH_LINE`]):
+/// an AUTH command, or a line of an AUTH exchange in progress (RFC 4954
+/// §4).
+fn may_be_long(state: &SmtpState, line: &[u8]) -> bool {
+    matches!(state, SmtpState::Auth(_))
+        || (line.len() > 4
+            && line[..4].eq_ignore_ascii_case(b"auth")
+            && matches!(line[4], b' ' | b'\t'))
+}
+
 /// Returns when a read starting now must give up: after
 /// `max_read_duration_ms`, or at the connection's `deadline` if that is
 /// sooner.
@@ -380,6 +391,9 @@ pub trait SmtpSession {
     const SYNTAX_ERR: &'static [u8] = b"501 5.5.4 Syntax error\r\n";
     /// `503` reply for commands out of sequence (kept for policy use).
     const INVALID_SEQ: &'static [u8] = b"503 5.5.1 Invalid sequence.\r\n";
+    /// `503` reply for a transaction command (MAIL, RCPT, DATA) before
+    /// HELO/EHLO (RFC 5321 §4.1.4).
+    const NEED_HELO: &'static [u8] = b"503 5.5.1 Send HELO/EHLO first\r\n";
     /// `503` reply for a repeated MAIL FROM.
     const MULTI_MAIL: &'static [u8] = b"503 5.5.1 Multiple MAIL FROM commands not allowed.\r\n";
     /// Reply when a command line exceeds `MAX_CMD_LINE`.
@@ -399,6 +413,10 @@ pub trait SmtpSession {
     /// Section 4.5.3.1.4). An over-long command is answered with
     /// `LINE_TOO_LONG` and the session continues.
     const MAX_CMD_LINE: usize = 512;
+    /// AUTH command lines and the lines of an AUTH exchange may be longer
+    /// (RFC 4954 §4: at least 12288 octets), for long initial responses
+    /// and tokens; every other command keeps [`SmtpSession::MAX_CMD_LINE`].
+    const MAX_AUTH_LINE: usize = 12288;
     /// Message-data lines are capped at this many octets including the
     /// line ending, so a single line can never exhaust memory regardless
     /// of the message-size policy. RFC 5321 sets 1000 for
@@ -563,10 +581,12 @@ pub trait SmtpSession {
                 if !in_data {
                     after_bare_lf = false;
                 }
+                // Commands are read up to the AUTH limit; anything but AUTH
+                // over the ordinary command limit is refused below.
                 let cap = if in_data {
                     Self::MAX_DATA_LINE
                 } else {
-                    Self::MAX_CMD_LINE
+                    Self::MAX_AUTH_LINE.max(Self::MAX_CMD_LINE)
                 };
 
                 let read = timeout_at(
@@ -607,6 +627,13 @@ pub trait SmtpSession {
                 };
 
                 match line {
+                    Line::Complete(line)
+                        if !in_data
+                            && line.len() > Self::MAX_CMD_LINE
+                            && !may_be_long(&session_state.state, &line) =>
+                    {
+                        let _ = stream.write_all(Self::LINE_TOO_LONG).await;
+                    }
                     Line::Complete(mut line) => {
                         if in_data {
                             if after_bare_lf && line == b".\r\n" {
@@ -871,13 +898,25 @@ pub trait SmtpSession {
                     }
                 }
 
-                (&SmtpState::Ready, v)
+                // RFC 5321 §4.1.4: these may be used at any time outside
+                // DATA, before HELO/EHLO too.
+                (&SmtpState::Idle | &SmtpState::Ready, v)
                     if eq_ignore_ascii_case(v, b"vrfy")
                         || eq_ignore_ascii_case(v, b"noop")
                         || eq_ignore_ascii_case(v, b"help")
                         || eq_ignore_ascii_case(v, b"expn") =>
                 {
-                    (Self::OK.to_vec(), SmtpState::Ready)
+                    (Self::OK.to_vec(), state.clone())
+                }
+
+                // A transaction command before HELO/EHLO is a sequencing
+                // error (503), not an unknown command (500).
+                (&SmtpState::Idle, v)
+                    if eq_ignore_ascii_case(v, b"mail")
+                        || eq_ignore_ascii_case(v, b"rcpt")
+                        || eq_ignore_ascii_case(v, b"data") =>
+                {
+                    (Self::NEED_HELO.to_vec(), SmtpState::Idle)
                 }
 
                 // An unknown or out-of-state verb is refused but the
@@ -1199,6 +1238,7 @@ mod tests {
 
     impl SmtpSession for SmallSession {
         const MAX_CMD_LINE: usize = 16;
+        const MAX_AUTH_LINE: usize = 24;
         const MAX_DATA_LINE: usize = 32;
 
         async fn server_greet(&self) -> Vec<u8> {
@@ -1311,7 +1351,7 @@ mod tests {
             &mut s,
             SmtpState::Idle,
             b"MAIL FROM:<a@b>\r\n",
-            TestSession::UNKNOWN,
+            TestSession::NEED_HELO,
             SmtpState::Idle,
         )
         .await;
@@ -1319,7 +1359,7 @@ mod tests {
             &mut s,
             SmtpState::Idle,
             b"RCPT TO:<c@d>\r\n",
-            TestSession::UNKNOWN,
+            TestSession::NEED_HELO,
             SmtpState::Idle,
         )
         .await;
@@ -1327,7 +1367,7 @@ mod tests {
             &mut s,
             SmtpState::Idle,
             b"DATA\r\n",
-            TestSession::UNKNOWN,
+            TestSession::NEED_HELO,
             SmtpState::Idle,
         )
         .await;
@@ -1400,7 +1440,7 @@ mod tests {
             &mut s,
             SmtpState::Idle,
             b"MAIL FROM:<a@b>\r\n",
-            TestSession::UNKNOWN,
+            TestSession::NEED_HELO,
             SmtpState::Idle,
         )
         .await;
@@ -1512,7 +1552,7 @@ mod tests {
             &mut s,
             SmtpState::Idle,
             b"DATA\r\n",
-            TestSession::UNKNOWN,
+            TestSession::NEED_HELO,
             SmtpState::Idle,
         )
         .await;
@@ -2718,6 +2758,77 @@ mod tests {
             ]
         );
         assert_eq!(session.mail_from.as_deref(), Some("<a@b>"));
+    }
+
+    /// RFC 4954 §4: an AUTH command line, and a line of an AUTH exchange,
+    /// may be far longer than 512 octets (here a 3000-byte password); any
+    /// other command over 512 octets is still refused.
+    #[tokio::test]
+    async fn auth_lines_may_exceed_the_command_limit() {
+        let password = "p".repeat(3000);
+        let (mut client, task) = spawn_session(TestSession {
+            tls_active: true,
+            auth_users: Some(("alice".to_string(), password.clone())),
+            ..Default::default()
+        });
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+
+        let initial = String::from_utf8(b64(&format!("\0alice\0{password}"))).unwrap();
+        assert!(initial.len() > 512);
+        client
+            .write_all(format!("AUTH PLAIN {initial}\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "235 2.7.0 Authentication successful\r\n"
+        );
+
+        // The same length as a continuation line of a fresh exchange.
+        let (mut client2, task2) = spawn_session(TestSession {
+            tls_active: true,
+            auth_users: Some(("alice".to_string(), password)),
+            ..Default::default()
+        });
+        client2.read_line(&mut greet).await.unwrap();
+        client2.write_all(b"AUTH PLAIN\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client2).await, "334 \r\n");
+        client2
+            .write_all(format!("{initial}\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reply(&mut client2).await,
+            "235 2.7.0 Authentication successful\r\n"
+        );
+
+        // Any other long command: 500, and the session goes on.
+        let long_helo = format!("HELO {}\r\n", "h".repeat(600));
+        client.write_all(long_helo.as_bytes()).await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "500 5.5.2 Line too long\r\n");
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "221 Bye\r\n");
+        assert!(task.await.unwrap().1.is_ok());
+        client2.write_all(b"QUIT\r\n").await.unwrap();
+        drop(task2);
+    }
+
+    /// RFC 5321 §4.1.4: NOOP, HELP, VRFY and EXPN work before HELO/EHLO
+    /// and leave the session where it was.
+    #[tokio::test]
+    async fn always_allowed_commands_work_before_helo() {
+        let mut s = TestSession::default();
+        for cmd in [&b"NOOP\r\n"[..], b"HELP\r\n", b"VRFY x\r\n", b"EXPN x\r\n"] {
+            expect(
+                &mut s,
+                SmtpState::Idle,
+                cmd,
+                TestSession::OK,
+                SmtpState::Idle,
+            )
+            .await;
+        }
     }
 
     /// An over-long command line is answered with 500 and the session

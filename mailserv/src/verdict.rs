@@ -18,6 +18,11 @@ pub(crate) struct DkimSummary {
     pub(crate) verified: bool,
     /// Why verification failed, when it did.
     pub(crate) error: Option<String>,
+    /// Whether that failure may change on retry (the key lookup got no
+    /// definite answer; see `dkim::DkimError::is_temporary`). Absent in
+    /// spool files from before this field existed.
+    #[serde(default)]
+    pub(crate) temporary: bool,
 }
 
 impl From<&dkim::DkimResult<'_>> for DkimSummary {
@@ -29,6 +34,10 @@ impl From<&dkim::DkimResult<'_>> for DkimSummary {
             signature_ok: result.signature_ok,
             verified: result.body_hash_ok && result.signature_ok,
             error: result.error.as_ref().map(|e| e.to_string()),
+            temporary: result
+                .error
+                .as_ref()
+                .is_some_and(dkim::DkimError::is_temporary),
         }
     }
 }
@@ -39,7 +48,7 @@ pub(crate) struct DmarcSummary {
     /// The RFC 5322 From domain the policy was looked up for.
     pub(crate) from_domain: String,
     /// The applied policy (p= or sp=).
-    pub(crate) policy: String,
+    pub(crate) policy: dmarc::DmarcPolicy,
     /// Whether an SPF pass aligned with the From domain.
     pub(crate) spf_aligned: bool,
     /// Whether a verified DKIM signature aligned with the From domain.
@@ -47,5 +56,5 @@ pub(crate) struct DmarcSummary {
     /// Whether DMARC passed (either alignment).
     pub(crate) pass: bool,
     /// What we did: "pass", "quarantine", or "reject".
-    pub(crate) action: String,
+    pub(crate) action: dmarc::Action,
 }

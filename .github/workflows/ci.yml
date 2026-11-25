@@ -58,3 +58,35 @@ jobs:
       # Accepted advisories, each with its reason, are in .cargo/audit.toml.
       - name: cargo audit (vulnerabilities, unmaintained and yanked crates)
         run: cargo audit --deny warnings
+
+  # A short fuzz run per target over its seeds (including past findings):
+  # keeps the targets building and the regressions fixed. Long runs are
+  # manual (fuzz/README.md).
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: build the fuzz targets (libFuzzer coverage instrumentation)
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: >-
+            -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4
+            -Cllvm-args=-sanitizer-coverage-inline-8bit-counters
+            -Cllvm-args=-sanitizer-coverage-pc-table
+            -Cllvm-args=-sanitizer-coverage-trace-compares
+            --cfg fuzzing -Cdebug-assertions -Coverflow_checks
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: 30 seconds per target
+        working-directory: fuzz
+        run: |
+          for target in smtp_session headers dkim_tags spf_record dmarc_record dns_message; do
+            mkdir -p "corpus/$target"
+            ./target/x86_64-unknown-linux-gnu/release/$target \
+              -max_total_time=30 -rss_limit_mb=2048 "corpus/$target" "seeds/$target"
+          done

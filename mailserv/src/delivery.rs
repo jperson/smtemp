@@ -62,6 +62,18 @@ pub trait DeliverySink: Send + Sync {
     ///
     /// The mailbox name is unusable or its storage can't be measured.
     fn usage(&self, mailbox: &str) -> Result<u64>;
+
+    /// Remove crash debris from the store: partial copies a delivery
+    /// started but never committed, older than `min_age` at `now` (Unix
+    /// seconds). Blocking, and possibly slow (it may walk every mailbox),
+    /// so it runs less often than the drain (see [`sweep_sink_debris`]).
+    ///
+    /// Returns what was removed, for the log.
+    ///
+    /// # Errors
+    ///
+    /// The store can't be listed or a file can't be removed.
+    fn sweep_debris(&self, now: u64, min_age: Duration) -> Result<Vec<String>>;
 }
 
 /// How long a measured mailbox size is trusted before the maildir is
@@ -173,6 +185,13 @@ impl DeliverySink for MaildirSink {
         write_durable(&staged, message)?;
         std::fs::rename(&staged, &target)
             .with_context(|| format!("cannot commit delivery to {}", target.display()))?;
+        // Make the rename itself durable: without this a power cut can
+        // lose the new directory entry after the message was dequeued. A
+        // failure is a failed delivery: the message stays queued, and the
+        // retry finds the file if it did survive (idempotent).
+        std::fs::File::open(&new)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("cannot sync maildir {}", new.display()))?;
         // Keep a cached size current, so a burst of deliveries is counted
         // before the next scan.
         let mut cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
@@ -180,6 +199,43 @@ impl DeliverySink for MaildirSink {
             *bytes = bytes.saturating_add(message.len() as u64);
         }
         Ok(())
+    }
+
+    fn sweep_debris(&self, now: u64, min_age: Duration) -> Result<Vec<String>> {
+        // {root}/{domain}/{local}/tmp/*: a file there is a copy whose
+        // rename into new/ never happened. Live deliveries are seconds
+        // old; `min_age` keeps them safe.
+        let mut removed = Vec::new();
+        let list = |dir: &Path| -> Result<Vec<PathBuf>> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .with_context(|| format!("cannot list {}", dir.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(e) => Err(e).with_context(|| format!("cannot list {}", dir.display())),
+            }
+        };
+        for domain in list(&self.root)?.into_iter().filter(|p| p.is_dir()) {
+            for mailbox in list(&domain)?.into_iter().filter(|p| p.is_dir()) {
+                for file in list(&mailbox.join("tmp"))? {
+                    let old = crate::fsutil::changed_at(&file)
+                        .is_some_and(|at| now.saturating_sub(at) >= min_age.as_secs());
+                    if !old || !file.is_file() {
+                        continue;
+                    }
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => removed.push(file.display().to_string()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(e)
+                                .with_context(|| format!("cannot remove {}", file.display()))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(removed)
     }
 
     fn usage(&self, mailbox: &str) -> Result<u64> {
@@ -231,33 +287,10 @@ fn split_recipient(recipient: &str) -> Result<(String, String)> {
     let local = local.to_ascii_lowercase();
     let domain = domain.to_ascii_lowercase();
     // Both components must be a single path segment: never empty, no
-    // leading dot (so never `.` or `..`), no `..` run, and only RFC 5321
-    // dot-atom characters minus `/` (the set the session enforces for
-    // local-parts at RCPT time; `\` and control characters are not atext).
-    let safe = |b: u8| {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'.' | b'!'
-                    | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'='
-                    | b'?'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'{'
-                    | b'|'
-                    | b'}'
-                    | b'~'
-            )
-    };
+    // leading dot (so never `.` or `..`), no `..` run, and only the
+    // mailbox-safe set the session enforces for local-parts at RCPT time
+    // (`address::is_mailbox_safe`, the one definition of it).
+    let safe = crate::address::is_mailbox_safe;
     for component in [&local, &domain] {
         if component.is_empty()
             || component.len() > 128
@@ -418,7 +451,7 @@ pub fn authentication_results(meta: &SpoolMeta) -> String {
         results.push(format!("auth=pass smtp.auth={}", header_token(user)));
     }
     if let Some(spf) = &meta.spf_result {
-        let result = spf.to_ascii_lowercase();
+        let result = spf.as_str();
         let identity = match meta.mail_from.as_deref() {
             Some(addr) if !addr.is_empty() => addr
                 .rsplit_once('@')
@@ -429,8 +462,8 @@ pub fn authentication_results(meta: &SpoolMeta) -> String {
                 .map(|h| format!("smtp.helo={}", header_token(h))),
         };
         results.push(match identity {
-            Some(identity) => format!("spf={} {identity}", header_token(&result)),
-            None => format!("spf={}", header_token(&result)),
+            Some(identity) => format!("spf={} {identity}", header_token(result)),
+            None => format!("spf={}", header_token(result)),
         });
     }
     if meta.dkim.is_empty() {
@@ -532,6 +565,31 @@ fn unix_now() -> u64 {
 /// Run one pass of the queue drain over `spool` into `sink` at the
 /// current time. See [`drain_at`] for the behavior, return value and
 /// errors.
+/// Sweep crash debris older than [`DEBRIS_MIN_AGE`] from `sink` at `now`
+/// (Unix seconds; see [`DeliverySink::sweep_debris`]), logging each
+/// removal at `warn` and a failure without propagating it. Blocking.
+///
+/// Returns how many files were removed.
+pub fn sweep_sink_debris(sink: &dyn DeliverySink, now: u64) -> usize {
+    match sink.sweep_debris(now, DEBRIS_MIN_AGE) {
+        Ok(removed) => {
+            for item in &removed {
+                tracing::warn!(file = %item, "removed uncommitted delivery file (crash debris)");
+            }
+            removed.len()
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "delivery debris sweep failed");
+            0
+        }
+    }
+}
+
+/// [`sweep_sink_debris`] now.
+pub fn sweep_sink_debris_now(sink: &dyn DeliverySink) -> usize {
+    sweep_sink_debris(sink, unix_now())
+}
+
 pub fn drain_once(spool: &dyn SpoolQueue, sink: &dyn DeliverySink) -> Result<DrainStats> {
     drain_at(spool, sink, unix_now())
 }
@@ -682,7 +740,7 @@ mod tests {
                 public_key: None,
                 key_generation: None,
             }],
-            spf_result: Some("Pass".into()),
+            spf_result: Some(spf::SpfResult::Pass),
             spf_helo: None,
             dkim: Vec::new(),
             dmarc: None,
@@ -749,6 +807,7 @@ mod tests {
                 signature_ok: true,
                 verified: true,
                 error: None,
+                temporary: false,
             },
             DkimSummary {
                 domain: "evil.example".into(),
@@ -757,15 +816,16 @@ mod tests {
                 signature_ok: false,
                 verified: false,
                 error: Some("bad".into()),
+                temporary: false,
             },
         ];
         meta.dmarc = Some(DmarcSummary {
             from_domain: "example.test".into(),
-            policy: "Reject".into(),
+            policy: dmarc::DmarcPolicy::Reject,
             spf_aligned: true,
             dkim_aligned: true,
             pass: true,
-            action: "Pass".into(),
+            action: dmarc::Action::Pass,
         });
         assert_eq!(
             authentication_results(&meta),
@@ -779,7 +839,7 @@ mod tests {
         // A bounce: SPF's identity is the HELO name; no signatures, no policy.
         let mut bounce = sample_meta();
         bounce.mail_from = Some(String::new());
-        bounce.spf_result = Some("SoftFail".into());
+        bounce.spf_result = Some(spf::SpfResult::SoftFail);
         assert_eq!(
             authentication_results(&bounce),
             "Authentication-Results: mail.test;\r\n\
@@ -900,6 +960,39 @@ mod tests {
         assert!(sink.usage("../etc@example.org").is_err());
     }
 
+    /// The maildir sweep removes `tmp/` files old enough to be crash
+    /// leftovers, and nothing else: not a fresh `tmp/` file (a delivery in
+    /// progress), not delivered mail in `new/`.
+    #[test]
+    fn maildir_sweep_removes_only_old_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        sink.deliver(
+            &rcpt("user@example.org", "user@example.org"),
+            "q-1",
+            b"mail",
+        )
+        .unwrap();
+        let tmp = dir.path().join("example.org/user/tmp");
+        std::fs::write(tmp.join("q-2.partial.eml"), b"half").unwrap();
+        let now = unix_now();
+
+        assert!(
+            sink.sweep_debris(now, DEBRIS_MIN_AGE).unwrap().is_empty(),
+            "too fresh"
+        );
+        let removed = sink.sweep_debris(now + 2 * 3600, DEBRIS_MIN_AGE).unwrap();
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(removed[0].ends_with("q-2.partial.eml"));
+        assert!(dir
+            .path()
+            .join("example.org/user/new/q-1.user_example.org.eml")
+            .exists());
+
+        let empty = MaildirSink::open(dir.path().join("nothing-yet")).unwrap();
+        assert!(empty.sweep_debris(now, DEBRIS_MIN_AGE).unwrap().is_empty());
+    }
+
     async fn catch_all_copies() {
         let dir = tempfile::tempdir().unwrap();
         let sink = MaildirSink::open(dir.path()).unwrap();
@@ -948,7 +1041,7 @@ mod tests {
                     ],
                     ..sample_meta()
                 },
-                &raw,
+                raw.clone(),
             )
             .unwrap();
 
@@ -1021,6 +1114,10 @@ mod tests {
         fn usage(&self, _mailbox: &str) -> Result<u64> {
             Ok(0)
         }
+
+        fn sweep_debris(&self, _now: u64, _min_age: Duration) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
     }
 
     /// The retry interval doubles per failure and stops at `RETRY_MAX`.
@@ -1039,7 +1136,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path().join("spool"), None).unwrap();
         let sink = FlakySink::failing();
-        spool.write(sample_meta(), b"payload").unwrap();
+        spool.write(sample_meta(), b"payload".to_vec()).unwrap();
         let t0: u64 = 1_700_000_000;
 
         // First failure, then nothing is attempted until the backoff ends.
@@ -1083,7 +1180,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = DiskSpool::open(dir.path().join("spool"), None).unwrap();
         let sink = FlakySink::failing();
-        let queue_id = spool.write(sample_meta(), b"payload").unwrap().queue_id;
+        let queue_id = spool
+            .write(sample_meta(), b"payload".to_vec())
+            .unwrap()
+            .queue_id;
         let t0: u64 = 1_700_000_000;
         let lifetime = MAX_QUEUE_LIFETIME.as_secs();
 

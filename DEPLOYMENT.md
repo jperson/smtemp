@@ -56,9 +56,7 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 | Refused-recipient budget per IP address only (no IPv6 /64 aggregation); a large provider's shared IP can hit it | Slow probing from many addresses; legitimate mail from a busy shared IP deferred for up to 15 minutes | B4 IPv4-only; G1 alerts on both log lines | PLAN §2.4.2 |
 | Malformed SPF records are PermError, as RFC 7208 requires; the Public Suffix List is a snapshot | Mail from a domain with a broken record gets a permanent `550`; a suffix newer than the snapshot is unknown | G2 daily review of permanent rejections; H7 refresh | PLAN §2.4.3 |
 | Display-name warnings are a header that mail clients don't show | Users can still be misled by display names | Tell pilot users to check the sender address; the console should surface the warning | PLAN §2.4.4 |
-| Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.5 |
-| Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.5 |
-| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.5 |
+| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 3× briefly at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | — (sizing) |
 | SPF `a`/`mx` don't query AAAA; per-IP limits are per address | IPv6 senders can fail SPF or escape limits | B4: IPv4-only MX | PLAN §6 |
 | No TLS certificate reload | A restart is needed to pick up a renewed certificate | D3 renewal hook | PLAN §6 |
 | Local-parts may contain shell metacharacters (`$`, `` ` ``, `|`, `&` are valid in addresses) | Operator scripts could misbehave on maildir paths | Never pass maildir paths through a shell unquoted | — |
@@ -90,10 +88,10 @@ did each one and when in §4.
   synchronized: yes`): DKIM `x=`, authority expiries, the spool's debris
   sweep and logs depend on it. Apply OS updates.
 - [ ] **B2. Size memory.** During DATA a session's buffer can reach about
-  2× its message size, and at end of data up to four more copies exist
-  briefly (spool write, delivery). Estimate peak RSS as baseline +
-  `max-connections` × 2 × `max-data-bytes` + (sessions finishing DATA at
-  once) × 4 × `max-data-bytes`:
+  2× its message size, and at end of data one more copy exists briefly
+  (the final message, while it is spooled). Estimate peak RSS as baseline
+  + `max-connections` × 2 × `max-data-bytes` + (sessions finishing DATA
+  at once) × 1 × `max-data-bytes`:
 
   | VPS RAM | Suggested `max-data-bytes` | Suggested `max-connections` | Worst-case DATA-phase buffers |
   |---|---|---|---|

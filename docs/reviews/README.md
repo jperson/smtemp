@@ -51,14 +51,14 @@ the section given.
 | M7 | No `Authentication-Results:` | Fixed (2026-11-24); forged ones claiming our authserv-id are removed |
 | M8 | HELO/MAIL FROM text copied into trace headers | Fixed |
 | M9 | Catch-all copies collapse | Fixed (2026-11-23): one file per envelope address |
-| M10 | State-machine sequencing | Partly fixed (EHLO now resets the transaction); pre-EHLO `503` and long AUTH PLAIN open (§2.4.5) |
+| M10 | State-machine sequencing | Fixed (2026-11-24): EHLO resets the transaction, `503` before EHLO, 12288-octet AUTH lines |
 | M11 | Connection cap can fire after the spool commit (duplicates) | Fixed (2026-11-23): the deadline is enforced between reads, and the fast path runs after the reply |
-| M12 | Per-IP connection count released by hand | Open (§2.4.5) |
+| M12 | Per-IP connection count released by hand | Fixed (2026-11-24): a drop guard, and no O(n) sweep per close |
 | M13 | Drain loaded every queued payload each pass | Fixed |
-| M14 | File modes; maildir directory fsync; maildir bypasses encryption | Modes fixed; fsync and `tmp/` sweep open (§2.4.5); encryption ordering fixed (trace headers are inside the stored payload, delivered verbatim) |
+| M14 | File modes; maildir directory fsync; maildir bypasses encryption | Modes fixed; maildir fsync and `tmp/` sweep fixed (2026-11-24); encryption ordering fixed (trace headers are inside the stored payload, delivered verbatim) |
 | M15 | A bad authority publish failed every RCPT | Fixed (last good snapshot kept) |
 | M16 | AUTH weaknesses | Fixed (2026-11-23): argon2id-hashed credentials file, per-session and per-IP attempt limits, case-insensitive mechanisms, LOGIN state reset, AUTH only on submission ports (587/465). Credentials reload on SIGHUP added (2026-11-23) |
-| M17 | DKIM: RSA floor, `l=`, From in `h=`, duplicate tags | Fixed except duplicate tags and `k=`/`a=` (§2.4.5) |
+| M17 | DKIM: RSA floor, `l=`, From in `h=`, duplicate tags | Fixed (duplicate tags and `k=`/`a=` on 2026-11-24) |
 | L1 | DNS label lengths not validated | Fixed |
 | L2 | DNS cache cleared wholesale when full | Open, accepted (bounded memory) |
 | L3 | Third-party resolver privacy; no DNSSEC | Mitigated by `--resolver-ca` (local resolver possible); DNSSEC is the resolver's job |
@@ -85,7 +85,7 @@ the section given.
 | N12 | SPF macro expander lenient on malformed input | Fixed (malformed macros are PermError) |
 | N13 | A deadline threw away a warm DNS connection | Fixed (pipelining) |
 | N14 | Shell metacharacters allowed in maildir directory names | Open, operational: never pass maildir paths through a shell |
-| N15 | Several message copies held at once | Open (§2.4.5) |
+| N15 | Several message copies held at once | Fixed (2026-11-24): about 3 at peak, from about 5 (= D5) |
 | N16 | No SPF alignment for bounces | Fixed (2026-11-24): the HELO identity aligns for the null sender |
 | N17 | SPF deadline and connection cap interact | Fixed: the cap no longer interrupts processing (see M11) |
 | N18 | Documentation overstated status | Fixed |
@@ -112,15 +112,15 @@ the section given.
 | F8 | No storage bound; drain loaded every payload | Payload loading fixed; per-mailbox quotas and a free-disk floor added (2026-11-24) |
 | F9 | Unlimited recipient probing | Fixed (2026-11-24): per-connection and per-IP refused-recipient limits; IPv6 /64 aggregation open (§6) |
 | F10 | AUTH hardening | Fixed; see M16 |
-| L1 | `create_owned_dir_all` `chown`s by path | Open (§2.4.5) |
+| L1 | `create_owned_dir_all` `chown`s by path | Fixed (2026-11-24): `fchown` through an `O_NOFOLLOW` handle |
 | L2 | `create_private_file` follows symlinks | Open, low (parent directories are private) |
 | L3 | Catch-all copies collapse | Fixed (= M9) |
 | L4 | Per-IP limits not aggregated per IPv6 /64 | Open (§6, IPv6 readiness) |
-| L5 | Per-IP count leaks on panic | Open (= M12) |
+| L5 | Per-IP count leaks on panic | Fixed (= M12) |
 | L6 | No `Authentication-Results:` | Fixed (= M7) |
 | L7 | RCPT success cache outlives a revocation for the session | Accepted (bounded by the 5-minute cap) |
 | L8 | No SPF alignment for the null sender | Fixed (= N16) |
-| L9 | EHLO doesn't reset the envelope; pre-EHLO `500` | EHLO reset fixed (2026-11-24); pre-EHLO `500` open (= M10) |
+| L9 | EHLO doesn't reset the envelope; pre-EHLO `500` | Fixed (= M10) |
 
 ### DEPLOYMENT.md (D1–D7, in git history)
 
@@ -130,6 +130,6 @@ the section given.
 | D2 | Only public DoT resolvers usable | Fixed (`--resolver-ca`); IPv6 resolver addresses open (§6) |
 | D3 | Malformed query names cost a full timeout; no end-of-data DNS deadline | Fixed |
 | D4 | Unsafe defaults, no privilege drop or graceful shutdown | Fixed |
-| D5 | Peak memory per session | Sizing guidance in DEPLOYMENT.md B2; fewer copies open (§2.4.5) |
+| D5 | Peak memory per session | Fewer copies (2026-11-24: about 3× at peak, from about 5×); sizing in DEPLOYMENT.md B2 |
 | D6 | Postmaster must be routable | Configuration (DEPLOYMENT.md C2) |
 | D7 | Documentation status gaps | Fixed |

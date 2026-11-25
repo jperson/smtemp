@@ -18,14 +18,12 @@ use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
-mod address;
 mod auth;
 mod authority;
 mod config;
 mod delivery;
 mod fsutil;
 mod hashpw;
-mod headers;
 mod limit;
 mod privdrop;
 mod quota;
@@ -36,6 +34,10 @@ mod spool;
 mod testutil;
 mod tls;
 mod verdict;
+
+// The pure header and envelope checks are the `mailserv` library (lib.rs),
+// so they can be fuzzed; `crate::address` and `crate::headers` resolve to it.
+use mailserv::{address, headers};
 
 /// Parse the command line and run: the `hash-password` utility (see
 /// [`hashpw::run`]), or the server. For the server, set up JSON logging

@@ -52,6 +52,7 @@ mailparse/    RFC 5322/2045 headers: raw byte view + typed (pest) view
 dns/          DNS wire codec, pipelined DNS-over-TLS client, TTL cache
 dnsq/         DNS query CLI
 smtp-client/  demo SMTP client
+fuzz/         libFuzzer targets (a separate workspace; see fuzz/README.md)
 ```
 
 Dependencies only point downward:
@@ -70,6 +71,8 @@ Inside `mailserv`:
 
 ```
 main.rs        entry point: arguments, logging, then config::load and server::run
+lib.rs         the library part: address and headers, pure functions over
+               untrusted bytes (so they can be fuzzed)
 config.rs      CLI flags, the TOML file, their merge (resolve_config), startup checks
 server.rs      startup, listeners, privilege drop, accept loop, limits, signals,
                handle_connection (drives one session over TCP/TLS)
@@ -139,7 +142,8 @@ small `TestSession` drives the whole state machine with no policy at all.
 accept loop (MX port, plus submission-port and submissions-port when set;
              one loop, so all share the limits below)
   canonical_peer(): ::ffff:a.b.c.d → a.b.c.d
-  limits: server-wide semaphore, per-IP concurrency, per-IP rate (60 s window)
+  limits: server-wide semaphore, per-IP concurrency, per-IP rate (60 s window);
+          both held as guards (a permit, a ConnectionSlot) that release on drop
     over a limit → 421, sent from a bounded pool of 32 refusal tasks
   spawn: timeout_at(deadline + 120 s backstop) {
     handle_connection(mode):        deadline = accept + max-conn-duration
@@ -180,7 +184,8 @@ later, only stops a task stuck in a handshake or a write.
 ### 4.1 Framing
 
 - **Line caps.** Command lines are capped at 512 octets and data lines at
-  64 KiB.
+  64 KiB. AUTH commands and the lines of an AUTH exchange may be up to
+  12288 octets (RFC 4954 §4), for long initial responses and tokens.
   - An over-long command gets `500` and is drained, and the session
     continues.
   - An over-long data line gets `552` and the session enters `Discard`,
@@ -196,8 +201,10 @@ later, only stops a task stuck in a handshake or a write.
   `recv_data` gets raw, unstuffed bytes with their original line ending; it
   is 8-bit safe.
 - **`RSET`** ends the transaction but keeps the session greeted (so does
-  an accepted HELO/EHLO, RFC 5321 §4.1.4). Unknown verbs
-  get `500`, and the state is kept.
+  an accepted HELO/EHLO, RFC 5321 §4.1.4). MAIL, RCPT and DATA before
+  HELO/EHLO get `503 5.5.1`; NOOP, HELP, VRFY and EXPN work in any state
+  outside DATA (RFC 5321 §4.1.4). Unknown verbs get `500`, and the state
+  is kept.
 
 ---
 
@@ -295,8 +302,11 @@ How the ordering is constrained:
     §6.1), like an `include:` of one.
   - Macros are expanded per RFC 7208 §7.
   - A whole evaluation has a 20 s deadline (`EVALUATION_DEADLINE`).
-  - DNS goes through the `SpfResolver` trait (TXT, A, MX, PTR). Production
-    uses the shared DoT client; tests use fixture mocks.
+  - DNS goes through the `SpfResolver` trait (TXT, A, MX, PTR), whose
+    lookups return `dns::Lookup`: found, absent (NXDOMAIN, no records,
+    an invalid name) or a temporary error, matched exhaustively, so no
+    lookup can mistake a SERVFAIL for "no record". Production uses the
+    shared DoT client; tests use fixture mocks.
 - **Results.** Fail and PermError reject at MAIL. TempError → `451`. Pass,
   Neutral, SoftFail and None are accepted and recorded for DMARC.
 
@@ -318,8 +328,17 @@ How the ordering is constrained:
     verify;
   - it hasn't expired (`x=`);
   - its `i=` matches `d=`;
-  - the key permits email.
+  - the key permits email;
+  - the key's `k=` is the algorithm of the signature's `a=` (RFC 6376
+    §6.1.2).
+- **Tag lists.** A tag that occurs twice invalidates the whole signature
+  or key record (RFC 6376 §3.2), so two `d=` can't be read two ways.
 - **Algorithms:** rsa-sha256 and ed25519-sha256. SHA-1 is refused.
+- **Key lookups** are `dns::Lookup`s: absent is `NoKeyRecord` (permanent),
+  a temporary error (SERVFAIL, timeout) is `KeyLookupFailed`, which the
+  summary records as `temporary`. A DMARC rejection that such a signature
+  could have avoided (its domain aligns with From) is deferred with `451`
+  instead: a DNS hiccup must not refuse legitimate mail for good.
 
 ### 6.3 DMARC (`dmarc`)
 
@@ -403,7 +422,10 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
   commit point.
 - **Queue IDs** are `<hex seconds>.<uuid>`: sortable and globally unique.
 - **Metadata** holds the envelope, peer, HELO, verdicts, TLS state, the
-  authenticated identity and the resolved recipients.
+  authenticated identity and the resolved recipients. Verdicts are stored
+  under stable names (`pass`, `softfail`, `temperror`; `reject`,
+  `quarantine`), never Rust variant names; files written with the older
+  variant names still load.
 - **Seams.** `SpoolWriter` (`write`, `remove`) is the write side, and
   `SpoolQueue` (`list`, `load_payload`, `record_attempt`, `dequeue`,
   `dead_letter`, `sweep_debris`) the read side the drain uses; `DiskSpool`
@@ -422,6 +444,11 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
   sink sums the files in `new/` and `cur/` and caches the result for 60 s
   (at most 10,000 mailboxes); deliveries through the sink add to the cached
   value at once, so only changes made by other tools wait for a rescan.
+- **Durable.** Each copy is written to `tmp/` and fsynced, renamed into
+  `new/`, and then `new/` itself is fsynced, so the rename survives a power
+  cut before the message is dequeued. Crash leftovers in a maildir's
+  `tmp/` older than an hour are swept at startup and hourly
+  (`DeliverySink::sweep_debris`).
 - **Idempotent** per (envelope address, queue ID): the file name is
   `{queue ID}.{address}.eml`, so the fast path and the drain can race
   safely, and several catch-all addresses routed to one inbox get one copy
@@ -484,6 +511,11 @@ users produce a startup warning.
 
 ## 9. DNS layer (`dns`)
 
+- **Lookups.** `DnsClient::lookup` is the one place a reply becomes a
+  `Lookup`: NOERROR with answers of the type is found; NOERROR without,
+  NXDOMAIN and an invalid name are absent; every other rcode, a timeout
+  and a failure are a temporary error. `DnsClient::query` reports why it
+  got no reply as a typed `QueryError`.
 - **Codec.** Parsing is **total**: every index is bounds-checked, rdata is
   bounded by `rdlength`, and compression pointers are range-checked and
   depth-limited. This is tested by every truncation length and about 5,800
@@ -606,6 +638,14 @@ server, DKIM takes `&RawMessage`, and the From-domain and bare-CR scans
 work on bytes. Nothing in the server calls the typed parser. The depth
 bound only protects library callers that use it.
 
+**One scanner.** Every check that looks at headers uses the same raw
+scanner (`find_separator` for where headers end, `extract_raw_headers`
+for the fields and their byte spans): DKIM, the From scan, the bare-CR
+check and verdict stripping. They can't disagree about where a field
+starts or ends, the parser differential that lets one check see a header
+another misses. A line that is neither a field nor a continuation ends
+the field before it, so a continuation after it belongs to no field.
+
 ---
 
 ## 12. Configuration, operations and testing
@@ -631,12 +671,17 @@ bound only protects library callers that use it.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 312 tests in four layers:
+- **Testing.** 328 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
   4. **integration**, with a real rustls client against the real driver
      over loopback.
+
+  **Fuzzing** (`fuzz/`): libFuzzer targets for the SMTP session, the
+  header scanner and checks, DKIM, SPF, DMARC with the PSL, and the DNS
+  decoder, each checking invariants as well as crashes. CI runs each for
+  30 seconds over its seeds; past findings are kept as seeds.
 
   Conformance anchors are external, never circular: DKIM hashes come from
   openssl or the RFC's own examples, SPF fixtures from recorded real
@@ -665,17 +710,13 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | The mailbox quota is soft (one message over) and doesn't count mail still queued for the mailbox | A mailbox can exceed its quota by one message plus its queue backlog | §2.4.1 |
 | The refused-recipient budget is per IP address (no IPv6 /64 aggregation), and a large provider's shared outbound IP can exhaust it with legitimate refusals | An IPv6 prober can rotate addresses; mail from a busy shared IP can be deferred for up to 15 minutes | §2.4.2, §6 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
-| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.5 |
 
 ### Correctness and delivery
 
 | Gap | Impact | Plan |
 |---|---|---|
-| No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.5 |
 | The Public Suffix List is a snapshot | A suffix added after it was taken isn't known; alignment there falls back to the last-two-labels rule | §2.4.3 (refresh) |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
-| Commands before EHLO get `500`, not `503`; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.5 |
-| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.5 |
 | `quarantine` is delivered as normal mail | Out of V1 scope by decision | — |
 
 ### What users are shown

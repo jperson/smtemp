@@ -13,7 +13,7 @@
 /// unterminated `<` or an address containing control characters (a bare
 /// CR would otherwise reach the generated `Return-Path:`/`Received:`
 /// headers).
-pub(crate) fn clean_path(raw: &str) -> Option<(&str, &str)> {
+pub fn clean_path(raw: &str) -> Option<(&str, &str)> {
     let raw = raw.trim();
     let (addr, params) = match raw.strip_prefix('<') {
         Some(rest) => {
@@ -34,7 +34,7 @@ pub(crate) fn clean_path(raw: &str) -> Option<(&str, &str)> {
 /// Returns the value of the `SIZE=` ESMTP parameter (RFC 1870, key
 /// matched case-insensitively) in the whitespace-separated `params`, if
 /// present and numeric.
-pub(crate) fn size_param(params: &str) -> Option<u64> {
+pub fn size_param(params: &str) -> Option<u64> {
     params.split_ascii_whitespace().find_map(|p| {
         let (key, value) = p.split_once('=')?;
         key.eq_ignore_ascii_case("SIZE")
@@ -45,7 +45,7 @@ pub(crate) fn size_param(params: &str) -> Option<u64> {
 
 /// Returns the domain of the address `addr` (everything after the last
 /// `@`, possibly empty), or `None` when it has no `@`.
-pub(crate) fn path_domain(addr: &str) -> Option<&str> {
+pub fn path_domain(addr: &str) -> Option<&str> {
     addr.rsplit_once('@').map(|(_, domain)| domain)
 }
 
@@ -62,7 +62,7 @@ pub(crate) fn path_domain(addr: &str) -> Option<&str> {
 /// Quoted local-parts are refused (server policy). Returns `None` when
 /// the local-part is safe, and also for an address with no `@` (callers
 /// reject those separately).
-pub(crate) fn unsafe_local_part(addr: &str) -> Option<&'static str> {
+pub fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     let local = addr.rsplit_once('@')?.0;
     if local.is_empty() {
         return Some("empty local-part");
@@ -87,7 +87,7 @@ pub(crate) fn unsafe_local_part(addr: &str) -> Option<&'static str> {
 /// a header — is refused before it is stored. The domain form is deliberately
 /// a little liberal (underscores, a trailing dot, single-label names such
 /// as `localhost`) because misconfigured but legitimate senders use them.
-pub(crate) fn valid_helo(h: &str) -> bool {
+pub fn valid_helo(h: &str) -> bool {
     if h.is_empty() || h.len() > 255 {
         return false;
     }
@@ -111,7 +111,7 @@ pub(crate) fn valid_helo(h: &str) -> bool {
 
 /// Is byte `b` in the mailbox-safe set: RFC 5321 `atext` plus `.`,
 /// excluding `/` (see [`unsafe_local_part`])?
-pub(crate) fn is_mailbox_safe(b: u8) -> bool {
+pub fn is_mailbox_safe(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
             b,

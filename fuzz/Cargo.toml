@@ -1,0 +1,70 @@
+# Fuzz targets for the parsers that take attacker bytes. Run one with
+# `cargo +nightly fuzz run <target>` (cargo-fuzz), from this directory.
+# A separate workspace, so the main build never needs nightly.
+[package]
+name = "smtemp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1.39.2", features = ["rt", "io-util", "time", "macros"] }
+smtp = { path = "../smtp" }
+mailparse = { path = "../mailparse" }
+dkim = { path = "../dkim" }
+spf = { path = "../spf" }
+dmarc = { path = "../dmarc" }
+dns = { path = "../dns" }
+mailserv = { path = "../mailserv" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "smtp_session"
+path = "fuzz_targets/smtp_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dkim_tags"
+path = "fuzz_targets/dkim_tags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spf_record"
+path = "fuzz_targets/spf_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dmarc_record"
+path = "fuzz_targets/dmarc_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false

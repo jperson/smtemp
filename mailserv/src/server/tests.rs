@@ -589,7 +589,7 @@ impl spool::SpoolWriter for SlowSpool {
     fn name(&self) -> &str {
         "slow"
     }
-    fn write(&self, meta: spool::SpoolMeta, payload: &[u8]) -> Result<spool::StoredMessage> {
+    fn write(&self, meta: spool::SpoolMeta, payload: Vec<u8>) -> Result<spool::StoredMessage> {
         std::thread::sleep(self.1);
         self.0.write(meta, payload)
     }

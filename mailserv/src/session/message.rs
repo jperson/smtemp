@@ -222,25 +222,39 @@ impl UserSession<'_> {
 
                 let summary = DmarcSummary {
                     from_domain: from_domain.clone(),
-                    policy: format!("{policy:?}"),
+                    policy,
                     spf_aligned: evaluation.spf_aligned,
                     dkim_aligned: evaluation.dkim_aligned,
                     pass: evaluation.pass,
-                    action: format!("{action:?}"),
+                    action,
                 };
                 info!(
                     from_domain = %summary.from_domain,
-                    dmarc_policy = %summary.policy,
+                    dmarc_policy = summary.policy.as_str(),
                     spf_aligned = summary.spf_aligned,
                     dkim_aligned = summary.dkim_aligned,
                     dmarc_pass = summary.pass,
-                    dmarc_action = %summary.action,
+                    dmarc_action = summary.action.as_str(),
                     "dmarc evaluation"
                 );
                 self.dmarc = Some(summary.clone());
                 dmarc_summary = Some(summary);
 
                 let exempt = self.authenticated.is_some();
+                // A signature that could have aligned but whose key lookup
+                // got no definite answer might have verified: refusing for
+                // good would reject legitimate mail over a DNS hiccup.
+                // Defer instead; the sender retries.
+                let unresolved = dkim_summaries
+                    .iter()
+                    .any(|d| d.temporary && dmarc::aligned_relaxed(&d.domain, &from_domain));
+                if action == dmarc::Action::Reject && !exempt && unresolved {
+                    warn!(
+                        from_domain = %from_domain,
+                        "dmarc would reject, but a DKIM key lookup failed temporarily; deferring"
+                    );
+                    return smtp::Control::tempfail(DMARC_TEMPFAIL);
+                }
                 if action == dmarc::Action::Reject && !exempt {
                     // Rejected mail is not spooled.
                     return smtp::Control::reject(
@@ -275,8 +289,8 @@ impl UserSession<'_> {
                 helo: self.helo.clone(),
                 mail_from: Some(mail_from),
                 rcpt_to: rcpt_to.clone(),
-                spf_result: spf_result.as_ref().map(|r| format!("{r:?}")),
-                spf_helo: self.spf_helo.as_ref().map(|r| format!("{r:?}")),
+                spf_result,
+                spf_helo: self.spf_helo,
                 dkim: dkim_summaries,
                 dmarc: dmarc_summary,
                 authenticated: self.authenticated.clone(),
@@ -293,15 +307,19 @@ impl UserSession<'_> {
             // them (claiming this server's authserv-id) are removed first.
             let message =
                 delivery::with_trace_headers(&meta, &strip_forged_verdicts(&raw, self.domain));
+            // Only the final message is needed from here on: holding the
+            // received copy too would double this session's memory while
+            // the spool writes.
+            drop(raw);
             let queue_id = meta.queue_id.clone();
             let write_spool = spool.clone();
-            let write = tokio::task::spawn_blocking(move || write_spool.write(meta, &message));
+            let write = tokio::task::spawn_blocking(move || write_spool.write(meta, message));
             // What the spool stored (sealed, with an encryptor): the bytes
             // every recipient gets, shared by the delivery tasks below.
-            let stored: Arc<[u8]> = match write.await {
+            let stored: Arc<Vec<u8>> = match write.await {
                 Ok(Ok(stored)) => {
                     info!(queue_id = %queue_id, recipients = rcpt_to.len(), "message spooled");
-                    stored.payload.into()
+                    Arc::new(stored.payload)
                 }
                 Ok(Err(e)) => {
                     error!(error = %e, "spool write failed; refusing with a temporary error");
@@ -366,7 +384,7 @@ async fn fast_path_deliver(
     spool: Arc<dyn spool::SpoolWriter>,
     recipients: Vec<spool::SpoolRcpt>,
     queue_id: String,
-    stored: Arc<[u8]>,
+    stored: Arc<Vec<u8>>,
 ) {
     let total = recipients.len();
     let mut delivered = 0usize;

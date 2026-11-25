@@ -32,7 +32,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Why a connection was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,9 +72,14 @@ struct Entry {
     window_count: u32,
 }
 
+/// Past this many tracked IPs, admitting a new one first drops the IPs
+/// with no connections whose window has expired, so the map stays
+/// bounded however many addresses connect.
+const CONNECTION_SWEEP_AT: usize = 4096;
+
 /// Per-source-IP concurrency and rate limits, shared across the accept
-/// loop. All state sits behind one mutex; the critical path per
-/// admission is a map lookup and a few integer updates.
+/// loop. All state sits behind one mutex, never held across an await; the
+/// critical path per admission is a map lookup and a few integer updates.
 #[derive(Debug)]
 pub struct ConnectionLimiter {
     /// Concurrent connections allowed per IP.
@@ -83,8 +88,29 @@ pub struct ConnectionLimiter {
     max_per_window: u32,
     /// Length of the fixed rate window.
     window: Duration,
+    /// Tracked IPs at which a new one triggers a sweep
+    /// ([`CONNECTION_SWEEP_AT`]).
+    sweep_at: usize,
     /// Per-IP state.
-    entries: Mutex<HashMap<IpAddr, Entry>>,
+    entries: std::sync::Mutex<HashMap<IpAddr, Entry>>,
+}
+
+/// An admitted connection's place in its IP's concurrent count, released
+/// when dropped: however the connection ends (normally, by an error, a
+/// timeout or a panic), the count is given back exactly once.
+#[derive(Debug)]
+#[must_use = "dropping the slot releases the connection at once"]
+pub struct ConnectionSlot {
+    /// The limiter the slot belongs to.
+    limiter: Arc<ConnectionLimiter>,
+    /// The connection's source IP.
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.limiter.release(self.ip);
+    }
 }
 
 impl ConnectionLimiter {
@@ -95,21 +121,33 @@ impl ConnectionLimiter {
             max_per_ip,
             max_per_window,
             window,
-            entries: Mutex::new(HashMap::new()),
+            sweep_at: CONNECTION_SWEEP_AT,
+            entries: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Lock the map, recovering it if a holder panicked (every update is a
+    /// few field changes or one insert/remove, so it is always valid).
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Entry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Try to admit a connection from `ip`.
     ///
-    /// Returns `Ok` only when the connection is within both budgets; on
-    /// success the IP's active and window counts are incremented and the
-    /// caller MUST call [`ConnectionLimiter::release`] when the
-    /// connection ends. Returns `Err(reason)` — without incrementing
-    /// either count — when the IP is over its concurrent cap or its
-    /// window budget.
-    pub async fn admit(&self, ip: IpAddr) -> Result<(), LimitReason> {
-        let mut entries = self.entries.lock().await;
+    /// Returns the connection's [`ConnectionSlot`], which releases it when
+    /// dropped, when the connection is within both budgets (the IP's
+    /// active and window counts are then incremented). Returns
+    /// `Err(reason)`, counting nothing, when the IP is over its concurrent
+    /// cap or its window budget.
+    pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionSlot, LimitReason> {
+        let mut entries = self.lock();
         let now = Instant::now();
+        if !entries.contains_key(&ip) && entries.len() >= self.sweep_at {
+            let window = self.window;
+            entries.retain(|_, e| e.active > 0 || now.duration_since(e.window_start) < window);
+        }
         let entry = entries.entry(ip).or_insert_with(|| Entry {
             active: 0,
             window_start: now,
@@ -131,25 +169,31 @@ impl ConnectionLimiter {
 
         entry.active += 1;
         entry.window_count += 1;
-        Ok(())
+        Ok(ConnectionSlot {
+            limiter: Arc::clone(self),
+            ip,
+        })
     }
 
-    /// Release one admitted connection from `ip`: decrement its active
-    /// count, then sweep idle entries whose window has expired. Calling
-    /// this without a matching successful `admit` (or twice) would
-    /// under-count, so it must pair exactly.
-    pub async fn release(&self, ip: IpAddr) {
-        let mut entries = self.entries.lock().await;
-        if let Some(entry) = entries.get_mut(&ip) {
+    /// Release one admitted connection from `ip` (only through
+    /// [`ConnectionSlot`]'s drop, so it pairs with `admit` exactly): its
+    /// active count goes down, and its entry is dropped once it has no
+    /// connections and its window has expired.
+    fn release(&self, ip: IpAddr) {
+        let mut entries = self.lock();
+        let idle_and_expired = entries.get_mut(&ip).is_some_and(|entry| {
             entry.active = entry.active.saturating_sub(1);
-        }
-
-        // Sweep: drop IPs with no active connections whose window has
-        // rolled over — bounded memory against unbounded attacker IPs.
-        let window = self.window;
-        entries.retain(|_, entry| {
-            entry.active > 0 || Instant::now().duration_since(entry.window_start) < window
+            entry.active == 0 && entry.window_start.elapsed() >= self.window
         });
+        if idle_and_expired {
+            entries.remove(&ip);
+        }
+    }
+
+    /// Returns `ip`'s active connection count (tests).
+    #[cfg(test)]
+    fn active(&self, ip: IpAddr) -> u32 {
+        self.lock().get(&ip).map_or(0, |e| e.active)
     }
 }
 
@@ -512,8 +556,8 @@ mod tests {
         assert!(!limiter.is_blocked_at(a, t0 + Duration::from_secs(61)));
     }
 
-    fn limiter(max_per_ip: u32, max_per_window: u32, window: Duration) -> ConnectionLimiter {
-        ConnectionLimiter::new(max_per_ip, max_per_window, window)
+    fn limiter(max_per_ip: u32, max_per_window: u32, window: Duration) -> Arc<ConnectionLimiter> {
+        Arc::new(ConnectionLimiter::new(max_per_ip, max_per_window, window))
     }
 
     /// Concurrent cap: the (N+1)th simultaneous connection from one IP
@@ -525,21 +569,24 @@ mod tests {
         let a = "10.0.0.1".parse().unwrap();
         let b = "10.0.0.2".parse().unwrap();
 
-        limiter.admit(a).await.unwrap();
-        limiter.admit(a).await.unwrap();
+        let first = limiter.admit(a).unwrap();
+        let _second = limiter.admit(a).unwrap();
         assert_eq!(
-            limiter.admit(a).await,
-            Err(LimitReason::TooManyConcurrent),
+            limiter.admit(a).unwrap_err(),
+            LimitReason::TooManyConcurrent,
             "third concurrent connection from one IP must be denied"
         );
 
         // A different IP has its own budget.
-        limiter.admit(b).await.unwrap();
+        let _other = limiter.admit(b).unwrap();
 
-        // Release admits the next connection from the same IP.
-        limiter.release(a).await;
-        limiter.admit(a).await.unwrap();
-        assert_eq!(limiter.admit(a).await, Err(LimitReason::TooManyConcurrent));
+        // Releasing a slot admits the next connection from the same IP.
+        drop(first);
+        let _third = limiter.admit(a).unwrap();
+        assert_eq!(
+            limiter.admit(a).unwrap_err(),
+            LimitReason::TooManyConcurrent
+        );
     }
 
     /// Window rate cap: connections beyond the per-window budget are
@@ -551,43 +598,66 @@ mod tests {
         let a = "10.1.0.1".parse().unwrap();
 
         for _ in 0..3 {
-            limiter.admit(a).await.unwrap();
-            limiter.release(a).await;
+            drop(limiter.admit(a).unwrap());
         }
         assert_eq!(
-            limiter.admit(a).await,
-            Err(LimitReason::RateLimited),
+            limiter.admit(a).unwrap_err(),
+            LimitReason::RateLimited,
             "fourth connection inside the window must be rate-limited"
         );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        limiter.admit(a).await.unwrap();
+        let _slot = limiter.admit(a).unwrap();
     }
 
-    /// The sweep must keep the map bounded: many IPs with zero active
-    /// connections and expired windows are dropped on the next release.
+    /// The map stays bounded: once it holds `sweep_at` IPs, admitting a
+    /// new one drops those with no connections and an expired window, and
+    /// keeps the rest (a live connection, or a window still counting).
     #[tokio::test]
     async fn sweep_drops_idle_expired_entries() {
-        let limiter = limiter(5, 5, Duration::from_millis(50));
+        let mut limiter = ConnectionLimiter::new(5, 5, Duration::from_millis(50));
+        limiter.sweep_at = 50;
+        let limiter = Arc::new(limiter);
+        let held: IpAddr = "10.9.1.1".parse().unwrap();
+        let _live = limiter.admit(held).unwrap();
         for i in 0..100u8 {
             let ip: IpAddr = format!("10.9.0.{i}").parse().unwrap();
-            limiter.admit(ip).await.unwrap();
-            limiter.release(ip).await;
+            drop(limiter.admit(ip).unwrap());
         }
+        // Fresh windows are kept even past `sweep_at`: they are still
+        // counting each IP's rate.
+        assert_eq!(limiter.lock().len(), 101);
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // The next release triggers the sweep over all expired entries.
-        let survivor = "10.9.0.200".parse().unwrap();
-        limiter.admit(survivor).await.unwrap();
-        limiter.release(survivor).await;
-        limiter.admit(survivor).await.unwrap();
-
-        let entries = limiter.entries.lock().await;
+        drop(limiter.admit("10.9.0.200".parse().unwrap()).unwrap());
+        let entries = limiter.lock();
         assert!(
             entries.len() <= 2,
-            "idle expired entries must be swept, got {}",
+            "idle expired entries swept, got {}",
             entries.len()
         );
+        assert_eq!(
+            entries.get(&held).map(|e| e.active),
+            Some(1),
+            "a live connection stays"
+        );
+    }
+
+    /// A slot is released however the connection ends, including a
+    /// panic in the task that holds it.
+    #[tokio::test]
+    async fn slot_is_released_when_its_task_panics() {
+        let limiter = limiter(1, 100, Duration::from_secs(60));
+        let ip: IpAddr = "10.7.0.1".parse().unwrap();
+        let slot = limiter.admit(ip).unwrap();
+        assert_eq!(limiter.active(ip), 1);
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            panic!("session bug");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(limiter.active(ip), 0, "the panic released the slot");
+        let _next = limiter.admit(ip).unwrap();
     }
 
     /// The 421 reply texts are retryable temporary failures.

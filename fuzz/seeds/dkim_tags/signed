@@ -1,0 +1,6 @@
+v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=x.example; s=s; h=From:Subject; bh=AAAA; b=AAAA; l=4
+From: a@x.example
+Subject: s
+
+body

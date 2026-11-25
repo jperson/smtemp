@@ -21,6 +21,10 @@ use crate::tls::{build_tls_acceptor, load_resolver_ca, tls_handshake};
 use crate::{auth, authority, delivery, fsutil, limit, privdrop, quota, spool};
 use smtp::SmtpSession as _;
 
+/// Drain passes (one a minute) between sweeps of the maildirs' crash
+/// debris: hourly.
+const SINK_SWEEP_EVERY_PASSES: u64 = 60;
+
 /// How long past its `max-conn-duration-ms` deadline a connection task
 /// may run before it is dropped. The session ends itself at the deadline
 /// (at its next read); this only catches a task stuck in a write or a
@@ -302,12 +306,22 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut passes: u64 = 0;
             loop {
                 ticker.tick().await;
+                // The maildirs' crash debris is swept at startup and then
+                // hourly (it walks every mailbox), the spool's every pass.
+                let sweep_sink = passes.is_multiple_of(SINK_SWEEP_EVERY_PASSES);
+                passes += 1;
                 let pass = tokio::task::spawn_blocking({
                     let spool = spool.clone();
                     let sink = sink.clone();
-                    move || delivery::drain_once(&*spool, &*sink)
+                    move || {
+                        if sweep_sink {
+                            delivery::sweep_sink_debris_now(&*sink);
+                        }
+                        delivery::drain_once(&*spool, &*sink)
+                    }
                 })
                 .await;
                 match pass {
@@ -473,17 +487,21 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             }
         };
 
-        // Per-IP concurrency and connection-rate budgets.
-        if let Err(reason) = limiter.admit(ip).await {
-            warn!(peer = %peer, "connection refused: per-IP limit reached");
-            refuse_async(stream, reason.reply(), &refuse_capacity).await;
-            drop(permit);
-            continue;
-        }
+        // Per-IP concurrency and connection-rate budgets. The slot gives
+        // the IP's count back when it is dropped, however the connection
+        // task ends (a panic included).
+        let slot = match limiter.admit(ip) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                warn!(peer = %peer, "connection refused: per-IP limit reached");
+                refuse_async(stream, reason.reply(), &refuse_capacity).await;
+                drop(permit);
+                continue;
+            }
+        };
 
         let acceptor = acceptor.clone();
         let max_read_ms = config.max_read_duration_ms;
-        let limiter = limiter.clone();
         let deadline = Instant::now() + Duration::from_millis(config.max_conn_duration_ms);
         let session_cfg = SessionConfig {
             domain: config.domain.clone(),
@@ -520,9 +538,10 @@ pub(crate) async fn run(config: Config) -> Result<()> {
                 Err(_) => warn!(peer = %peer, "connection stuck past its duration limit; dropped"),
             }
 
-            // Free the connection's capacity, whoever ended it.
+            // Free the connection's capacity (both guards would on a
+            // panic too).
             drop(permit);
-            limiter.release(ip).await;
+            drop(slot);
         });
     };
 

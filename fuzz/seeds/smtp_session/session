@@ -1,0 +1,14 @@
+EHLO client.example
+AUTH PLAIN
+AGFsaWNlAHB3
+MAIL FROM:<a@b.example>
+RCPT TO:<c@d.example>
+DATA
+Subject: x
+..dotted
+
+.
+body
+.
+RSET
+QUIT

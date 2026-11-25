@@ -471,6 +471,7 @@ name = "dmarc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
  "spf",
  "thiserror",
  "tokio",
@@ -1540,6 +1541,7 @@ dependencies = [
  "rcgen",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-rustls",

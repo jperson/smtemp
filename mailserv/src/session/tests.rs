@@ -858,3 +858,94 @@ async fn refused_recipients_are_limited_per_ip() {
     other.begin("x@sender.example");
     assert!(other.rcpt_to("<a@small.example>").await.is_accept());
 }
+
+/// A bounce (null sender) from a `p=reject` domain, unsigned, aligns
+/// through SPF on the HELO identity: the HELO host's SPF passes and
+/// shares the From domain's organizational domain, so DMARC passes. A
+/// HELO host of another organization still fails.
+#[tokio::test]
+async fn bounces_align_through_the_helo_identity() {
+    let dns = spawn_mock_resolver(
+        |name, qtype| match (name, qtype) {
+            (n, 16) if n.starts_with("_dmarc.") => MockAnswer::Txt("v=DMARC1; p=reject"),
+            ("mta.bounce.example" | "mta.other.example", 16) => {
+                MockAnswer::Txt("v=spf1 ip4:127.0.0.1 -all")
+            }
+            _ => MockAnswer::Rcode(3),
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        dns,
+        ..size_limit_session(dir.path())
+    };
+    let bounce = b"From: MAILER-DAEMON@bounce.example\r\nSubject: Undelivered\r\n\r\nbody\r\n";
+
+    for (helo, accepted) in [("mta.bounce.example", true), ("mta.other.example", false)] {
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        assert!(session.helo(true, helo).await.is_accept());
+        assert!(
+            session.mail_from("<>").await.is_accept(),
+            "SPF passes for {helo}"
+        );
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+        session.t().data = bounce.to_vec();
+        let reply = session.end_data().await;
+        assert_eq!(reply.is_accept(), accepted, "{helo}: {reply:?}");
+        assert_eq!(
+            session.dmarc.as_ref().map(|d| d.spf_aligned),
+            Some(accepted)
+        );
+    }
+}
+
+/// End to end: the stored message carries our Authentication-Results and
+/// the display-name warning, the sender's forged Authentication-Results
+/// claiming our authserv-id is gone, and the metadata records the claim.
+#[tokio::test]
+async fn stored_message_carries_our_verdicts_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let cfg = SessionConfig {
+        dns: spawn_nxdomain_resolver().await,
+        spool: Some(Arc::new(spool::DiskSpool::open(&spool_dir, None).unwrap())),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@attacker.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    session.t().data =
+        b"Authentication-Results: mail.test; dmarc=pass header.from=victim.example\r\n\
+From: \"ceo@victim.example\" <x@attacker.example>\r\n\
+Subject: wire the money\r\n\r\nbody\r\n"
+            .to_vec();
+    assert!(session.end_data().await.is_accept());
+
+    let new = spool_dir.join("new");
+    let names = std::fs::read_dir(&new)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let eml = names.iter().find(|n| n.ends_with(".eml")).unwrap();
+    let text = String::from_utf8(std::fs::read(new.join(eml)).unwrap()).unwrap();
+    assert_eq!(text.matches("Authentication-Results:").count(), 1, "{text}");
+    // (`begin` skips SPF, so there is no spf= result.)
+    assert!(
+        text.contains("Authentication-Results: mail.test;\r\n\tdkim=none;"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\tdmarc=none\r\n"),
+        "ours, not the forged pass: {text}"
+    );
+    assert!(text.contains("X-Display-Name-Warning: the From display name names victim.example"));
+    let json = names.iter().find(|n| n.ends_with(".json")).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(new.join(json)).unwrap()).unwrap();
+    assert_eq!(
+        meta["display_name_claims"],
+        serde_json::json!(["victim.example"])
+    );
+}

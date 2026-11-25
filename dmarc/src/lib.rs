@@ -5,11 +5,15 @@
 //! is generic over [`spf::SpfResolver`], reusing the SPF crate's resolver
 //! abstraction (and its fixture mocks).
 //!
-//! Not implemented: `rua=`/`ruf=` reporting, `pct=` gradual sampling
-//! (treated as 100), and PSL-based organizational-domain discovery. Policy
-//! discovery walks the From domain's ancestors instead (see
-//! [`fetch_policy`]); relaxed alignment is a suffix test.
+//! Relaxed alignment compares organizational domains from a vendored
+//! Public Suffix List snapshot ([`psl`]). Policy discovery walks the From
+//! domain's ancestors (see [`fetch_policy`]), which needs no list.
+//!
+//! Not implemented: `rua=`/`ruf=` reporting and `pct=` gradual sampling
+//! (treated as 100).
 #![warn(missing_docs)]
+
+pub mod psl;
 
 use spf::SpfResolver;
 use thiserror::Error;
@@ -154,12 +158,19 @@ fn parse_policy(value: &str) -> Result<DmarcPolicy, DmarcError> {
 }
 
 /// Relaxed alignment (RFC 7489 Section 3.1.1): returns whether domains
-/// `a` and `b` are equal or one is a subdomain of the other (trimmed,
-/// case-insensitive).
+/// `a` and `b` have the same organizational domain (see
+/// [`psl::organizational_domain`]), so `mail.example.com` and
+/// `news.example.com` align while `a.github.io` and `b.github.io` don't.
+/// A domain that is itself a public suffix has no organizational domain
+/// and aligns only with itself.
 pub fn aligned_relaxed(a: &str, b: &str) -> bool {
-    let a = a.trim().to_ascii_lowercase();
-    let b = b.trim().to_ascii_lowercase();
-    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+    match (psl::organizational_domain(a), psl::organizational_domain(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => aligned_strict(
+            a.trim().trim_end_matches('.'),
+            b.trim().trim_end_matches('.'),
+        ),
+    }
 }
 
 /// Strict alignment: returns whether domains `a` and `b` match exactly
@@ -412,6 +423,17 @@ mod tests {
         assert!(aligned_relaxed("mail.example.org", "example.org"));
         assert!(aligned_relaxed("example.org", "mail.example.org"));
         assert!(!aligned_relaxed("notexample.org", "example.org"));
+        // Siblings share the organizational domain: they align.
+        assert!(aligned_relaxed("mail.example.org", "news.example.org"));
+        assert!(aligned_relaxed(
+            "bounce.mail.example.co.uk",
+            "example.co.uk"
+        ));
+        // Across a public suffix they don't, however the names look.
+        assert!(!aligned_relaxed("victim.co.uk", "attacker.co.uk"));
+        assert!(!aligned_relaxed("alice.github.io", "bob.github.io"));
+        assert!(!aligned_relaxed("co.uk", "victim.co.uk"));
+        assert!(aligned_relaxed("Example.ORG.", "example.org"));
 
         assert!(aligned_strict("Example.ORG", "example.org"));
         assert!(!aligned_strict("mail.example.org", "example.org"));

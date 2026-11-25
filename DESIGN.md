@@ -286,7 +286,11 @@ How the ordering is constrained:
     count.
 - **Evaluation.** All mechanisms are supported.
   - The RFC 7208 §4.6.4 budget applies: 10 DNS-querying terms and 2 void
-    lookups, shared across `include`/`redirect`.
+    lookups, shared across `include`/`redirect`. `mx` and `ptr` are one
+    term each: the address lookups behind them aren't terms or void
+    lookups (an IPv6-only MX host has no A records). Instead, one `mx`
+    with more than 10 exchanges is PermError, and `ptr` considers only
+    the first 10 names.
   - A `redirect=` to a domain with no SPF record is PermError (RFC 7208
     §6.1), like an `include:` of one.
   - Macros are expanded per RFC 7208 §7.
@@ -337,8 +341,17 @@ How the ordering is constrained:
 - **Fails closed.** Any lookup error is `DmarcError::Temp` → `451 4.4.3`:
   skipping a name could skip the policy that applies. Several records at one
   name means DMARC isn't applied (RFC 7489 §6.6.3), logged at `warn`.
-- **Alignment.** Strict (`adkim`/`aspf=s`) is an exact match. Relaxed is a
-  **suffix test**, which is safe but rejects sibling subdomains (§13).
+- **Alignment.** Strict (`adkim`/`aspf=s`) is an exact match. Relaxed
+  compares **organizational domains** (RFC 7489 §3.2) from a vendored,
+  dated Public Suffix List (`dmarc::psl`, ICANN and private sections), so
+  `mail.example.com` aligns with `news.example.com` while
+  `alice.github.io` and `bob.github.io` don't. It is parsed at startup
+  (the log records its version); Unicode rules are converted to `xn--`
+  form.
+- **The SPF identity.** The MAIL FROM domain, or for the null sender (a
+  bounce) the HELO name, which is what SPF evaluated (RFC 7208 §2.4), so
+  an unsigned bounce from a `p=reject` domain aligns when its HELO host
+  passes SPF in the same organization.
 - **Policy.** A `reject` failure → `550`. `quarantine` and `none` are
   delivered. `pct` is treated as 100. Authenticated senders are exempt from
   rejection, but only after the grant check (§10).
@@ -419,6 +432,21 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
   clause**: one payload serves every recipient, so naming one would
   disclose Bcc recipients to the others. Non-printable bytes in a stored
   HELO are replaced with `?`.
+- **Verdict headers**, after `Received:`:
+  - `Authentication-Results:` (RFC 8601), authserv-id `--domain`: `auth`
+    for a submission, `spf` with `smtp.mailfrom` (or `smtp.helo` for a
+    bounce), one `dkim` per signature, `dmarc` with `header.from` (or
+    `none`). Sender-chosen values (selectors, names) are reduced to
+    `[A-Za-z0-9.-_+@]`.
+  - `X-Display-Name-Warning:` when the From display name or a comment
+    contains an address whose organizational domain is none of the
+    authors' (encoded-words decoded first). A warning, not a refusal:
+    list software (Google Groups' "alice@example.com via Team") does
+    this legitimately. The claims are also in the spool metadata
+    (`display_name_claims`) and the log.
+  - Before these are added, the message's own `Authentication-Results:`
+    claiming our authserv-id, and any `X-Display-Name-Warning:`, are
+    removed (RFC 8601 §5), so a sender can't plant a "pass".
 - **Fast path.** After the spool commit, delivery to each recipient
   starts in a background task and the `250` goes out at once. A failure is
   logged and the message stays queued for the drain; when every copy is
@@ -603,7 +631,7 @@ bound only protects library callers that use it.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 301 tests in four layers:
+- **Testing.** 312 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
@@ -644,9 +672,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | Gap | Impact | Plan |
 |---|---|---|
 | No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.5 |
-| SPF budget charges MX-host and PTR-name address lookups against the 10-term limit | Large legitimate records can hit PermError → `550` | §2.4.3 |
-| Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | §2.4.3 |
-| No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | §2.4.3 |
+| The Public Suffix List is a snapshot | A suffix added after it was taken isn't known; alignment there falls back to the last-two-labels rule | §2.4.3 (refresh) |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
 | Commands before EHLO get `500`, not `503`; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.5 |
 | DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.5 |
@@ -656,8 +682,8 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 
 | Gap | Impact | Plan |
 |---|---|---|
-| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | §2.4.4 |
-| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | §2.4.4 |
+| Only display names containing an address are checked; lookalike characters (`＠`, Cyrillic letters) and brand names aren't | `From: "PayPal Support" <x@attacker>` gets no warning | §2.4.4 |
+| The display-name warning is a header; mail clients don't show it | Protection depends on a UI (the console) surfacing it | §2.4.4 |
 
 ### Storage and encryption seams
 

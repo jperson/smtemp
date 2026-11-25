@@ -1,6 +1,6 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-24:** 301 tests pass (1 ignored) with no network beyond
+**As of 2026-11-24:** 312 tests pass (1 ignored) with no network beyond
 loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
@@ -21,7 +21,7 @@ optional. Send-side work is post-V1 (§6).
 | Area | Status |
 |---|---|
 | SMTP core, STARTTLS, framing and smuggling defences | ✅ Done |
-| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, and bounce alignment (§2.4 item 3) |
+| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done: RFC 7208 lookup limits, PSL-based relaxed alignment, bounce alignment; our `Authentication-Results:` and display-name warnings on delivered mail |
 | Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
 | Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: maildir fsync and `tmp/` debris (§2.4) |
 | Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Recipient probing limited per connection and per IP |
@@ -78,17 +78,17 @@ Fix these after the pilot starts and before GA, in this order:
    100 per 15 minutes). Open: aggregate the per-IP budget per IPv6 /64
    (§6, IPv6 readiness), and watch whether large providers' shared
    outbound IPs need an allow-list.
-3. **SPF and DMARC correctness** (the first three reject legitimate mail):
-   - stop charging the address lookups behind `mx` and `ptr` to SPF's
-     10-term budget, but add RFC 7208 §4.6.4's 10-address cap per
-     `mx`/`ptr`;
-   - organisational-domain relaxed DMARC alignment. This needs a Public
-     Suffix List; vendor a dated snapshot;
-   - HELO-identity SPF alignment for bounces (null sender).
-4. **What users are shown:**
-   - add our `Authentication-Results:` and strip forged ones that claim our
-     authserv-id;
-   - a display-name check, or document that display names are unverified.
+3. **SPF and DMARC correctness.** Done: `mx`/`ptr` cost one term each,
+   with RFC 7208 §4.6.4's per-mechanism address cap; relaxed alignment
+   compares organizational domains from a vendored Public Suffix List
+   (`dmarc/data/public_suffix_list.dat`); bounces align through the HELO
+   identity. Open: refresh the PSL snapshot regularly (DEPLOYMENT.md H7).
+4. **What users are shown.** Done: our `Authentication-Results:` (forged
+   ones claiming our authserv-id are removed), and an
+   `X-Display-Name-Warning:` when the From display name names another
+   organization (tagged, never refused, since list software does it).
+   Open: lookalike display names without an address (`PayPal Support`),
+   and lookalike Unicode characters.
 5. **Robustness:**
    - an RAII guard for the per-IP connection count;
    - fsync the maildir directory after the rename, and sweep old files from
@@ -113,11 +113,7 @@ One line per open item; DESIGN.md §13 has the impact of each.
 | Gap | DESIGN §13 area | Planned in |
 |---|---|---|
 | Quotas are soft and don't count queued mail; no per-domain total | Abuse resistance | §2.4.1 |
-| SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.3 |
-| Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.3 |
-| No SPF alignment for the null sender | Correctness and delivery | §2.4.3 |
-| No `Authentication-Results:` | What users are shown | §2.4.4 |
-| Display-name spoofing | What users are shown | §2.4.4 |
+| Display names without an address, and lookalike characters, aren't checked | What users are shown | §2.4.4 |
 | Per-IP count release, maildir fsync and `tmp/`, pre-EHLO replies, DKIM tag checks, `chown` by path, memory copies | Abuse resistance; Correctness and delivery | §2.4.5 |
 | Sender grants read only at startup | Submission and AUTH | §6 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits not aggregated per IPv6 /64 | Correctness; Abuse resistance | §6 (IPv6 readiness) |

@@ -374,6 +374,14 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     // socket is simply closed.
     let refuse_capacity = Arc::new(tokio::sync::Semaphore::new(32));
     let fast_path = Arc::new(tokio::sync::Semaphore::new(MAX_FAST_PATH_DELIVERIES));
+    // The Public Suffix List (relaxed DMARC alignment, display-name
+    // checks): parsed now, not during the first message.
+    let rules = dmarc::psl::load();
+    info!(
+        rules,
+        version = dmarc::psl::version().unwrap_or("unknown"),
+        "public suffix list loaded"
+    );
     let probing = Arc::new(limit::ProbeLimits::new(
         config.max_refused_rcpt_per_session,
         config.max_refused_rcpt_per_ip,

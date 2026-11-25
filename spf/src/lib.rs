@@ -63,6 +63,10 @@ pub enum SpfError {
     /// The RFC 7208 §4.6.4 2-void-lookup budget was exceeded.
     #[error("SPF void lookup limit of {0} exceeded")]
     VoidLimit(usize),
+    /// One `mx` mechanism needed more than the RFC 7208 §4.6.4 limit of
+    /// address lookups (one per MX exchange).
+    #[error("SPF mx mechanism needs more than {0} address lookups")]
+    AddressLimit(usize),
     /// The whole evaluation ran past its elapsed-time limit
     /// ([`EVALUATION_DEADLINE`]); RFC 7208 §4.6.4 makes this a TempError.
     #[error("SPF evaluation exceeded its {0:?} time limit")]
@@ -75,17 +79,20 @@ impl SpfError {
     pub fn to_result(&self) -> SpfResult {
         match self {
             SpfError::Temp | SpfError::Deadline(_) => SpfResult::TempError,
-            SpfError::Perm | SpfError::LookupLimit(_) | SpfError::VoidLimit(_) => {
-                SpfResult::PermError
-            }
+            SpfError::Perm
+            | SpfError::LookupLimit(_)
+            | SpfError::VoidLimit(_)
+            | SpfError::AddressLimit(_) => SpfResult::PermError,
         }
     }
 }
 
-/// RFC 7208 Section 4.6.4 evaluation limits, shared by every DNS query a
-/// single `check_host()` evaluation performs: the record fetches behind
-/// `include` and `redirect`, the `a`/`mx`/`ptr`/`exists` mechanism
-/// queries, and the secondary A lookups behind `mx` and `ptr`.
+/// RFC 7208 Section 4.6.4 evaluation limits, shared by one `check_host()`
+/// evaluation: every DNS-querying term (`include`, `a`, `mx`, `ptr`,
+/// `exists`, and `redirect`) is one lookup, and a query of one of those
+/// terms that returns nothing is one void lookup. The address lookups
+/// behind `mx` and `ptr` are not terms: they have their own per-mechanism
+/// cap ([`MAX_ADDRESS_LOOKUPS`]) and are never void lookups.
 ///
 /// The budget is what makes hostile records safe to evaluate: a circular
 /// include/redirect chain or a record with dozens of mechanisms terminates
@@ -103,6 +110,10 @@ struct Budget {
 const MAX_LOOKUPS: usize = 10;
 /// RFC 7208 §4.6.4: the most void lookups one evaluation may make.
 const MAX_VOID_LOOKUPS: usize = 2;
+/// RFC 7208 §4.6.4: the most address lookups one `mx` mechanism may make
+/// (more is PermError), and the most PTR names one `ptr` mechanism
+/// considers (the rest are ignored).
+const MAX_ADDRESS_LOOKUPS: usize = 10;
 
 impl Budget {
     /// Account one DNS lookup.
@@ -530,10 +541,11 @@ async fn check_a_record<R: SpfResolver + Sync>(
 }
 
 /// `mx` (RFC 7208 Section 5.4): match `peer` against the A records of
-/// each MX exchange of `d`, widened to `cidr.v4`. The MX lookup counts as
-/// one budgeted lookup and each exchange's A lookup as another, so a
-/// record pointing at a wildcard MX target is bounded by the shared
-/// budget.
+/// each MX exchange of `d`, widened to `cidr.v4`. The mechanism is one
+/// budgeted lookup (and a void one when `d` has no MX); the exchanges'
+/// address lookups are capped at [`MAX_ADDRESS_LOOKUPS`] per mechanism
+/// instead (RFC 7208 §4.6.4), and an exchange without A records (an
+/// IPv6-only host) is not a void lookup.
 ///
 /// Returns `Some(m)` on a match, `None` otherwise.
 ///
@@ -554,12 +566,13 @@ async fn check_mx_record<R: SpfResolver + Sync>(
         budget.record_void()?;
     }
 
+    // Checked before any address lookup: an MX set that can't be
+    // evaluated within the cap is PermError whatever it would match.
+    if mxs.len() > MAX_ADDRESS_LOOKUPS {
+        return Err(SpfError::AddressLimit(MAX_ADDRESS_LOOKUPS));
+    }
     for (_, exchange) in mxs {
-        budget.spend()?;
         let ips = resolver.a(&exchange).await.map_err(|_| SpfError::Temp)?;
-        if ips.is_empty() {
-            budget.record_void()?;
-        }
         for ip in ips {
             let ipn = Ipv4Net::new(ip, cidr.v4).map_err(|_| SpfError::Perm)?;
             if let Some(r) = check_ipv4(peer, &ipn, m) {
@@ -572,8 +585,11 @@ async fn check_mx_record<R: SpfResolver + Sync>(
 
 /// `ptr` (RFC 7208 Section 5.5): forward-confirmed reverse DNS of the
 /// connecting IPv4 `peer`, validated against the domain-spec `d` (or
-/// `current_domain` when `d` is empty). The PTR lookup and each forward
-/// lookup count against the budget. IPv6 peers never match.
+/// `current_domain` when `d` is empty). The PTR lookup is one budgeted
+/// lookup (void when it finds nothing); only the first
+/// [`MAX_ADDRESS_LOOKUPS`] names are forward-confirmed and the rest are
+/// ignored (RFC 7208 §4.6.4), and those confirmations are not charged.
+/// IPv6 peers never match.
 ///
 /// Returns `Some(m)` on a match, `None` otherwise.
 ///
@@ -604,13 +620,9 @@ async fn check_ptr_record<R: SpfResolver + Sync>(
     let target = if d.is_empty() { current_domain } else { d };
     let target = target.to_ascii_lowercase();
 
-    for name in names {
+    for name in names.into_iter().take(MAX_ADDRESS_LOOKUPS) {
         // Forward-confirm: the PTR name's A records must contain the IP.
-        budget.spend()?;
         let ips = resolver.a(&name).await.map_err(|_| SpfError::Temp)?;
-        if ips.is_empty() {
-            budget.record_void()?;
-        }
         if !ips.contains(&ip4) {
             continue;
         }
@@ -1131,6 +1143,93 @@ mod tests {
         assert_eq!(result.unwrap(), SpfResult::PermError);
         let result = check(&resolver, "192.0.2.1", "foo@b.example", "b.example").await;
         assert_eq!(result.unwrap(), SpfResult::Fail);
+    }
+
+    /// RFC 7208 §4.6.4 for `mx`: the mechanism is one term, its address
+    /// lookups don't count against the 10 (so nine `mx` mechanisms with
+    /// four exchanges each still evaluate), exchanges without A records
+    /// aren't void lookups, and more than 10 exchanges is PermError.
+    #[tokio::test]
+    async fn mx_address_lookups_have_their_own_cap() {
+        let mut resolver = MockResolver::default();
+        let mut mechanisms = Vec::new();
+        for i in 1..=9 {
+            let domain = format!("mx{i}.example");
+            // Three IPv6-only exchanges (no A) and one that doesn't match.
+            let mut exchanges: Vec<(u16, String)> =
+                (1..=3).map(|j| (10, format!("v6-{j}.{domain}"))).collect();
+            exchanges.push((20, format!("out.{domain}")));
+            resolver.a.insert(
+                format!("out.{domain}"),
+                vec!["198.51.100.1".parse().unwrap()],
+            );
+            resolver.mx.insert(domain.clone(), exchanges);
+            mechanisms.push(format!("mx:{domain}"));
+        }
+        resolver
+            .a
+            .insert("in.mx9.example".into(), vec!["192.0.2.1".parse().unwrap()]);
+        resolver
+            .mx
+            .get_mut("mx9.example")
+            .unwrap()
+            .push((30, "in.mx9.example".into()));
+        resolver.txt.insert(
+            "big.example".into(),
+            vec![format!("v=spf1 {} -all", mechanisms.join(" "))],
+        );
+        let result = check(&resolver, "192.0.2.1", "a@big.example", "big.example").await;
+        assert_eq!(
+            result.unwrap(),
+            SpfResult::Pass,
+            "nine terms, 37 address lookups"
+        );
+
+        // Eleven exchanges in one mx: PermError, even though one matches.
+        let many: Vec<(u16, String)> = (1..=11)
+            .map(|j| (10, format!("h{j}.wide.example")))
+            .collect();
+        resolver
+            .a
+            .insert("h1.wide.example".into(), vec!["192.0.2.1".parse().unwrap()]);
+        resolver.mx.insert("wide.example".into(), many);
+        resolver
+            .txt
+            .insert("wide.example".into(), vec!["v=spf1 mx -all".into()]);
+        let result = check(&resolver, "192.0.2.1", "a@wide.example", "wide.example").await;
+        assert_eq!(
+            result.unwrap(),
+            SpfResult::PermError,
+            "more than 10 address lookups"
+        );
+    }
+
+    /// RFC 7208 §4.6.4 for `ptr`: only the first 10 PTR names are
+    /// forward-confirmed, the rest ignored, and the confirmations aren't
+    /// charged against the 10-term budget.
+    #[tokio::test]
+    async fn ptr_considers_only_the_first_ten_names() {
+        let mut resolver = MockResolver::default();
+        let peer: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        let names: Vec<String> = (1..=12).map(|i| format!("n{i}.ptr.example")).collect();
+        for name in &names {
+            resolver.a.insert(name.clone(), vec![peer]);
+        }
+        resolver.ptr.insert("7.2.0.192.in-addr.arpa".into(), names);
+        // Only the 11th name is under the target domain: ignored.
+        resolver.txt.insert(
+            "late.example".into(),
+            vec!["v=spf1 ptr:n11.ptr.example -all".into()],
+        );
+        let result = check(&resolver, "192.0.2.7", "a@late.example", "late.example").await;
+        assert_eq!(result.unwrap(), SpfResult::Fail);
+        // A name within the first ten matches, without exhausting the budget.
+        resolver.txt.insert(
+            "early.example".into(),
+            vec!["v=spf1 ptr:ptr.example -all".into()],
+        );
+        let result = check(&resolver, "192.0.2.7", "a@early.example", "early.example").await;
+        assert_eq!(result.unwrap(), SpfResult::Pass);
     }
 
     /// The 10-lookup budget: an eleventh DNS-consuming mechanism is a

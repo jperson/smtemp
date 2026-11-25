@@ -250,6 +250,12 @@ pub struct SpoolMeta {
     /// [`PayloadEncryptor::id`] of the provider that sealed the payload,
     /// or None when stored in the clear.
     pub encryption: Option<String>,
+    /// Domains the From display name (or a comment) names that belong to
+    /// none of the message's authors (see
+    /// [`crate::headers::display_name_claims`]); empty when none. Absent
+    /// in spool files from before this field existed.
+    #[serde(default)]
+    pub display_name_claims: Vec<String>,
 }
 
 /// One committed message in the queue, as returned by
@@ -703,6 +709,7 @@ mod tests {
             tls_active: false,
             message_size: 0,
             encryption: None,
+            display_name_claims: Vec::new(),
         }
     }
 

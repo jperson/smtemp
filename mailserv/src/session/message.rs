@@ -118,15 +118,29 @@ impl UserSession<'_> {
             }
         };
 
+        // The From authors, on the same tolerant raw scan DMARC uses, so
+        // they are the ones a mail client displays.
+        let from_value = single_from_value(&raw).ok();
+        let authors = from_value.as_deref().and_then(from_authors);
+        // A display name naming another organization's address is tagged
+        // (a warning header and the spool metadata), never refused: list
+        // software does it legitimately.
+        let display_name_claims = match (&from_value, &authors) {
+            (Some(value), Some(authors)) => display_name_claims(value, authors),
+            _ => Vec::new(),
+        };
+        if !display_name_claims.is_empty() {
+            info!(
+                claims = ?display_name_claims,
+                from_authors = ?authors,
+                "From display name names another domain; message tagged"
+            );
+        }
+
         // An authenticated session is exempt from DMARC rejection below,
         // which is only safe because every From author must be an address
-        // the login owns (`--auth-senders`). Checked on the same tolerant
-        // raw scan DMARC uses, so the author checked is the one a mail
-        // client displays.
+        // the login owns (`--auth-senders`).
         if let Some(user) = self.authenticated.as_deref() {
-            let authors = single_from_value(&raw)
-                .ok()
-                .and_then(|value| from_authors(&value));
             let permitted = match (&authors, self.auth.as_deref()) {
                 (Some(authors), Some(auth)) => authors
                     .iter()
@@ -176,7 +190,15 @@ impl UserSession<'_> {
             if let Some(found) = found {
                 let record = &found.record;
                 let spf_passed = matches!(spf_result, Some(SpfResult::Pass));
-                let spf_domain = path_domain(&mail_from);
+                // The SPF-authenticated domain: the MAIL FROM domain, or for
+                // the null sender (a bounce) the HELO domain, which is the
+                // identity SPF evaluated (RFC 7208 section 2.4). Address-literal
+                // HELOs authenticate no domain.
+                let spf_domain = if mail_from.is_empty() {
+                    self.helo.as_deref().filter(|h| !h.starts_with('['))
+                } else {
+                    path_domain(&mail_from)
+                };
                 // DMARC consumes ONLY this message's DKIM results.
                 // `self.dkim` accumulates across the connection for the
                 // session log; using it here would let a replayed genuine
@@ -261,12 +283,16 @@ impl UserSession<'_> {
                 tls_active: self.tls_active,
                 message_size: raw.len(),
                 encryption: None, // set by the backend's encryptor, if any
+                display_name_claims,
             };
             // The trace headers go in now, once, before the write: the
             // stored payload is the final message for every recipient, so
             // it can be sealed and is delivered verbatim (fast path and
             // drain alike).
-            let message = delivery::with_trace_headers(&meta, &raw);
+            // Our verdict headers go on top; a sender's forged copies of
+            // them (claiming this server's authserv-id) are removed first.
+            let message =
+                delivery::with_trace_headers(&meta, &strip_forged_verdicts(&raw, self.domain));
             let queue_id = meta.queue_id.clone();
             let write_spool = spool.clone();
             let write = tokio::task::spawn_blocking(move || write_spool.write(meta, &message));

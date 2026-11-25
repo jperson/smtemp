@@ -43,12 +43,12 @@ the section given.
 | H7 | Unlimited DKIM signatures per message | Fixed (at most 5) |
 | H8 | Grace-mode domains refused permanent mailboxes | Fixed |
 | M1 | SPF parser stopped at the first unknown term | Fixed |
-| M2 | SPF budget over-counts `mx`/`ptr` address lookups | Open (§2.4.3) |
+| M2 | SPF budget over-counts `mx`/`ptr` address lookups | Fixed (2026-11-24): one term each, RFC 7208 §4.6.4 address caps |
 | M3 | DMARC organisational domain was "last two labels" | Fixed (parent-domain walk) |
 | M4 | DMARC `sp=` never applied | Fixed |
-| M5 | Relaxed alignment is a suffix test | Open (§2.4.3) |
+| M5 | Relaxed alignment is a suffix test | Fixed (2026-11-24): organizational domains from a vendored PSL |
 | M6 | DMARC failed open on DNS errors; `quarantine` a no-op | Fixed; `quarantine` delivered normally by decision |
-| M7 | No `Authentication-Results:` | Open (§2.4.4) |
+| M7 | No `Authentication-Results:` | Fixed (2026-11-24); forged ones claiming our authserv-id are removed |
 | M8 | HELO/MAIL FROM text copied into trace headers | Fixed |
 | M9 | Catch-all copies collapse | Fixed (2026-11-23): one file per envelope address |
 | M10 | State-machine sequencing | Partly fixed (EHLO now resets the transaction); pre-EHLO `503` and long AUTH PLAIN open (§2.4.5) |
@@ -79,14 +79,14 @@ the section given.
 | N6 | A DMARC test used live DNS | Fixed (mock DoT resolver; since 2026-11-23 no test uses live DNS except one `#[ignore]`d DKIM test) |
 | N7 | Documentation accuracy | Fixed |
 | N8 | Bare CR hid a header from the `From:` scanner | Fixed (`550 5.6.0`) |
-| N9 | Display-name spoofing | Open (§2.4.4) |
+| N9 | Display-name spoofing | Mitigated (2026-11-24): `X-Display-Name-Warning:` when a display name names another organization (tag, by decision); lookalikes open (§2.4.4) |
 | N10 | No storage quotas | Fixed (2026-11-24): per-mailbox quotas (authority file, server default) and a free-disk floor; per-domain totals and queued mail open (§2.4.1) |
 | N11 | DKIM gave no result when `mailparse` rejected the message | Fixed (raw view) |
 | N12 | SPF macro expander lenient on malformed input | Fixed (malformed macros are PermError) |
 | N13 | A deadline threw away a warm DNS connection | Fixed (pipelining) |
 | N14 | Shell metacharacters allowed in maildir directory names | Open, operational: never pass maildir paths through a shell |
 | N15 | Several message copies held at once | Open (§2.4.5) |
-| N16 | No SPF alignment for bounces | Open (§2.4.3) |
+| N16 | No SPF alignment for bounces | Fixed (2026-11-24): the HELO identity aligns for the null sender |
 | N17 | SPF deadline and connection cap interact | Fixed: the cap no longer interrupts processing (see M11) |
 | N18 | Documentation overstated status | Fixed |
 | N19 | IPv4-mapped peers broke SPF on an IPv6 listener | Fixed |
@@ -117,9 +117,9 @@ the section given.
 | L3 | Catch-all copies collapse | Fixed (= M9) |
 | L4 | Per-IP limits not aggregated per IPv6 /64 | Open (§6, IPv6 readiness) |
 | L5 | Per-IP count leaks on panic | Open (= M12) |
-| L6 | No `Authentication-Results:` | Open (= M7) |
+| L6 | No `Authentication-Results:` | Fixed (= M7) |
 | L7 | RCPT success cache outlives a revocation for the session | Accepted (bounded by the 5-minute cap) |
-| L8 | No SPF alignment for the null sender | Open (= N16) |
+| L8 | No SPF alignment for the null sender | Fixed (= N16) |
 | L9 | EHLO doesn't reset the envelope; pre-EHLO `500` | EHLO reset fixed (2026-11-24); pre-EHLO `500` open (= M10) |
 
 ### DEPLOYMENT.md (D1–D7, in git history)

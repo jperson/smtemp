@@ -33,7 +33,7 @@ complete.
 | Operability (logging, sizing, shutdown, privileges, paths) | ⚠️ **Configuration needed** in Phases B, C and E. |
 | Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** Per-mailbox quotas and a free-disk floor bound disk use; address probing is limited per connection and per source IP. |
 | Legitimate mail wrongly rejected | ⚠️ **Pilot only.** Some legitimate mail can get a permanent `550` (§2). Acceptable while the logs are reviewed daily (G2). |
-| Spoofing that reaches users (display names, no `Authentication-Results:`) | ⚠️ **Pilot only.** |
+| Spoofing that reaches users (display names) | ⚠️ **Pilot only.** Delivered mail carries our `Authentication-Results:` (forged ones removed) and an `X-Display-Name-Warning:` for display names naming another organization, but mail clients don't show that header. |
 
 **Go-live blockers** (all must be done before port 25 is opened):
 - the release is built from a recorded commit (A1–A3);
@@ -54,8 +54,8 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 | The static authority (no `authority` file) accepts every local-part | Any address at a hosted domain receives mail | C1, C2: always set `authority`, `reject` mode | Configuration |
 | Quotas are soft (one message over) and cap each mailbox, not a domain's total | A sender can fill one mailbox to its quota, and many mailboxes together can fill the disk until the free-disk floor defers mail | C1/C2 quotas sized for B3; G1 alerts | PLAN §2.4.1 |
 | Refused-recipient budget per IP address only (no IPv6 /64 aggregation); a large provider's shared IP can hit it | Slow probing from many addresses; legitimate mail from a busy shared IP deferred for up to 15 minutes | B4 IPv4-only; G1 alerts on both log lines | PLAN §2.4.2 |
-| SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.3 |
-| No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.4 |
+| Malformed SPF records are PermError, as RFC 7208 requires; the Public Suffix List is a snapshot | Mail from a domain with a broken record gets a permanent `550`; a suffix newer than the snapshot is unknown | G2 daily review of permanent rejections; H7 refresh | PLAN §2.4.3 |
+| Display-name warnings are a header that mail clients don't show | Users can still be misled by display names | Tell pilot users to check the sender address; the console should surface the warning | PLAN §2.4.4 |
 | Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.5 |
 | Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.5 |
 | Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.5 |
@@ -430,8 +430,10 @@ Run the authority-dependent tests against a test domain listed in
   Delivery is idempotent per recipient, so re-queuing an already-delivered
   message doesn't duplicate it, unless the user has since moved it from
   `new/` to `cur/`.
-- [ ] **H3. Runbook: disk full.** Spool writes fail, so senders get `451`
-  and retry; nothing that was already accepted is lost. Deliveries of
+- [ ] **H3. Runbook: disk full.** Below `min-free-disk-bytes`, new mail gets
+  `452 4.3.1` (log: `storage low; deferring new mail`) and senders retry;
+  if the disk fills anyway, spool writes fail with `451`. Nothing that was
+  already accepted is lost. Deliveries of
   accepted mail fail, and are retried with backoff (1 min doubling to
   1 h) for 5 days, so nothing is dead-lettered unless the outage lasts
   that long. To recover:
@@ -461,6 +463,11 @@ Run the authority-dependent tests against a test domain listed in
   reloaded` in the log. If the log shows `authority reload failed`,
   **the previous policy is still in force**, including any address you
   meant to expire. Fix the file immediately.
+- [ ] **H7. Runbook: refresh the Public Suffix List** (each release, or
+  monthly). Replace `dmarc/data/public_suffix_list.dat` with the current
+  list from <https://publicsuffix.org/list/public_suffix_list.dat>, run
+  the test suite, and release. **Check:** the startup log line `public
+  suffix list loaded` shows the new `version`.
 
 ### Enabling submission
 

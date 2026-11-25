@@ -302,6 +302,213 @@ pub(crate) fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     ))
 }
 
+/// The header names a forged copy of which is removed from incoming mail:
+/// our own verdict headers (see [`strip_forged_verdicts`]).
+const OUR_VERDICT_HEADERS: [&[u8]; 2] = [b"authentication-results", b"x-display-name-warning"];
+
+/// Remove from the header block of `raw` the verdict headers a sender
+/// could forge to look like ours: any `Authentication-Results:` whose
+/// authserv-id is `authserv_id` (RFC 8601 §5: an MTA removes those before
+/// adding its own), and any `X-Display-Name-Warning:` (only this server
+/// adds that). Other headers, the body and line endings are kept
+/// byte-for-byte.
+///
+/// Returns the message without those fields (a copy of `raw` when there
+/// were none).
+pub(crate) fn strip_forged_verdicts(raw: &[u8], authserv_id: &str) -> Vec<u8> {
+    let end = header_block_end(raw);
+    let mut out = Vec::with_capacity(raw.len());
+    // Each header field is its first line plus any continuation lines
+    // (starting with a space or tab); `dropping` says whether the current
+    // field is being removed.
+    let mut dropping = false;
+    let mut i = 0;
+    while i < end {
+        let line_end = raw[i..end]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(end, |p| i + p + 1);
+        let line = &raw[i..line_end];
+        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
+            dropping = is_forged_verdict(raw, i, end, authserv_id);
+        }
+        if !dropping {
+            out.extend_from_slice(line);
+        }
+        i = line_end;
+    }
+    out.extend_from_slice(&raw[end..]);
+    out
+}
+
+/// Whether the header field starting at `start` (in the header block
+/// ending at `end` of `raw`) is one of [`OUR_VERDICT_HEADERS`] that
+/// [`strip_forged_verdicts`] removes.
+fn is_forged_verdict(raw: &[u8], start: usize, end: usize, authserv_id: &str) -> bool {
+    let line = &raw[start..end];
+    let first_line = line.split(|&b| b == b'\n').next().unwrap_or_default();
+    let Some(colon) = first_line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let name = trim_header_fws(&line[..colon]).to_ascii_lowercase();
+    if !OUR_VERDICT_HEADERS.contains(&name.as_slice()) {
+        return false;
+    }
+    if name.as_slice() == b"x-display-name-warning" {
+        return true;
+    }
+    // The unfolded value: the rest of this line and its continuations.
+    let mut value = Vec::new();
+    for (n, l) in split_header_lines(&line[colon + 1..])
+        .into_iter()
+        .enumerate()
+    {
+        if n > 0 && !l.starts_with(b" ") && !l.starts_with(b"\t") {
+            break;
+        }
+        value.push(b' ');
+        value.extend_from_slice(l);
+    }
+    auth_results_id(&value).is_some_and(|id| {
+        id.trim_end_matches('.')
+            .eq_ignore_ascii_case(authserv_id.trim_end_matches('.'))
+    })
+}
+
+/// Returns the authserv-id of an `Authentication-Results:` value (RFC 8601
+/// §2.2): its first token, after any comments, up to whitespace or `;`.
+/// `None` for an empty value.
+fn auth_results_id(value: &[u8]) -> Option<String> {
+    let mut depth = 0usize;
+    let mut token = Vec::new();
+    for &b in value {
+        match b {
+            b'(' => depth += 1,
+            b')' if depth > 0 => depth -= 1,
+            _ if depth > 0 => {}
+            b' ' | b'\t' | b'\r' | b'\n' if token.is_empty() => {}
+            b' ' | b'\t' | b'\r' | b'\n' | b';' => break,
+            _ => token.push(b),
+        }
+        if depth == 0 && b == b';' {
+            break;
+        }
+    }
+    (!token.is_empty()).then(|| String::from_utf8_lossy(&token).into_owned())
+}
+
+/// Returns the domains that the From value `from_value` names in display
+/// names or comments but that belong to none of its `authors` (from
+/// [`from_authors`]), compared by organizational domain: what a reader
+/// could take for the sender when it isn't, as in `"ceo@victim.example"
+/// <x@attacker.example>`. Sorted and deduplicated.
+///
+/// RFC 2047 encoded-words (`=?utf-8?B?...?=`) are decoded first, since
+/// mail clients display them decoded. An address in a different
+/// organization is common in legitimate list mail too (`"alice@example.com
+/// via Team" <team@lists.example>`), so this is a warning, not a refusal.
+pub(crate) fn display_name_claims(from_value: &[u8], authors: &[(String, String)]) -> Vec<String> {
+    let org = |d: &str| dmarc::psl::organizational_domain(d).unwrap_or_else(|| d.to_string());
+    let author_orgs: Vec<String> = authors.iter().map(|(_, d)| org(d)).collect();
+    let mut claims: Vec<String> = address_domains(&decode_encoded_words(from_value))
+        .into_iter()
+        .filter(|d| !author_orgs.contains(&org(d)))
+        .collect();
+    claims.sort();
+    claims.dedup();
+    claims
+}
+
+/// Returns the domain of every `local@domain` in `text` (lowercased, a
+/// trailing dot removed): an `@` with a non-space character before it and
+/// a domain of letters, digits, `-` and `.` (with at least one dot) after.
+fn address_domains(text: &[u8]) -> Vec<String> {
+    let mut domains = Vec::new();
+    for (at, _) in text.iter().enumerate().filter(|(_, &b)| b == b'@') {
+        let before_ok = at > 0 && !text[at - 1].is_ascii_whitespace() && text[at - 1] != b'<';
+        let domain: Vec<u8> = text[at + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+            .copied()
+            .collect();
+        let domain = String::from_utf8_lossy(&domain)
+            .trim_matches('.')
+            .to_ascii_lowercase();
+        if before_ok && domain.contains('.') {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+/// Decode the RFC 2047 encoded-words in `value` (`=?charset?B|Q?text?=`)
+/// to their raw bytes, whatever the charset (only ASCII is looked at
+/// afterwards, and every common charset is an ASCII superset). Anything
+/// that isn't a well-formed encoded-word is kept as it is.
+fn decode_encoded_words(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut i = 0;
+    while i < value.len() {
+        if value[i..].starts_with(b"=?") {
+            if let Some((decoded, used)) = decode_one_word(&value[i..]) {
+                out.extend_from_slice(&decoded);
+                i += used;
+                continue;
+            }
+        }
+        out.push(value[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode the encoded-word at the start of `word`.
+///
+/// Returns the decoded bytes and the length of the encoded-word, or
+/// `None` when it isn't one.
+fn decode_one_word(word: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // =?charset?enc?text?=
+    let rest = &word[2..];
+    let q1 = rest.iter().position(|&b| b == b'?')?;
+    let enc = *rest.get(q1 + 1)?;
+    if rest.get(q1 + 2) != Some(&b'?') {
+        return None;
+    }
+    let text_start = q1 + 3;
+    let text_len = rest[text_start..].windows(2).position(|w| w == b"?=")?;
+    let text = &rest[text_start..text_start + text_len];
+    let used = 2 + text_start + text_len + 2;
+    let decoded = match enc.to_ascii_uppercase() {
+        b'B' => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .ok()?
+        }
+        b'Q' => {
+            let mut bytes = Vec::with_capacity(text.len());
+            let mut j = 0;
+            while j < text.len() {
+                match text[j] {
+                    b'_' => bytes.push(b' '),
+                    // `=XX`: a malformed escape makes the whole word not
+                    // an encoded-word, kept as it is.
+                    b'=' => {
+                        let hex = std::str::from_utf8(text.get(j + 1..j + 3)?).ok()?;
+                        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+                        j += 2;
+                    }
+                    b => bytes.push(b),
+                }
+                j += 1;
+            }
+            bytes
+        }
+        _ => return None,
+    };
+    Some((decoded, used))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +641,75 @@ mod tests {
         ] {
             assert!(!header_has_bare_cr(ok), "{:?}", String::from_utf8_lossy(ok));
         }
+    }
+    /// Forged verdict headers are removed: an `Authentication-Results:`
+    /// claiming our authserv-id (case-insensitively, after a comment,
+    /// folded over lines), and any `X-Display-Name-Warning:`. Results from
+    /// other servers, `ARC-Authentication-Results:`, the body and the line
+    /// endings are kept exactly.
+    #[test]
+    fn forged_verdicts_are_stripped() {
+        let raw = b"Received: from x\r\n\
+Authentication-Results: MX.Example.ORG;\r\n\tspf=pass smtp.mailfrom=victim.example\r\n\
+Authentication-Results: other.example; dkim=pass\r\n\
+Authentication-Results: (forged) mx.example.org.; dmarc=pass\n\
+ARC-Authentication-Results: i=1; mx.example.org; spf=pass\r\n\
+X-Display-Name-Warning: none here\r\n\
+Subject: hi\r\n\
+\r\n\
+Authentication-Results: mx.example.org; body text stays\r\n";
+        let out = strip_forged_verdicts(raw, "mx.example.org");
+        let expected = b"Received: from x\r\n\
+Authentication-Results: other.example; dkim=pass\r\n\
+ARC-Authentication-Results: i=1; mx.example.org; spf=pass\r\n\
+Subject: hi\r\n\
+\r\n\
+Authentication-Results: mx.example.org; body text stays\r\n";
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(expected)
+        );
+        let clean = b"Subject: hi\r\n\r\nbody\r\n";
+        assert_eq!(strip_forged_verdicts(clean, "mx.example.org"), clean);
+    }
+
+    /// A display name (or comment) naming an address in another
+    /// organization is reported, including when hidden in an RFC 2047
+    /// encoded-word; the same organization, or no address at all, isn't.
+    #[test]
+    fn display_name_claims_find_other_organizations() {
+        let claims = |value: &str| {
+            let authors = from_authors(value.as_bytes()).unwrap();
+            display_name_claims(value.as_bytes(), &authors)
+        };
+        assert_eq!(
+            claims("\"ceo@victim.example\" <x@attacker.example>"),
+            ["victim.example"]
+        );
+        assert_eq!(
+            claims("x@attacker.example (CEO <ceo@victim.example>)"),
+            ["victim.example"]
+        );
+        // Encoded-words, as a mail client would display them.
+        assert_eq!(
+            claims("=?utf-8?B?Y2VvQHZpY3RpbS5leGFtcGxl?= <x@attacker.example>"),
+            ["victim.example"]
+        );
+        assert_eq!(
+            claims("=?iso-8859-1?Q?ceo=40victim=2Eexample?= <x@attacker.example>"),
+            ["victim.example"]
+        );
+        // List software: tagged, not refused.
+        assert_eq!(
+            claims("\"'alice@example.com' via Team\" <team@googlegroups.com>"),
+            ["example.com"]
+        );
+        // Same organization, a plain name, or no display name: nothing.
+        assert!(claims("\"bob@mail.example.com\" <bob@example.com>").is_empty());
+        assert!(claims("Bob Smith <bob@example.com>").is_empty());
+        assert!(claims("bob@example.com").is_empty());
+        assert!(claims("Alice <a@one.example>, \"b@two.example\" <b@two.example>").is_empty());
+        // Malformed encoded-words are left alone, not misdecoded.
+        assert!(claims("=?utf-8?Q?bad=ZZ?= <x@attacker.example>").is_empty());
     }
 }

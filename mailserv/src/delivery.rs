@@ -325,8 +325,11 @@ fn rfc5322_date(ts: jiff::Timestamp) -> String {
 /// `Return-Path:` (the envelope sender in `<>`, `<>` for the null
 /// sender), then a `Received:` header (from the HELO and peer IP, by
 /// `meta.server_domain`, with `ESMTP`, plus `S` for TLS and `A` for an
-/// authenticated submission per RFC 3848, and the queue ID), then `raw`
-/// verbatim. There is no `for` clause (RFC 5321 §4.4 makes it optional):
+/// authenticated submission per RFC 3848, and the queue ID), then this
+/// server's `Authentication-Results:` (see [`authentication_results`]),
+/// then an `X-Display-Name-Warning:` when `meta.display_name_claims` isn't
+/// empty, then `raw` verbatim (the caller has removed forged copies of
+/// those two headers). There is no `for` clause (RFC 5321 §4.4 makes it optional):
 /// one message shared by all recipients can't name one without disclosing
 /// it to the others. An unparseable `meta.received_at` is dated at the
 /// Unix epoch.
@@ -375,8 +378,101 @@ pub fn with_trace_headers(meta: &SpoolMeta, raw: &[u8]) -> Vec<u8> {
         )
         .as_bytes(),
     );
+    out.extend_from_slice(authentication_results(meta).as_bytes());
+    if !meta.display_name_claims.is_empty() {
+        let claims: Vec<String> = meta
+            .display_name_claims
+            .iter()
+            .map(|d| header_token(d))
+            .collect();
+        out.extend_from_slice(
+            format!(
+                "X-Display-Name-Warning: the From display name names {}, which is not the sender\r\n",
+                claims.join(", ")
+            )
+            .as_bytes(),
+        );
+    }
     out.extend_from_slice(raw);
     out
+}
+
+/// Returns this server's `Authentication-Results:` header (RFC 8601) for
+/// the message described by `meta`, with `meta.server_domain` as the
+/// authserv-id and one result per method:
+///
+/// - `auth=pass smtp.auth=<login>` for an authenticated submission;
+/// - `spf=<result>` with `smtp.mailfrom=<domain>`, or `smtp.helo=<name>`
+///   for the null sender (whose SPF identity is the HELO name); omitted
+///   when SPF wasn't evaluated (authenticated submissions);
+/// - one `dkim=pass|fail header.d=<d> header.s=<s>` per evaluated
+///   signature, or `dkim=none`;
+/// - `dmarc=pass|fail header.from=<domain>`, or `dmarc=none` when the
+///   From domain publishes no policy.
+///
+/// Every value is reduced to header-safe characters ([`header_token`]),
+/// since signature tags and names come from the sender.
+pub fn authentication_results(meta: &SpoolMeta) -> String {
+    let mut results: Vec<String> = Vec::new();
+    if let Some(user) = &meta.authenticated {
+        results.push(format!("auth=pass smtp.auth={}", header_token(user)));
+    }
+    if let Some(spf) = &meta.spf_result {
+        let result = spf.to_ascii_lowercase();
+        let identity = match meta.mail_from.as_deref() {
+            Some(addr) if !addr.is_empty() => addr
+                .rsplit_once('@')
+                .map(|(_, d)| format!("smtp.mailfrom={}", header_token(d))),
+            _ => meta
+                .helo
+                .as_deref()
+                .map(|h| format!("smtp.helo={}", header_token(h))),
+        };
+        results.push(match identity {
+            Some(identity) => format!("spf={} {identity}", header_token(&result)),
+            None => format!("spf={}", header_token(&result)),
+        });
+    }
+    if meta.dkim.is_empty() {
+        results.push("dkim=none".to_string());
+    }
+    for dkim in &meta.dkim {
+        results.push(format!(
+            "dkim={} header.d={} header.s={}",
+            if dkim.verified { "pass" } else { "fail" },
+            header_token(&dkim.domain),
+            header_token(&dkim.selector),
+        ));
+    }
+    results.push(match &meta.dmarc {
+        Some(dmarc) => format!(
+            "dmarc={} header.from={}",
+            if dmarc.pass { "pass" } else { "fail" },
+            header_token(&dmarc.from_domain)
+        ),
+        None => "dmarc=none".to_string(),
+    });
+    format!(
+        "Authentication-Results: {};\r\n\t{}\r\n",
+        header_token(&meta.server_domain),
+        results.join(";\r\n\t")
+    )
+}
+
+/// Returns `value` with every character outside letters, digits and
+/// `.-_+@` replaced by `_`, so a sender-chosen value (a DKIM selector, a
+/// HELO name) can't break or extend a header.
+fn header_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '@') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// What one drain pass did, for logging.
@@ -594,6 +690,7 @@ mod tests {
             tls_active: false,
             message_size: 0,
             encryption: None,
+            display_name_claims: Vec::new(),
         }
     }
 
@@ -634,6 +731,89 @@ mod tests {
             let text = String::from_utf8(with_trace_headers(&m, &raw)).unwrap();
             assert!(text.contains(token), "{token}: {text}");
         }
+    }
+
+    /// Authentication-Results names our authserv-id and each method's
+    /// result: SPF with the MAIL FROM domain (the HELO name for a bounce),
+    /// every DKIM signature, DMARC with the From domain, AUTH for a
+    /// submission; sender-chosen values are reduced to safe characters.
+    #[test]
+    fn authentication_results_reports_each_method() {
+        use crate::verdict::{DkimSummary, DmarcSummary};
+        let mut meta = sample_meta();
+        meta.dkim = vec![
+            DkimSummary {
+                domain: "example.test".into(),
+                selector: "s1".into(),
+                body_hash_ok: true,
+                signature_ok: true,
+                verified: true,
+                error: None,
+            },
+            DkimSummary {
+                domain: "evil.example".into(),
+                selector: "x;dmarc=pass\r\nX-Injected: 1".into(),
+                body_hash_ok: false,
+                signature_ok: false,
+                verified: false,
+                error: Some("bad".into()),
+            },
+        ];
+        meta.dmarc = Some(DmarcSummary {
+            from_domain: "example.test".into(),
+            policy: "Reject".into(),
+            spf_aligned: true,
+            dkim_aligned: true,
+            pass: true,
+            action: "Pass".into(),
+        });
+        assert_eq!(
+            authentication_results(&meta),
+            "Authentication-Results: mail.test;\r\n\
+             \tspf=pass smtp.mailfrom=example.test;\r\n\
+             \tdkim=pass header.d=example.test header.s=s1;\r\n\
+             \tdkim=fail header.d=evil.example header.s=x_dmarc_pass__X-Injected__1;\r\n\
+             \tdmarc=pass header.from=example.test\r\n"
+        );
+
+        // A bounce: SPF's identity is the HELO name; no signatures, no policy.
+        let mut bounce = sample_meta();
+        bounce.mail_from = Some(String::new());
+        bounce.spf_result = Some("SoftFail".into());
+        assert_eq!(
+            authentication_results(&bounce),
+            "Authentication-Results: mail.test;\r\n\
+             \tspf=softfail smtp.helo=client.test;\r\n\tdkim=none;\r\n\tdmarc=none\r\n"
+        );
+
+        // A submission: AUTH, no SPF.
+        let mut submitted = sample_meta();
+        submitted.authenticated = Some("alice".into());
+        submitted.spf_result = None;
+        assert!(authentication_results(&submitted).starts_with(
+            "Authentication-Results: mail.test;\r\n\tauth=pass smtp.auth=alice;\r\n\tdkim=none"
+        ));
+    }
+
+    /// The message gets our Authentication-Results after the Received
+    /// header, and a display-name warning only when there are claims.
+    #[test]
+    fn trace_headers_carry_the_verdicts() {
+        let mut meta = sample_meta();
+        let text =
+            String::from_utf8(with_trace_headers(&meta, b"Subject: x\r\n\r\nbody\r\n")).unwrap();
+        assert!(
+            text.contains("\r\nAuthentication-Results: mail.test;\r\n\tspf=pass"),
+            "{text}"
+        );
+        assert!(!text.contains("X-Display-Name-Warning"));
+
+        meta.display_name_claims = vec!["victim.example".into()];
+        let text =
+            String::from_utf8(with_trace_headers(&meta, b"Subject: x\r\n\r\nbody\r\n")).unwrap();
+        assert!(text.contains(
+            "X-Display-Name-Warning: the From display name names victim.example, which is not the sender\r\nSubject: x"
+        ), "{text}");
     }
 
     /// Defence in depth: a stored HELO containing a bare CR can't inject a

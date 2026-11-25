@@ -29,7 +29,7 @@ complete.
 | Protocol safety (smuggling, framing, path traversal, header-parser crashes) | ✅ Good. Covered by tests that reproduce each attack. |
 | Spoofing that bypasses policy (SPF/DKIM/DMARC) | ✅ Good for a pilot. DMARC fails closed on lookup errors and finds policies at parent domains; bare-CR headers are refused; the SPF parser never weakens a `-all` record; DKIM enforces RFC 8301 key sizes, whole-body `l=` and `From` in `h=`. |
 | DNS robustness | ✅ Good. Pipelined DoT connections, per-IP DNS limit, deadlines for SPF and end-of-data checks. |
-| Durability (spool before `250`, idempotent delivery, retry, dead-letter) | ✅ Adequate for a pilot. Failed deliveries are retried for 5 days; crash debris is swept. Duplicates on a timeout remain possible (§2). |
+| Durability (spool before `250`, idempotent delivery, retry, dead-letter) | ✅ Adequate for a pilot. Failed deliveries are retried for 5 days; crash debris is swept. The connection time limit never cuts a message off between its spool write and its `250`. |
 | Operability (logging, sizing, shutdown, privileges, paths) | ⚠️ **Configuration needed** in Phases B, C and E. |
 | Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** No quotas; unlimited address probing per session. Configuration and monitoring narrow both; only code closes them. |
 | Legitimate mail wrongly rejected | ⚠️ **Pilot only.** Some legitimate mail can get a permanent `550` (§2). Acceptable while the logs are reviewed daily (G2). |
@@ -54,12 +54,11 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 | The static authority (no `authority` file) accepts every local-part | Any address at a hosted domain receives mail | C1, C2: always set `authority`, `reject` mode | Configuration |
 | No storage quotas or free-disk check | A sender can fill the disk | B3 dedicated filesystem, G1 alerts, C2 `reject` mode, no `catch-all` | PLAN §2.4.1 |
 | Unlimited refused RCPTs per session | Probing which addresses exist | G1 `recipient refused` alert; firewall abusive sources | PLAN §2.4.2 |
-| The connection cap can fire after the spool commit, before the `250` | The sender retries and the message is delivered twice | C1 `max-conn-duration-ms = 300000`; G1 duration alert; restart in quiet periods (H4) | PLAN §2.4.3 |
-| SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.4 |
-| No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.5 |
-| Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.6 |
-| Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.6 |
-| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.6 |
+| SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.3 |
+| No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.4 |
+| Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.5 |
+| Per-IP connection count released by hand | A panicking session leaks one slot of its IP's budget | E1 `Restart=always` | PLAN §2.4.5 |
+| Peak memory is about 2× `max-data-bytes` per session during DATA, up to 6× at end of data | Memory exhaustion | B2 sizing, E1 `MemoryMax` | PLAN §2.4.5 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits are per address | IPv6 senders can fail SPF or escape limits | B4: IPv4-only MX | PLAN §6 |
 | No TLS certificate reload | A restart is needed to pick up a renewed certificate | D3 renewal hook | PLAN §6 |
 | Local-parts may contain shell metacharacters (`$`, `` ` ``, `|`, `&` are valid in addresses) | Operator scripts could misbehave on maildir paths | Never pass maildir paths through a shell unquoted | — |
@@ -75,8 +74,7 @@ did each one and when in §4.
 
 - [ ] **A1. Run the CI gate:** `cargo fmt --all -- --check && cargo clippy
   --workspace --all-targets -- -D warnings && cargo test --workspace`.
-  **Check:** all green. The `mailserv` integration tests need outbound
-  DoT to 1.1.1.1 (README "Network caveat").
+  **Check:** all green. The tests need no network beyond loopback.
 - [ ] **A2. Audit dependencies:** `cargo install cargo-audit && cargo
   audit --deny warnings` on the release commit (CI also runs it on every
   push and weekly). **Check:** clean. Accepted advisories are listed with
@@ -238,6 +236,8 @@ did each one and when in §4.
   User=mailserv
   Group=mailserv
   ExecStart=/usr/local/bin/mailserv --config /etc/mailserv/mailserv.toml
+  # `systemctl reload` re-reads the AUTH credentials file (submission only).
+  ExecReload=/bin/kill -HUP $MAINPID
   WorkingDirectory=/var/lib/mailserv
   Environment=RUST_LOG=info
   # Port 25 without root. (mailserv can also drop privileges itself:
@@ -374,7 +374,7 @@ Run the authority-dependent tests against a test domain listed in
   | `shutdown grace period over; closing the remaining sessions` | log | any (sessions were cut; raise `shutdown-grace-ms`) |
   | `end-of-data DNS checks exceeded their time limit; temporary failure` (and `spf evaluation exceeded its time limit; temperror`) | log | > 5 in 10 min (slow resolver or hostile records) |
   | `connection refused: server at capacity` | log | any sustained (capacity or attack) |
-  | `connection exceeded the duration limit` | log | > 1% of sessions (each can mean a duplicate delivery) |
+  | `connection stuck past its duration limit; dropped` | log | any (a session stuck 2 min past `max-conn-duration-ms`, in a handshake or a write) |
   | `connection handler failed` / `drain task panicked` / `spool task panicked` | log | any |
   | Service liveness | `systemctl is-active mailserv`, external TCP check on 25 | down for 1 min |
   | Certificate expiry | `openssl s_client … \| openssl x509 -noout -enddate` | < 14 days |
@@ -388,7 +388,7 @@ Run the authority-dependent tests against a test domain listed in
   For each rejection, decide whether it was legitimate mail hit by one of
   the §2 rejection causes (the SPF budget, suffix-based alignment, bounce
   alignment, or a sender's malformed SPF record), and keep a tally. Any
-  legitimate rejection is a reason to prioritise that fix (PLAN §2.4.4).
+  legitimate rejection is a reason to prioritise that fix (PLAN §2.4.3).
 
 ### Phase H — Backups and runbooks
 
@@ -454,15 +454,22 @@ Run the authority-dependent tests against a test domain listed in
 
 Not part of the pilot. When it is wanted:
 - Make the credentials file: `mailserv hash-password` per login, one
-  `user:hash` line each, `root:root 0600`. Set `auth-users-file` and
-  `auth-senders` (a login without grants can't send).
+  `user:hash` line each, owned `root:mailserv` with mode `0640` (the
+  service user must read it for reloads; startup warns otherwise). Set
+  `auth-users-file` and `auth-senders` (a login without grants can't
+  send).
 - Set `submission-port = 587` and/or `submissions-port = 465`. Both need
   `tls-cert`/`tls-key`; the startup check refuses them otherwise. AUTH is
   never offered on port 25.
 - Open `587/tcp` and/or `465/tcp` in B5. The systemd unit's
   `CAP_NET_BIND_SERVICE` already covers them.
-- Revoking a login means editing the file and restarting (no reload yet:
-  PLAN §2.3).
+- To add, change or revoke a login: edit the file (write a temporary file
+  and `mv` it into place), run `systemctl reload mailserv`, and confirm
+  `credentials reloaded` with the expected `added`/`removed` in the log. On
+  `credentials reload failed` the previous logins are still in force: fix
+  the file and reload again. A revoked login can't authenticate or send,
+  even on a session that is already open. Changing `auth-senders` grants
+  still needs a restart.
 - **Check:** `openssl s_client -connect mx1.<domain>:465 -quiet` then
   `EHLO x` lists `AUTH PLAIN LOGIN`; on port 25 after STARTTLS it
   doesn't, and `AUTH PLAIN` gets `502`; on 587, `MAIL FROM` before AUTH

@@ -43,8 +43,7 @@ Design goals, in order:
 ## 2. Workspace layout
 
 ```
-mailserv/     the binary: policy (UserSession), authority, auth grants,
-              spool, delivery, limits, privilege drop, TLS, driver
+mailserv/     the binary (modules below)
 smtp/         wire protocol: state machine, framing, DATA transparency
 spf/          RFC 7208 evaluation over an abstract resolver (SpfResolver)
 dmarc/        RFC 7489 records, policy discovery, alignment, policy
@@ -67,6 +66,27 @@ dmarc    → spf      (the SpfResolver trait only)
 The `smtp` crate depends on nothing but `anyhow`, `tokio` and `base64`, so
 it can't see policy internals.
 
+Inside `mailserv`:
+
+```
+main.rs        entry point: arguments, logging, then config::load and server::run
+config.rs      CLI flags, the TOML file, their merge (resolve_config), startup checks
+server.rs      startup, listeners, privilege drop, accept loop, limits, signals,
+               handle_connection (drives one session over TCP/TLS)
+session.rs     UserSession: the SmtpSession policy (HELO, AUTH, MAIL, RCPT, DATA)
+session/message.rs   end of data: header checks, DKIM, DMARC, spool, fast path
+address.rs     envelope syntax: paths, ESMTP parameters, HELO, local-part rules
+headers.rs     raw header checks: the single From:, its authors, bare CRs
+tls.rs         certificates, resolver CA, handshakes
+verdict.rs     DKIM/DMARC summaries recorded with each message
+auth.rs        credentials (argon2id), reload, sender grants
+authority.rs   recipient authority (file-backed, hot-reloaded)
+spool.rs       durable queue (SpoolWriter, SpoolQueue, DiskSpool)
+delivery.rs    trace headers, DeliverySink, MaildirSink, the drain
+limit.rs       per-IP connection, DNS and AUTH-failure limits
+privdrop.rs, fsutil.rs, hashpw.rs   privileges, file modes, `hash-password`
+```
+
 ---
 
 ## 3. Protocol versus policy
@@ -87,7 +107,7 @@ pub trait SmtpSession {
     fn starttls(&mut self) -> Control;
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) -> Control;
     fn auth_line(&mut self, line: &[u8]) -> Control;
-    // … plus the greeting, data_line_too_long, shutdown_signal
+    // … plus the greeting, data_line_too_long, shutdown_signal, deadline
 }
 ```
 
@@ -119,8 +139,8 @@ accept loop (MX port, plus submission-port and submissions-port when set;
   canonical_peer(): ::ffff:a.b.c.d → a.b.c.d
   limits: server-wide semaphore, per-IP concurrency, per-IP rate (60 s window)
     over a limit → 421, sent from a bounded pool of 32 refusal tasks
-  spawn: timeout_at(max-conn-duration) {
-    handle_connection(mode):
+  spawn: timeout_at(deadline + 120 s backstop) {
+    handle_connection(mode):        deadline = accept + max-conn-duration
       Submissions (465): TLS handshake first, then run(TLS), banner over TLS
       otherwise:
       run(plaintext)
@@ -134,6 +154,17 @@ accept loop (MX port, plus submission-port and submissions-port when set;
   release limits
 ```
 
+**Connection deadline.** `max-conn-duration-ms` is enforced by the session
+itself (`SmtpSession::deadline`), not by cancelling it: every read waits at
+most until the deadline, and when it's reached the client gets `421 4.4.2`
+and the connection closes. Handling a line and writing its reply are never
+cut short, so a message whose terminator has arrived is always processed and
+answered. That matters because the spool commit happens inside end of data:
+cancelling between the commit and the `250` would make the client send the
+message again. A slow-drip DATA transfer is still cut off at the deadline,
+before end of data, so nothing is committed. The outer `timeout_at`, 120 s
+later, only stops a task stuck in a handshake or a write.
+
 **Graceful shutdown** (SIGTERM or SIGINT):
 - the listeners close, so new connections are refused;
 - sessions are signalled through `shutdown_signal`. The read loop acts on
@@ -141,6 +172,8 @@ accept loop (MX port, plus submission-port and submissions-port when set;
   in DATA or AUTH finishes first;
 - the process exits when every session has ended, after
   `shutdown-grace-ms`, or on a second signal.
+
+**SIGHUP** reloads the credentials file (§10). It never stops the server.
 
 ### 4.1 Framing
 
@@ -189,8 +222,9 @@ accept loop (MX port, plus submission-port and submissions-port when set;
    deadline exceeded at 3 or 6       → 451 4.4.3
 7. release the DNS permit
 8. spool (durable write)             → 451 4.3.0 if it fails
-9. fast-path delivery to each recipient (failures stay queued)
-10. clear the envelope; reply 250
+9. clear the envelope; reply 250
+10. fast-path delivery to each recipient, in the background (failures
+    stay queued for the drain)
 ```
 
 How the ordering is constrained:
@@ -346,8 +380,13 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
   clause**: one payload serves every recipient, so naming one would
   disclose Bcc recipients to the others. Non-printable bytes in a stored
   HELO are replaced with `?`.
-- **Fast path.** Delivery is attempted inside end-of-data, before the
-  `250`. A failure is logged, and the message stays queued.
+- **Fast path.** After the spool commit, delivery to each recipient
+  starts in a background task and the `250` goes out at once. A failure is
+  logged and the message stays queued for the drain; when every copy is
+  delivered the message is dequeued. At most 64 fast-path deliveries run at
+  once, server-wide; past that the drain delivers. A fast path cut off by a
+  restart is harmless: the message is still queued and delivery is
+  idempotent.
 
 **Queue drain** (startup, then every 60 s, on the blocking pool;
 `delivery::drain_at`):
@@ -433,14 +472,22 @@ users produce a startup warning.
   AUTH command starts from a clean state, so an aborted LOGIN leaves
   nothing behind.
 - **Credentials.** `--auth-users-file` names a file of `user:hash` lines
-  (`#` comments allowed), read once at startup while still privileged.
+  (`#` comments allowed), read at startup while still privileged.
   - Each hash is an argon2id PHC string, made with `mailserv
     hash-password` (default cost: 19 MiB, 2 passes, 1 lane). Anything
     else, including a plaintext password, is a startup error; hashes
     below OWASP's minimum cost load with a warning.
-  - The file is refused if "other" users can read it, and a
-    group-readable file is warned about. The old inline `auth-users`
-    config key is a startup error.
+  - The file is refused if "other" users can read it. The old inline
+    `auth-users` config key is a startup error.
+  - **SIGHUP reloads it** (`AuthConfig::reload`, on the blocking pool).
+    The new logins replace the old as a whole; a file that fails any check
+    is refused and the current logins stay. A removed login can't
+    authenticate again and can't send, even on a session that
+    authenticated before the reload (each grant check requires the login
+    to still exist). Failure counts carry over. A grant for a removed login
+    is inert and logged (at startup it would be an error). The reload runs
+    as the service user, so the file must be readable by it: owner root,
+    group the service group, mode `0640`. Startup warns if it isn't.
 - **Checking a password** (`AuthConfig::check`):
   - a session gets 3 wrong passwords, then every AUTH gets `454 4.7.0`
     without a check;
@@ -459,6 +506,7 @@ users produce a startup warning.
     whole-domain grant.
   - A login without grants can authenticate but can't send. A grant for a
     login without credentials is a startup error.
+  - Grants come from `--auth-senders` and change only on restart.
 - **Exemptions.** Authenticated sessions skip SPF and are exempt from DMARC
   rejection. Both apply only after the grant checks pass, so being
   authenticated never means "may use any From".
@@ -503,7 +551,8 @@ bound only protects library callers that use it.
   - Only `--domain` is required.
 - **Privileges.** Started as root, mailserv:
   1. binds the port;
-  2. reads the TLS key, resolver CA and AUTH credentials file;
+  2. reads the TLS key, resolver CA and AUTH credentials file (a SIGHUP
+     reload later reads the credentials again, as the service user);
   3. creates missing storage directories owned by `--user`;
   4. drops supplementary groups, gid and uid, and verifies that root can't
      be regained;
@@ -515,7 +564,7 @@ bound only protects library callers that use it.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 273 tests in four layers:
+- **Testing.** 284 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
@@ -529,10 +578,11 @@ bound only protects library callers that use it.
   named for the property they check (the archived reviews in
   `docs/reviews/` record which finding each property came from).
 
-  The DMARC tests use a local mock DoT resolver. Two things touch the
-  network:
-  - the `mailserv` integration tests use the real resolver (1.1.1.1);
-  - one `#[ignore]`d test fetches a live DKIM key.
+  Every DNS-backed test uses a local mock DoT resolver on loopback
+  (`testutil::spawn_mock_resolver` in `mailserv`; the integration tests'
+  one answers NXDOMAIN, as the real DNS does for the `.test` and
+  `.example` names they use). The suite needs no network beyond loopback;
+  only one `#[ignore]`d test fetches a live DKIM key.
 
 ---
 
@@ -548,28 +598,27 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | No storage quotas (per message, mailbox or domain) and no free-disk tempfail | A sender can fill the disk. Contained only by a dedicated filesystem and alerts | §2.4.1 |
 | No session-wide limit on refused RCPTs (`RSET` resets the 100 cap) | Unlimited probing for which addresses exist; a privacy problem for disposable addresses | §2.4.2 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
-| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.6 |
+| The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.5 |
 
 ### Correctness and delivery
 
 | Gap | Impact | Plan |
 |---|---|---|
-| The connection cap can fire between the spool commit and the `250`; the fast path runs before the reply | The client retries, and the message is delivered twice | §2.4.3 |
-| No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.6 |
-| SPF budget charges MX-host and PTR-name address lookups against the 10-term limit | Large legitimate records can hit PermError → `550` | §2.4.4 |
-| Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | §2.4.4 |
-| No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | §2.4.4 |
+| No fsync of the maildir directory after the rename; crash leftovers in a maildir's `tmp/` aren't swept (the spool's are) | A crash can lose a just-delivered file (it's still in the spool unless it was dequeued); `tmp/` debris accumulates | §2.4.5 |
+| SPF budget charges MX-host and PTR-name address lookups against the 10-term limit | Large legitimate records can hit PermError → `550` | §2.4.3 |
+| Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | §2.4.3 |
+| No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | §2.4.3 |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
-| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.6 |
-| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.6 |
+| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.5 |
+| DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.5 |
 | `quarantine` is delivered as normal mail | Out of V1 scope by decision | — |
 
 ### What users are shown
 
 | Gap | Impact | Plan |
 |---|---|---|
-| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | §2.4.5 |
-| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | §2.4.5 |
+| No `Authentication-Results:` header is added, and forged inbound ones aren't stripped | Readers that trust A-R can be misled | §2.4.4 |
+| Display names aren't checked against the author domain | `From: "ceo@victim" <x@attacker>` passes | §2.4.4 |
 
 ### Storage and encryption seams
 
@@ -591,7 +640,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 
 | Gap | Impact | Plan |
 |---|---|---|
-| The credentials file is read only at startup | Revoking a login needs a restart | §2.3 |
+| `--auth-senders` grants are read only at startup | Changing what a login may send as needs a restart (revoking the login itself doesn't) | §6 |
 | Submitted mail can only go to hosted recipients | No outbound relay; not a full MSA | §6 |
 
 ### Parsing

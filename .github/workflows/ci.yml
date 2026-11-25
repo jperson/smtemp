@@ -43,8 +43,8 @@ jobs:
         with:
           toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@v2
-      # The mailserv integration tests resolve through the real 1.1.1.1
-      # over DoT; the one live-DKIM-key test is #[ignore]d.
+      # Hermetic: DNS-backed tests use local mock DoT resolvers. The one
+      # live-DKIM-key test is #[ignore]d.
       - name: cargo test
         run: cargo test --workspace
 

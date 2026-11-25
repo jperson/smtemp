@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 
 /// What the session policy decided about a command: the reply to send to
 /// the client, and whether the protocol state machine is allowed to
@@ -179,6 +179,14 @@ enum Line {
     /// `last` is the last octet read so far (used to tell a CRLF ending
     /// from a bare LF once the line is drained).
     Overflow { terminated: bool, last: Option<u8> },
+}
+
+/// Returns when a read starting now must give up: after
+/// `max_read_duration_ms`, or at the connection's `deadline` if that is
+/// sooner.
+fn read_deadline(max_read_duration_ms: u64, deadline: Option<Instant>) -> Instant {
+    let per_read = Instant::now() + Duration::from_millis(max_read_duration_ms);
+    deadline.map_or(per_read, |d| d.min(per_read))
 }
 
 /// Read one line (up to and including '\n') from `reader`, never
@@ -362,6 +370,9 @@ pub trait SmtpSession {
     /// `421` sent when the server shuts down between transactions (RFC
     /// 5321 §3.8): the client must retry later.
     const SHUTTING_DOWN: &'static [u8] = b"421 4.3.2 Service shutting down, try again later\r\n";
+    /// `421` sent when the connection reaches its [`SmtpSession::deadline`]
+    /// while waiting for the client.
+    const TIME_LIMIT: &'static [u8] = b"421 4.4.2 Connection time limit reached, closing\r\n";
 
     /// Command lines are capped at 512 octets including CRLF (RFC 5321
     /// Section 4.5.3.1.4). An over-long command is answered with
@@ -465,6 +476,20 @@ pub trait SmtpSession {
         std::future::pending()
     }
 
+    /// When the whole connection must end, or `None` (the default) for no
+    /// limit.
+    ///
+    /// The deadline bounds **reads** only: each read waits at most until
+    /// the deadline (as well as at most `max_read_duration_ms`), and when
+    /// it is reached the session gets [`SmtpSession::TIME_LIMIT`] and
+    /// ends. Handling a line and writing its reply are never cut short,
+    /// so a message whose terminator has arrived is always processed and
+    /// answered: a server that stores mail before replying never stores a
+    /// message whose client then saw no reply (and would send again).
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
+
     /// Serve one connection over `stream`: read bounded lines, run them
     /// through `handler`, write replies, until QUIT, EOF, an error, a
     /// read timeout, a graceful shutdown, or a STARTTLS pause.
@@ -523,8 +548,8 @@ pub trait SmtpSession {
                     Self::MAX_CMD_LINE
                 };
 
-                let read = timeout(
-                    Duration::from_millis(*max_read_duration_ms),
+                let read = timeout_at(
+                    read_deadline(*max_read_duration_ms, self.deadline()),
                     read_line_capped(stream, cap),
                 );
                 // Between transactions, a graceful shutdown ends the session
@@ -550,7 +575,13 @@ pub trait SmtpSession {
                     // unterminated line is still delivered.
                     Ok(Ok(line)) if line.is_complete_and_empty() => return Ok(EndReason::Closed),
                     Ok(Ok(line)) => line,
-                    // Read error or timeout: the session ends silently.
+                    // The connection's deadline: say so, then close.
+                    Err(_) if self.deadline().is_some_and(|d| Instant::now() >= d) => {
+                        let _ = stream.write_all(Self::TIME_LIMIT).await;
+                        return Ok(EndReason::Closed);
+                    }
+                    // Read error or per-read timeout: the session ends
+                    // silently.
                     _ => return Ok(EndReason::Closed),
                 };
 
@@ -587,8 +618,8 @@ pub trait SmtpSession {
                         let drained = if terminated {
                             Ok(Ok(last == Some(b'\r')))
                         } else {
-                            timeout(
-                                Duration::from_millis(*max_read_duration_ms),
+                            timeout_at(
+                                read_deadline(*max_read_duration_ms, self.deadline()),
                                 drain_line(stream, last),
                             )
                             .await
@@ -906,6 +937,10 @@ mod tests {
         auth_pending: Option<&'static str>,
         /// Graceful-shutdown signal (None: never shuts down).
         shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+        /// Connection deadline (None: no limit).
+        deadline: Option<Instant>,
+        /// How long `end_data` takes (simulated storage and checks).
+        end_data_delay: Duration,
     }
 
     impl TestSession {
@@ -1070,6 +1105,10 @@ mod tests {
             std::future::pending::<()>().await
         }
 
+        fn deadline(&self) -> Option<Instant> {
+            self.deadline
+        }
+
         async fn helo(&mut self, ehlo: bool, arg: &str) -> Control {
             self.do_helo(ehlo, arg)
         }
@@ -1107,6 +1146,7 @@ mod tests {
         }
 
         async fn end_data(&mut self) -> Control {
+            tokio::time::sleep(self.end_data_delay).await;
             self.do_end_data()
         }
 
@@ -2451,6 +2491,107 @@ mod tests {
         assert_eq!(result.unwrap(), EndReason::Closed);
         assert_eq!(session.end_data_calls, 1, "the message was completed");
         assert_eq!(session.data_lines.len(), 2);
+    }
+
+    /// Run `session` over a duplex; returns the client side (greeting
+    /// already read) and the task.
+    fn spawn_session(
+        mut session: TestSession,
+    ) -> (
+        BufReader<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<(TestSession, Result<EndReason>)>,
+    ) {
+        let (client, server) = duplex(4096);
+        let peer: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let task = tokio::spawn(async move {
+            let mut stream = BufReader::new(server);
+            let result = session
+                .run(
+                    &mut stream,
+                    &peer,
+                    "example.org",
+                    &5000,
+                    &mut SessionState::default(),
+                )
+                .await;
+            (session, result)
+        });
+        (BufReader::new(client), task)
+    }
+
+    /// Send the HELO, MAIL, RCPT and DATA commands of a transaction over
+    /// `client`, checking each reply.
+    async fn open_transaction(client: &mut BufReader<tokio::io::DuplexStream>) {
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        for (cmd, reply) in [
+            (&b"HELO client.example\r\n"[..], "250 hello\r\n"),
+            (b"MAIL FROM:<a@b>\r\n", "250 Ok\r\n"),
+            (b"RCPT TO:<c@d>\r\n", "250 Ok\r\n"),
+            (b"DATA\r\n", "354 End data with <CR>.<CR><LF>\r\n"),
+        ] {
+            client.write_all(cmd).await.unwrap();
+            assert_eq!(read_reply(client).await, reply);
+        }
+    }
+
+    /// An idle session that reaches its deadline is told so (`421`) and
+    /// closed, even though the per-read timeout is longer.
+    #[tokio::test]
+    async fn deadline_ends_an_idle_session_with_421() {
+        let (mut client, task) = spawn_session(TestSession {
+            deadline: Some(Instant::now() + Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "421 4.4.2 Connection time limit reached, closing\r\n"
+        );
+        assert_eq!(task.await.unwrap().1.unwrap(), EndReason::Closed);
+    }
+
+    /// The deadline never cuts off a message whose terminator has
+    /// arrived: end-of-data runs past the deadline and its reply is still
+    /// sent, then the session ends. (Cutting it off after a store but
+    /// before the reply is what makes the client send it again.)
+    #[tokio::test]
+    async fn deadline_lets_end_of_data_finish_and_reply() {
+        let (mut client, task) = spawn_session(TestSession {
+            deadline: Some(Instant::now() + Duration::from_millis(300)),
+            end_data_delay: Duration::from_millis(600),
+            ..Default::default()
+        });
+        open_transaction(&mut client).await;
+        client.write_all(b"body\r\n.\r\n").await.unwrap();
+        assert_eq!(read_reply(&mut client).await, "250 accepted\r\n");
+        assert_eq!(
+            read_reply(&mut client).await,
+            "421 4.4.2 Connection time limit reached, closing\r\n"
+        );
+        let (session, result) = task.await.unwrap();
+        assert_eq!(result.unwrap(), EndReason::Closed);
+        assert_eq!(session.end_data_calls, 1);
+    }
+
+    /// A client that drips DATA past the deadline is cut off mid-transfer:
+    /// the message is never completed.
+    #[tokio::test]
+    async fn deadline_cuts_off_a_slow_transfer_before_end_of_data() {
+        let (mut client, task) = spawn_session(TestSession {
+            deadline: Some(Instant::now() + Duration::from_millis(300)),
+            ..Default::default()
+        });
+        open_transaction(&mut client).await;
+        client.write_all(b"line one\r\n").await.unwrap();
+        assert_eq!(
+            read_reply(&mut client).await,
+            "421 4.4.2 Connection time limit reached, closing\r\n"
+        );
+        let (session, result) = task.await.unwrap();
+        assert_eq!(result.unwrap(), EndReason::Closed);
+        assert_eq!(session.end_data_calls, 0, "never completed");
     }
 
     /// SMTP smuggling, `<LF>.<CRLF>` variant (CVE-2023-51764): a `.` line

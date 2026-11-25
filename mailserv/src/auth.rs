@@ -22,8 +22,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::password_hash::rand_core::OsRng;
@@ -99,11 +99,11 @@ pub enum AuthCheck {
     Blocked,
 }
 
-/// AUTH configuration: the credential store plus each login's sender
-/// grants, and the shared guards that bound password checking. Grants only
-/// exist alongside credentials, so the type rules out a configuration that
-/// authorizes senders without AUTH.
-pub struct AuthConfig {
+/// One loaded set of logins: the credential store, the dummy hash for
+/// unknown logins, and each login's sender grants. Replaced as a whole
+/// on reload, so a check never sees half of one file and half of
+/// another.
+struct Logins {
     /// `user -> argon2id hash`.
     credentials: HashMap<String, PasswordHashString>,
     /// An argon2id hash of a random password with the same parameters as
@@ -111,53 +111,10 @@ pub struct AuthConfig {
     /// much as a wrong password.
     dummy: PasswordHashString,
     /// `user -> addresses/domains` that user may send as.
-    pub senders: SenderGrants,
-    /// Failed attempts per source IP.
-    failures: AuthFailureLimiter,
-    /// Bounds concurrent hash checks to the number of CPUs, so AUTH
-    /// attempts can't monopolize the blocking pool.
-    checks: tokio::sync::Semaphore,
+    senders: SenderGrants,
 }
 
-impl std::fmt::Debug for AuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never print the hashes.
-        f.debug_struct("AuthConfig")
-            .field("users", &self.credentials.len())
-            .field("senders", &self.senders)
-            .finish_non_exhaustive()
-    }
-}
-
-impl AuthConfig {
-    /// Load the credentials file at `path` and combine it with the
-    /// `--auth-senders` spec `senders_spec` (see
-    /// [`AuthConfig::from_credentials`] for both formats).
-    ///
-    /// The file must not be accessible to "other" users; read it before
-    /// dropping privileges, so it can stay root-owned with mode `0600`.
-    /// Group access is allowed (the caller warns about it).
-    ///
-    /// # Errors
-    ///
-    /// The file can't be read, is accessible to other users, or fails
-    /// [`AuthConfig::from_credentials`].
-    pub fn load(path: &Path, senders_spec: Option<&str>) -> Result<Self> {
-        if let Some(bits) = crate::fsutil::shared_bits(path) {
-            if bits & 0o007 != 0 {
-                bail!(
-                    "credentials file {} is accessible to other users (mode bits {bits:03o}); \
-                     chmod o-rwx it",
-                    path.display()
-                );
-            }
-        }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read credentials file {}", path.display()))?;
-        Self::from_credentials(&text, senders_spec)
-            .with_context(|| format!("invalid credentials file {}", path.display()))
-    }
-
+impl Logins {
     /// Build from the contents of a credentials file, `credentials`, and
     /// the `--auth-senders` spec `senders_spec`.
     ///
@@ -168,6 +125,12 @@ impl AuthConfig {
     /// whitespace) are ignored. `senders_spec` is the [`SenderGrants`]
     /// spec; `None` or a blank spec means no login has any grants.
     ///
+    /// With `strict`, a grant for a login that isn't in the file is an
+    /// error (at startup it's almost always a typo, and ignoring it would
+    /// leave the intended user unable to send). Otherwise it is ignored
+    /// (on reload it means the login was revoked) and listed by
+    /// [`Logins::orphaned_grants`].
+    ///
     /// One argon2 hash is computed here (the dummy for unknown logins),
     /// with the first credential's parameters.
     ///
@@ -175,11 +138,10 @@ impl AuthConfig {
     ///
     /// A line without a `:`, an empty user, a value that is not an
     /// argon2id PHC string (including a plaintext password), a user listed
-    /// twice, no users at all, any [`SenderGrants::parse`] error, or a
-    /// grant for a login that has no credentials (almost always a typo,
-    /// and silently ignoring it would leave the intended user unable to
-    /// send). Errors name the line number, never the value.
-    pub fn from_credentials(credentials: &str, senders_spec: Option<&str>) -> Result<Self> {
+    /// twice, no users at all, any [`SenderGrants::parse`] error, or (with
+    /// `strict`) a grant for a login that has no credentials. Errors name
+    /// the line number, never the value.
+    fn parse(credentials: &str, senders_spec: Option<&str>, strict: bool) -> Result<Self> {
         let mut hashes: HashMap<String, PasswordHashString> = HashMap::new();
         let mut first: Option<PasswordHashString> = None;
         for (index, line) in credentials.lines().enumerate() {
@@ -212,9 +174,11 @@ impl AuthConfig {
             Some(spec) if !spec.trim().is_empty() => SenderGrants::parse(spec)?,
             _ => SenderGrants::default(),
         };
-        for user in senders.by_user.keys() {
-            if !hashes.contains_key(user) {
-                bail!("--auth-senders names {user:?}, which has no credentials");
+        if strict {
+            for user in senders.by_user.keys() {
+                if !hashes.contains_key(user) {
+                    bail!("--auth-senders names {user:?}, which has no credentials");
+                }
             }
         }
 
@@ -229,27 +193,214 @@ impl AuthConfig {
         )?;
         let dummy =
             PasswordHashString::new(&dummy).map_err(|e| anyhow!("dummy hash unparseable: {e}"))?;
-
-        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-        Ok(AuthConfig {
+        Ok(Logins {
             credentials: hashes,
             dummy,
             senders,
+        })
+    }
+
+    /// Returns the logins named by the grants spec that aren't in the
+    /// credentials (so their grants are inert), sorted.
+    fn orphaned_grants(&self) -> Vec<String> {
+        let mut users: Vec<String> = self
+            .senders
+            .by_user
+            .keys()
+            .filter(|u| !self.credentials.contains_key(*u))
+            .cloned()
+            .collect();
+        users.sort_unstable();
+        users
+    }
+
+    /// Read and parse the credentials file at `path` with the grants spec
+    /// `senders_spec`; `strict` as in [`Logins::parse`].
+    ///
+    /// # Errors
+    ///
+    /// The file is accessible to other users or can't be read, or
+    /// [`Logins::parse`] fails; the message names the file.
+    fn load(path: &Path, senders_spec: Option<&str>, strict: bool) -> Result<Self> {
+        if let Some(bits) = crate::fsutil::shared_bits(path) {
+            if bits & 0o007 != 0 {
+                bail!(
+                    "credentials file {} is accessible to other users (mode bits {bits:03o}); \
+                     chmod o-rwx it",
+                    path.display()
+                );
+            }
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read credentials file {}", path.display()))?;
+        Self::parse(&text, senders_spec, strict)
+            .with_context(|| format!("invalid credentials file {}", path.display()))
+    }
+}
+
+/// What a successful [`AuthConfig::reload`] loaded, for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadSummary {
+    /// Logins that can authenticate now.
+    pub users: usize,
+    /// Logins that were removed by this reload, sorted.
+    pub removed: Vec<String>,
+    /// Logins added by this reload, sorted.
+    pub added: Vec<String>,
+    /// Logins with `--auth-senders` grants but no credentials (revoked
+    /// logins whose grants are now inert), sorted.
+    pub orphaned_grants: Vec<String>,
+}
+
+/// AUTH configuration: the current set of logins (credentials and sender
+/// grants), where it was loaded from, and the shared guards that bound
+/// password checking. Grants only exist alongside credentials, so the
+/// type rules out a configuration that authorizes senders without AUTH.
+///
+/// The logins can be replaced at runtime ([`AuthConfig::reload`]); the
+/// per-IP failure counts and the check slots carry over.
+pub struct AuthConfig {
+    /// The current logins.
+    logins: RwLock<Arc<Logins>>,
+    /// The credentials file, when loaded from one (reload needs it).
+    path: Option<PathBuf>,
+    /// The `--auth-senders` spec, re-applied to each reloaded file.
+    senders_spec: Option<String>,
+    /// Failed attempts per source IP.
+    failures: AuthFailureLimiter,
+    /// Bounds concurrent hash checks to the number of CPUs, so AUTH
+    /// attempts can't monopolize the blocking pool.
+    checks: tokio::sync::Semaphore,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the hashes.
+        let logins = self.current();
+        f.debug_struct("AuthConfig")
+            .field("path", &self.path)
+            .field("users", &logins.credentials.len())
+            .field("senders", &logins.senders)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthConfig {
+    /// Load the credentials file at `path` and combine it with the
+    /// `--auth-senders` spec `senders_spec` (see [`Logins::parse`] for both
+    /// formats). The path and spec are kept for [`AuthConfig::reload`].
+    ///
+    /// The file must not be accessible to "other" users. Group access is
+    /// allowed: `root:<service group> 0640` lets the service user re-read
+    /// it after dropping privileges.
+    ///
+    /// # Errors
+    ///
+    /// The file can't be read, is accessible to other users, or fails
+    /// [`Logins::parse`] (strictly: a grant must name a login).
+    pub fn load(path: &Path, senders_spec: Option<&str>) -> Result<Self> {
+        let logins = Logins::load(path, senders_spec, true)?;
+        Ok(Self::with_logins(
+            logins,
+            Some(path.to_path_buf()),
+            senders_spec,
+        ))
+    }
+
+    /// Build from the contents of a credentials file, `credentials`, and
+    /// the `--auth-senders` spec `senders_spec` (test helper). Such a
+    /// configuration has no file, so it can't be reloaded.
+    ///
+    /// # Errors
+    ///
+    /// As [`Logins::parse`], strictly.
+    #[cfg(test)]
+    pub fn from_credentials(credentials: &str, senders_spec: Option<&str>) -> Result<Self> {
+        let logins = Logins::parse(credentials, senders_spec, true)?;
+        Ok(Self::with_logins(logins, None, senders_spec))
+    }
+
+    /// Wrap `logins`, loaded from `path` with `senders_spec`, with fresh
+    /// failure counts and check slots.
+    fn with_logins(logins: Logins, path: Option<PathBuf>, senders_spec: Option<&str>) -> Self {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        AuthConfig {
+            logins: RwLock::new(Arc::new(logins)),
+            path,
+            senders_spec: senders_spec.map(str::to_string),
             failures: AuthFailureLimiter::new(AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW),
             checks: tokio::sync::Semaphore::new(cpus),
+        }
+    }
+
+    /// Returns the current logins.
+    fn current(&self) -> Arc<Logins> {
+        // A poisoned lock still holds a complete snapshot (the writer only
+        // swaps an Arc).
+        Arc::clone(&self.logins.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Re-read the credentials file and re-apply the `--auth-senders`
+    /// spec, replacing the logins at once. Blocking (file I/O and one
+    /// argon2 hash); call it from the blocking pool.
+    ///
+    /// Sessions that already authenticated stay authenticated, but a
+    /// removed login can no longer send ([`AuthConfig::permits`]), and new
+    /// AUTH attempts use the new file. Failure counts are kept.
+    ///
+    /// Unlike at startup, a grant for a login that is no longer in the
+    /// file is not an error: removing the login is how it is revoked. The
+    /// grant is inert and reported in [`ReloadSummary::orphaned_grants`].
+    ///
+    /// Returns what changed.
+    ///
+    /// # Errors
+    ///
+    /// This configuration wasn't loaded from a file, or the file fails
+    /// [`AuthConfig::load`]'s other checks. The current logins are then
+    /// kept unchanged.
+    pub fn reload(&self) -> Result<ReloadSummary> {
+        let Some(path) = &self.path else {
+            bail!("these credentials were not loaded from a file");
+        };
+        let new = Logins::load(path, self.senders_spec.as_deref(), false)?;
+        let old = self.current();
+        let mut removed: Vec<String> = old
+            .credentials
+            .keys()
+            .filter(|u| !new.credentials.contains_key(*u))
+            .cloned()
+            .collect();
+        let mut added: Vec<String> = new
+            .credentials
+            .keys()
+            .filter(|u| !old.credentials.contains_key(*u))
+            .cloned()
+            .collect();
+        removed.sort_unstable();
+        added.sort_unstable();
+        let users = new.credentials.len();
+        let orphaned_grants = new.orphaned_grants();
+        *self.logins.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new);
+        Ok(ReloadSummary {
+            users,
+            removed,
+            added,
+            orphaned_grants,
         })
     }
 
     /// Returns the number of logins that can authenticate.
     pub fn user_count(&self) -> usize {
-        self.credentials.len()
+        self.current().credentials.len()
     }
 
     /// Returns the logins whose hash parameters are below OWASP's minimum
-    /// recommendations (see [`MIN_MEMORY_KIB`]), sorted, for a startup
-    /// warning. They still work.
-    pub fn weak_hash_users(&self) -> Vec<&str> {
-        let mut weak: Vec<&str> = self
+    /// recommendations (see [`MIN_MEMORY_KIB`]), sorted, for a warning.
+    /// They still work.
+    pub fn weak_hash_users(&self) -> Vec<String> {
+        let logins = self.current();
+        let mut weak: Vec<String> = logins
             .credentials
             .iter()
             .filter(|(_, hash)| {
@@ -259,7 +410,7 @@ impl AuthConfig {
                             < MIN_MEMORY_TIMES_PASSES_KIB
                 })
             })
-            .map(|(user, _)| user.as_str())
+            .map(|(user, _)| user.clone())
             .collect();
         weak.sort_unstable();
         weak
@@ -295,18 +446,19 @@ impl AuthConfig {
         }
     }
 
-    /// Check the password `pass` for login `user`. Blocking and
-    /// deliberately slow (one argon2id evaluation); use
-    /// [`AuthConfig::check`] from async code.
+    /// Check the password `pass` for login `user` against the current
+    /// logins. Blocking and deliberately slow (one argon2id evaluation);
+    /// use [`AuthConfig::check`] from async code.
     ///
     /// Returns `true` only when `user` exists and `pass` matches. The hash
     /// comparison is constant-time, and an unknown login is checked
     /// against a dummy hash with the same parameters, so the time taken
     /// reveals neither how close a guess was nor whether the login exists.
     pub fn verify(&self, user: &str, pass: &str) -> bool {
-        let (hash, known) = match self.credentials.get(user) {
+        let logins = self.current();
+        let (hash, known) = match logins.credentials.get(user) {
             Some(hash) => (hash, true),
-            None => (&self.dummy, false),
+            None => (&logins.dummy, false),
         };
         let matches = Argon2::default()
             .verify_password(pass.as_bytes(), &hash.password_hash())
@@ -314,14 +466,24 @@ impl AuthConfig {
         matches && known
     }
 
+    /// Whether login `user` may send as `local@domain`: the login must
+    /// still exist in the current credentials (so a reload revokes it,
+    /// even for a session that authenticated earlier) and hold a grant
+    /// for the address (see [`SenderGrants::permits`]).
+    pub fn permits(&self, user: &str, local: &str, domain: &str) -> bool {
+        let logins = self.current();
+        logins.credentials.contains_key(user) && logins.senders.permits(user, local, domain)
+    }
+
     /// Returns the logins that can authenticate but have no sender grants
     /// (so every `MAIL FROM` they send is refused), sorted for stable logs.
-    pub fn users_without_grants(&self) -> Vec<&str> {
-        let mut users: Vec<&str> = self
+    pub fn users_without_grants(&self) -> Vec<String> {
+        let logins = self.current();
+        let mut users: Vec<String> = logins
             .credentials
             .keys()
-            .filter(|u| !self.senders.by_user.contains_key(*u))
-            .map(String::as_str)
+            .filter(|u| !logins.senders.by_user.contains_key(*u))
+            .cloned()
             .collect();
         users.sort_unstable();
         users
@@ -487,7 +649,7 @@ mod tests {
     #[test]
     fn grants_cover_addresses_and_domains() {
         let c = cfg("alice=alice@example.org|@Example.NET.,bob=bob@example.org");
-        let g = &c.senders;
+        let g = &c;
         assert!(g.permits("alice", "alice", "example.org"));
         assert!(g.permits("alice", "ALICE", "EXAMPLE.org."));
         assert!(g.permits("alice", "anyone", "example.net"));
@@ -509,7 +671,7 @@ mod tests {
     #[test]
     fn no_senders_spec_means_no_one_may_send() {
         let c = AuthConfig::from_credentials(&test_credentials(&[("alice", "pw")]), None).unwrap();
-        assert!(!c.senders.permits("alice", "alice", "example.org"));
+        assert!(!c.permits("alice", "alice", "example.org"));
         assert_eq!(c.users_without_grants(), vec!["alice"]);
     }
 
@@ -664,6 +826,70 @@ mod tests {
         let missing = dir.path().join("missing");
         let err = format!("{:#}", AuthConfig::load(&missing, None).unwrap_err());
         assert!(err.contains("cannot read credentials file"), "{err}");
+    }
+
+    /// `reload` swaps in the edited file: a removed login can no longer
+    /// authenticate or send (its grant goes inert and is reported), an
+    /// added one can, a changed password applies, and failure counts
+    /// carry over. A broken file is refused with the old logins kept, and
+    /// a configuration built from a string can't be reloaded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_replaces_logins_atomically() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users");
+        let write = |text: String| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write(test_credentials(&[("alice", "pw"), ("bob", "pw")]));
+        let c =
+            Arc::new(AuthConfig::load(&path, Some("alice=@example.org,bob=@example.org")).unwrap());
+        assert!(c.permits("bob", "b", "example.org"));
+
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        for _ in 0..AUTH_FAILURES_PER_IP {
+            c.check(ip, "alice", "wrong").await;
+        }
+
+        // bob is revoked, carol arrives, alice changes her password.
+        write(test_credentials(&[("alice", "new"), ("carol", "pw")]));
+        assert_eq!(
+            c.reload().unwrap(),
+            ReloadSummary {
+                users: 2,
+                removed: vec!["bob".into()],
+                added: vec!["carol".into()],
+                orphaned_grants: vec!["bob".into()],
+            }
+        );
+        assert!(!c.verify("bob", "pw"));
+        assert!(
+            !c.permits("bob", "b", "example.org"),
+            "a revoked login can't send, even if its session authenticated earlier"
+        );
+        assert!(c.verify("carol", "pw"));
+        assert!(c.verify("alice", "new") && !c.verify("alice", "pw"));
+        assert!(c.permits("alice", "a", "example.org"));
+        assert_eq!(
+            c.check(ip, "carol", "pw").await,
+            AuthCheck::Blocked,
+            "failure counts survive a reload"
+        );
+
+        // A broken file is refused; the current logins stay.
+        write("alice:hunter2\n".to_string());
+        let err = format!("{:#}", c.reload().unwrap_err());
+        assert!(err.contains("not an argon2id hash"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(c.verify("alice", "new"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(c.reload().is_err(), "world-readable is still refused");
+        assert_eq!(c.user_count(), 2);
+
+        let fixed = AuthConfig::from_credentials(&test_credentials(&[("a", "pw")]), None).unwrap();
+        assert!(fixed.reload().is_err());
     }
 
     #[test]

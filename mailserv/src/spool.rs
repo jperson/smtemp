@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{DkimSummary, DmarcSummary};
+use crate::verdict::{DkimSummary, DmarcSummary};
 
 /// Returns a new queue ID: the Unix time in seconds as 12 hex digits (so
 /// lexical order is roughly arrival order), a dot, and a random UUID (so

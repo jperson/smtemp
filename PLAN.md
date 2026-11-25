@@ -1,7 +1,7 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-23:** 279 tests pass (1 ignored); clippy, fmt, rustdoc and
-`cargo audit` are clean on Rust 1.100.0.
+**As of 2026-11-23:** 284 tests pass (1 ignored) with no network beyond
+loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
 [DESIGN.md](DESIGN.md) (its §13 describes every current gap), and go-live
@@ -12,8 +12,7 @@ finding IDs to where each item stands now.
 **V1 scope:** a receive-only hosted MX. Customers point their domain's MX
 at us, and addresses are created in an external management console. V1 has
 no relaying, sending or bounces; submission (587/465, AUTH) is built but
-optional. Send-side work is post-V1
-(§6).
+optional. Send-side work is post-V1 (§6).
 
 ---
 
@@ -22,11 +21,11 @@ optional. Send-side work is post-V1
 | Area | Status |
 |---|---|
 | SMTP core, STARTTLS, framing and smuggling defences | ✅ Done |
-| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, and bounce alignment (§2.4 item 4) |
+| SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, and bounce alignment (§2.4 item 3) |
 | Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
-| Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: duplicates on timeout, maildir fsync and `tmp/` debris (§2.4) |
+| Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: maildir fsync and `tmp/` debris (§2.4) |
 | Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done. Open: storage quotas and recipient probing (§2.4) |
-| Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file, attempt limits. Open: credentials reload (§2.3) |
+| Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file reloaded on SIGHUP, attempt limits |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
 | S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§5) |
 
@@ -57,10 +56,9 @@ before MAIL FROM; the MX listener answers AUTH with `502`. Credentials
 are argon2id hashes in a private file (`--auth-users-file`, made with
 `mailserv hash-password`), checked on the blocking pool, with an unknown
 login costing the same as a wrong password and failures limited per
-session (3) and per source IP (10 per 15 minutes).
+session (3) and per source IP (10 per 15 minutes). SIGHUP reloads the
+credentials file, so a login is revoked by removing it and reloading.
 
-- [ ] Reload the credentials file on SIGHUP, so a login can be revoked
-  without a restart. Until then, revoke by restarting.
 - [ ] Decide whether the pilot enables submission at all. It is off unless
   a submission port is set.
 
@@ -73,20 +71,18 @@ Fix these after the pilot starts and before GA, in this order:
    `catch-all` can be offered.
 2. **Recipient probing:** close the session after N refused RCPTs, and keep
    a refused-RCPT budget per IP (`RSET` resets today's 100-recipient cap).
-3. **Duplicates on timeout:** never let the connection cap fire between the
-   spool commit and the `250`; move fast-path delivery after the reply.
-4. **SPF and DMARC correctness** (the first three reject legitimate mail):
+3. **SPF and DMARC correctness** (the first three reject legitimate mail):
    - stop charging the address lookups behind `mx` and `ptr` to SPF's
      10-term budget, but add RFC 7208 §4.6.4's 10-address cap per
      `mx`/`ptr`;
    - organisational-domain relaxed DMARC alignment. This needs a Public
      Suffix List; vendor a dated snapshot;
    - HELO-identity SPF alignment for bounces (null sender).
-5. **What users are shown:**
+4. **What users are shown:**
    - add our `Authentication-Results:` and strip forged ones that claim our
      authserv-id;
    - a display-name check, or document that display names are unverified.
-6. **Robustness:**
+5. **Robustness:**
    - an RAII guard for the per-IP connection count;
    - fsync the maildir directory after the rename, and sweep old files from
      the maildirs' `tmp/` (the spool's debris is already swept);
@@ -98,7 +94,7 @@ Fix these after the pilot starts and before GA, in this order:
      path-based `chown`;
    - fewer copies of the message buffer (peak memory is about 2× the
      message size per session during DATA and up to 6× at end of data).
-7. **Assurance:** fuzz the SMTP framing, the header scanners, and the
+6. **Assurance:** fuzz the SMTP framing, the header scanners, and the
    SPF/DMARC/DNS parsers; get an independent security review.
 
 ---
@@ -111,14 +107,13 @@ One line per open item; DESIGN.md §13 has the impact of each.
 |---|---|---|
 | No storage quotas or free-disk check | Abuse resistance | §2.4.1 |
 | Unlimited recipient probing per session | Abuse resistance | §2.4.2 |
-| Duplicate delivery if the connection cap fires after commit | Correctness and delivery | §2.4.3 |
-| SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.4 |
-| Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.4 |
-| No SPF alignment for the null sender | Correctness and delivery | §2.4.4 |
-| No `Authentication-Results:` | What users are shown | §2.4.5 |
-| Display-name spoofing | What users are shown | §2.4.5 |
-| Per-IP count release, maildir fsync and `tmp/`, pre-EHLO replies, DKIM tag checks, `chown` by path, memory copies | Abuse resistance; Correctness and delivery | §2.4.6 |
-| Credentials read only at startup | AUTH | §2.3 |
+| SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.3 |
+| Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.3 |
+| No SPF alignment for the null sender | Correctness and delivery | §2.4.3 |
+| No `Authentication-Results:` | What users are shown | §2.4.4 |
+| Display-name spoofing | What users are shown | §2.4.4 |
+| Per-IP count release, maildir fsync and `tmp/`, pre-EHLO replies, DKIM tag checks, `chown` by path, memory copies | Abuse resistance; Correctness and delivery | §2.4.5 |
+| Sender grants read only at startup | Submission and AUTH | §6 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits not aggregated per IPv6 /64 | Correctness; Abuse resistance | §6 (IPv6 readiness) |
 | `quarantine` delivered as normal mail | Correctness and delivery | Out of V1 scope (decided) |
 
@@ -130,12 +125,16 @@ From the design and code assessment in
 [docs/reviews/FINDINGS.md](docs/reviews/FINDINGS.md). None blocks the
 pilot; items 1–3 most reduce the kind of bug the reviews kept finding.
 
+Done: `mailserv/src/main.rs` is split into `config`, `server`, `session`
+(with `session/message.rs` for end of data), `address`, `headers`, `tls`
+and `verdict` (DESIGN §2); the `mailserv` tests are hermetic.
+
 | # | Change | Why | Effort |
 |---|---|---|---|
-| 1 | Split `mailserv/src/main.rs` (about 4,800 lines) into `config`, `server` (accept loop, limits, shutdown), `session` (`UserSession`), `headers` (From extraction, bare-CR check) and `tls` modules; introduce a `Transaction` type created at an accepted MAIL and dropped at end of data, RSET or abort | Per-message state is loose fields reset by hand in `clear_envelope`, which is how a DKIM verdict once leaked across messages | Medium |
+| 1 | Introduce a `Transaction` type in `session`, created at an accepted MAIL and dropped at end of data, RSET or abort | Per-message state is loose fields reset by hand in `clear_envelope`, which is how a DKIM verdict once leaked across messages | Medium |
 | 2 | One raw header scanner, in `mailparse`, used by DKIM, the From extraction and the bare-CR check; one shared mailbox-safe character set for RCPT validation and the maildir sink | Two scanners can disagree about line boundaries; two copies of a rule can drift | Small–medium |
 | 3 | Run DKIM canonicalisation and verification on the blocking pool (fetch keys first, async) | Attacker-controlled CPU work currently runs on async workers | Small |
-| 4 | Fuzz targets; make the `mailserv` integration tests use the mock DoT resolver instead of live 1.1.1.1 | No fuzzing; CI fails offline | Small to set up |
+| 4 | Fuzz targets | No fuzzing | Small to set up |
 | 5 | Total lookup results (`Found / Absent / TempError`) for SPF and DKIM key lookups, matched exhaustively | Fail-closed is enforced case by case, not by the types | Medium |
 | 6 | Typed errors in `dns`/`spf`; `serde` enums with stable names for the verdicts in spool metadata (today `format!("{:?}")`) | Renaming a variant silently changes stored data | Small–medium |
 
@@ -199,9 +198,10 @@ addresses exist lives in the external console. Order: recipient authority
   - **Done:** a credentials file separate from the sender grants
     (`--auth-users-file`) holding argon2id hashes only, refused if other
     users can read it; never in argv; per-session and per-IP attempt
-    limits.
-  - **Next:** reload on SIGHUP (§2.3); optionally make the attempt
-    limits configurable.
+    limits; reloaded on SIGHUP.
+  - **Next:** reload `--auth-senders` grants too (they live in the config,
+    which isn't reloaded); optionally make the attempt limits
+    configurable.
   - **Two seams:** `CredentialVerifier` (later backed by the console) and
     `SenderAuthorizer` (stays in the app).
   - **Backend constraints:** fail closed for AUTH only (never block inbound

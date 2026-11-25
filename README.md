@@ -149,7 +149,7 @@ Settings come from three sources; the first one that sets a value wins:
 
 | Flag / config key | Default | Description |
 |---|---|---|
-| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only on the submission ports over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read once at startup, before privileges are dropped, so it can be `root:root 0600`. A file other users can access is a startup error; a group-readable one is warned about. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). Port 25 never offers AUTH (`502`); without a submission port the logins can't be used, which is warned about. Revoking a login needs a restart. The old inline `auth-users` key is a startup error. |
+| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only on the submission ports over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read at startup, before privileges are dropped, and again on `SIGHUP` (`systemctl reload mailserv`) as the service user, so for reloads make it owner root, group the service group, mode `0640` (startup warns when the service user can't read it). A file other users can access is a startup error. A reload that fails keeps the current logins; a login removed by a reload can no longer authenticate or send. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). Port 25 never offers AUTH (`502`); without a submission port the logins can't be used, which is warned about. The old inline `auth-users` key is a startup error. |
 | `--auth-senders` / `auth-senders` | *(none)* | What each AUTH login may send as: `user=grant\|grant,…`, each grant an address (`alice@example.org`) or a whole domain (`@example.net`). An authenticated `MAIL FROM` outside the grants gets `553 5.7.1` (the null sender always does), and a `From:` author outside them gets `550 5.7.1`. A login with no grants can't send. Grants for an unknown login, or this flag without `--auth-users-file`, are startup errors. |
 
 | Flag | Description |
@@ -294,7 +294,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 279 tests, 1 ignored
+cargo test --workspace          # 284 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```
@@ -308,13 +308,9 @@ The suite has four layers (DESIGN.md §12):
 
 Every fixed security finding has a test that reproduces its attack.
 
-**Network caveat.** Tests are offline and deterministic, with two
-exceptions:
-- the `mailserv` integration tests use the real resolver path (default
-  1.1.1.1) and rely on `spfless-domain-xyz.test` being NXDOMAIN;
-- the one `#[ignore]`d DKIM test fetches a live key.
-
-The DMARC tests use a local mock DoT resolver.
+**Network.** The tests need nothing beyond loopback: every DNS-backed test
+runs against a local mock DNS-over-TLS resolver. The one exception is the
+`#[ignore]`d DKIM test, which fetches a live key.
 
 ### Lints (enforced by CI)
 
@@ -378,3 +374,6 @@ drill), see DEPLOYMENT.md Phase F.
 | `dns` | DNS wire codec and pipelined DNS-over-TLS client |
 | `dnsq` | DNS query CLI |
 | `smtp-client` | Demo SMTP client |
+
+claude --resume a3e8080d-b50c-435b-b268-bf8e28005f2d
+

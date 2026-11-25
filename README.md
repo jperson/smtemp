@@ -115,6 +115,8 @@ Settings come from three sources; the first one that sets a value wins:
 | `--max-connections` / `max-connections` | `100` | Server-wide simultaneous connections. Over the limit: `421`. |
 | `--max-conn-per-ip` / `max-conn-per-ip` | `10` | Simultaneous connections per source IP. |
 | `--max-conn-rate-per-ip` / `max-conn-rate-per-ip` | `60` | New connections per 60 s per source IP. |
+| `--max-refused-rcpt-per-session` / `max-refused-rcpt-per-session` | `20` | Refused recipients (unknown addresses, relay attempts) a connection may have; its next RCPT gets `421 4.7.0` and the connection closes (`0`: no limit). RSET doesn't reset the count. |
+| `--max-refused-rcpt-per-ip` / `max-refused-rcpt-per-ip` | `100` | Refused recipients per source IP per 15 minutes, across connections (`0`: no limit). Past it, every RCPT from that IP gets the same `421`, valid recipients included, until the window ends. |
 | `--max-dns-per-ip` / `max-dns-per-ip` | `4` | Concurrent DNS-backed checks (SPF, DKIM + DMARC) per source IP. A check over the limit waits up to 10 s, then gets `451 4.7.0` (never a permanent reject). `0` is a startup error. |
 
 **TLS**
@@ -192,6 +194,8 @@ min-free-disk-bytes = 1073741824
 max-connections = 100
 max-conn-per-ip = 10
 max-conn-rate-per-ip = 60
+max-refused-rcpt-per-session = 20
+max-refused-rcpt-per-ip = 100
 max-dns-per-ip = 4
 max-conn-duration-ms = 300000
 max-read-duration-ms = 15000
@@ -304,7 +308,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 297 tests, 1 ignored
+cargo test --workspace          # 301 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```

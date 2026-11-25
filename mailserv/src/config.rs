@@ -59,6 +59,19 @@ pub(crate) struct Args {
     #[arg(long, value_name = "BYTES")]
     pub(crate) min_free_disk_bytes: Option<u64>,
 
+    /// Refused recipients (unknown addresses, relay attempts) a connection
+    /// may have before its next RCPT gets `421` and it is closed (default
+    /// 20; 0 for no limit). RSET doesn't reset the count.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_refused_rcpt_per_session: Option<u32>,
+
+    /// Refused recipients per source IP per 15 minutes, across connections
+    /// (default 100; 0 for no limit). Past it, every RCPT from that IP gets
+    /// `421` (valid recipients too, so probing learns nothing) until the
+    /// window ends.
+    #[arg(long, value_name = "N")]
+    pub(crate) max_refused_rcpt_per_ip: Option<u32>,
+
     /// Whole-connection time limit in milliseconds (default 300000).
     #[arg(long)]
     pub(crate) max_conn_duration_ms: Option<u64>,
@@ -175,6 +188,7 @@ pub(crate) struct Args {
     /// the same as the flags in kebab-case (host, port, submission-port,
     /// submissions-port, domain,
     /// max-data-bytes, mailbox-quota-bytes, min-free-disk-bytes,
+    /// max-refused-rcpt-per-session, max-refused-rcpt-per-ip,
     /// max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users-file, auth-senders, resolver, resolver-ca,
     /// dns-connections, spool-dir, maildir-dir, max-connections,
@@ -206,6 +220,8 @@ pub(crate) struct FileConfig {
     pub(crate) max_data_bytes: Option<usize>,
     pub(crate) mailbox_quota_bytes: Option<u64>,
     pub(crate) min_free_disk_bytes: Option<u64>,
+    pub(crate) max_refused_rcpt_per_session: Option<u32>,
+    pub(crate) max_refused_rcpt_per_ip: Option<u32>,
     pub(crate) max_conn_duration_ms: Option<u64>,
     pub(crate) max_read_duration_ms: Option<u64>,
     pub(crate) max_connections: Option<u32>,
@@ -254,6 +270,12 @@ pub(crate) struct Config {
     /// Free-space floor for the spool and maildir filesystems (default
     /// [`DEFAULT_MIN_FREE_DISK_BYTES`]); `None` when set to 0.
     pub(crate) min_free_disk_bytes: Option<u64>,
+    /// Refused recipients per connection (default
+    /// [`limit::DEFAULT_REFUSED_RCPT_PER_SESSION`]; 0: no limit).
+    pub(crate) max_refused_rcpt_per_session: u32,
+    /// Refused recipients per source IP per window (default
+    /// [`limit::DEFAULT_REFUSED_RCPT_PER_IP`]; 0: no limit).
+    pub(crate) max_refused_rcpt_per_ip: u32,
     /// Whole-connection time limit (default
     /// [`DEFAULT_MAX_CONN_DURATION_MS`]).
     pub(crate) max_conn_duration_ms: u64,
@@ -433,6 +455,14 @@ pub(crate) fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
                 .unwrap_or(DEFAULT_MIN_FREE_DISK_BYTES),
         )
         .filter(|&q| q > 0),
+        max_refused_rcpt_per_session: cli
+            .max_refused_rcpt_per_session
+            .or(file.max_refused_rcpt_per_session)
+            .unwrap_or(limit::DEFAULT_REFUSED_RCPT_PER_SESSION),
+        max_refused_rcpt_per_ip: cli
+            .max_refused_rcpt_per_ip
+            .or(file.max_refused_rcpt_per_ip)
+            .unwrap_or(limit::DEFAULT_REFUSED_RCPT_PER_IP),
         max_conn_duration_ms: cli
             .max_conn_duration_ms
             .or(file.max_conn_duration_ms)
@@ -703,6 +733,8 @@ mod tests {
         assert_eq!(resolved.max_data_bytes, 10 * 1024 * 1024);
         assert_eq!(resolved.mailbox_quota_bytes, Some(10 * 1024 * 1024));
         assert_eq!(resolved.min_free_disk_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(resolved.max_refused_rcpt_per_session, 20);
+        assert_eq!(resolved.max_refused_rcpt_per_ip, 100);
         assert_eq!(resolved.max_conn_duration_ms, 300_000);
         assert_eq!(resolved.max_connections, 100);
         assert_eq!(resolved.shutdown_grace_ms, 60_000);

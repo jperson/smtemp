@@ -31,7 +31,7 @@ complete.
 | DNS robustness | ✅ Good. Pipelined DoT connections, per-IP DNS limit, deadlines for SPF and end-of-data checks. |
 | Durability (spool before `250`, idempotent delivery, retry, dead-letter) | ✅ Adequate for a pilot. Failed deliveries are retried for 5 days; crash debris is swept. The connection time limit never cuts a message off between its spool write and its `250`. |
 | Operability (logging, sizing, shutdown, privileges, paths) | ⚠️ **Configuration needed** in Phases B, C and E. |
-| Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** Per-mailbox quotas and a free-disk floor bound disk use; address probing per session is unlimited (monitoring narrows it; only code closes it). |
+| Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** Per-mailbox quotas and a free-disk floor bound disk use; address probing is limited per connection and per source IP. |
 | Legitimate mail wrongly rejected | ⚠️ **Pilot only.** Some legitimate mail can get a permanent `550` (§2). Acceptable while the logs are reviewed daily (G2). |
 | Spoofing that reaches users (display names, no `Authentication-Results:`) | ⚠️ **Pilot only.** |
 
@@ -53,7 +53,7 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 |---|---|---|---|
 | The static authority (no `authority` file) accepts every local-part | Any address at a hosted domain receives mail | C1, C2: always set `authority`, `reject` mode | Configuration |
 | Quotas are soft (one message over) and cap each mailbox, not a domain's total | A sender can fill one mailbox to its quota, and many mailboxes together can fill the disk until the free-disk floor defers mail | C1/C2 quotas sized for B3; G1 alerts | PLAN §2.4.1 |
-| Unlimited refused RCPTs per session | Probing which addresses exist | G1 `recipient refused` alert; firewall abusive sources | PLAN §2.4.2 |
+| Refused-recipient budget per IP address only (no IPv6 /64 aggregation); a large provider's shared IP can hit it | Slow probing from many addresses; legitimate mail from a busy shared IP deferred for up to 15 minutes | B4 IPv4-only; G1 alerts on both log lines | PLAN §2.4.2 |
 | SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.3 |
 | No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.4 |
 | Maildir directory not fsynced after the rename | A power cut can lose a just-delivered file that was already dequeued | Accepted for the pilot | PLAN §2.4.5 |
@@ -169,6 +169,8 @@ did each one and when in §4.
   max-read-duration-ms = 15000
   max-conn-per-ip = 10
   max-conn-rate-per-ip = 60
+  max-refused-rcpt-per-session = 20
+  max-refused-rcpt-per-ip = 100
   max-dns-per-ip = 4
   dns-connections = 2
   resolver = "9.9.9.9"             # B6
@@ -378,6 +380,7 @@ Run the authority-dependent tests against a test domain listed in
   | `multiple DMARC records; DMARC not applied` | log | daily review (a sender domain's misconfiguration) |
   | `message refused: bare CR in the header block` | log | daily review; a spike means a spoofing campaign |
   | `recipient refused` | log | > 50 in 10 min from one `peer` (address probing): block the source at the firewall |
+  | `connection closed: too many refused recipients` | log | review daily; a well-known provider's `peer` with `scope: ip` means legitimate mail is being deferred, so consider raising `max-refused-rcpt-per-ip` |
   | `per-IP DNS limit: no permit within the wait; temporary failure` | log | > 20 in 10 min (attack, or `max-dns-per-ip` too low) |
   | `message refused: size limit` | log | daily review; a spike for one domain means its `max-message-bytes` may be too low |
   | `shutdown grace period over; closing the remaining sessions` | log | any (sessions were cut; raise `shutdown-grace-ms`) |

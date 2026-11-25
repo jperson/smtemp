@@ -42,6 +42,10 @@ pub enum Control {
     /// enters [`SmtpState::Auth`], and further lines go to
     /// [`SmtpSession::auth_line`] until it returns a final verdict.
     Challenge(Vec<u8>),
+    /// Refuse and end the session (a `421`, RFC 5321 §3.8): the reply is
+    /// written and the connection is closed, as after QUIT. Honoured for
+    /// MAIL and RCPT; elsewhere it is an ordinary refusal.
+    Close(Vec<u8>),
 }
 
 impl Control {
@@ -65,6 +69,11 @@ impl Control {
         Control::Upgrade(reply.into())
     }
 
+    /// Build a [`Control::Close`] (refuse and end the session).
+    pub fn close(reply: impl Into<Vec<u8>>) -> Self {
+        Control::Close(reply.into())
+    }
+
     /// Build a [`Control::Challenge`] (AUTH continuation).
     pub fn challenge(reply: impl Into<Vec<u8>>) -> Self {
         Control::Challenge(reply.into())
@@ -77,7 +86,8 @@ impl Control {
             | Control::Reject(r)
             | Control::Tempfail(r)
             | Control::Upgrade(r)
-            | Control::Challenge(r) => r,
+            | Control::Challenge(r)
+            | Control::Close(r) => r,
         }
     }
 
@@ -88,7 +98,18 @@ impl Control {
             | Control::Reject(r)
             | Control::Tempfail(r)
             | Control::Upgrade(r)
-            | Control::Challenge(r) => r,
+            | Control::Challenge(r)
+            | Control::Close(r) => r,
+        }
+    }
+
+    /// Returns the state after a MAIL or RCPT answered with this control
+    /// in `Ready`: [`SmtpState::Quit`] for [`Control::Close`], otherwise
+    /// `Ready`.
+    fn next_after_envelope(&self) -> SmtpState {
+        match self {
+            Control::Close(_) => SmtpState::Quit,
+            _ => SmtpState::Ready,
         }
     }
 
@@ -823,14 +844,22 @@ pub trait SmtpSession {
 
                 (&SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"mail") => {
                     match Self::envelope_arg(arg, b"from:") {
-                        Ok(path) => (self.mail_from(path).await.into_reply(), SmtpState::Ready),
+                        Ok(path) => {
+                            let control = self.mail_from(path).await;
+                            let next = control.next_after_envelope();
+                            (control.into_reply(), next)
+                        }
                         Err(reply) => (reply, SmtpState::Ready),
                     }
                 }
 
                 (&SmtpState::Ready, v) if eq_ignore_ascii_case(v, b"rcpt") => {
                     match Self::envelope_arg(arg, b"to:") {
-                        Ok(path) => (self.rcpt_to(path).await.into_reply(), SmtpState::Ready),
+                        Ok(path) => {
+                            let control = self.rcpt_to(path).await;
+                            let next = control.next_after_envelope();
+                            (control.into_reply(), next)
+                        }
                         Err(reply) => (reply, SmtpState::Ready),
                     }
                 }
@@ -941,6 +970,8 @@ mod tests {
         deadline: Option<Instant>,
         /// How long `end_data` takes (simulated storage and checks).
         end_data_delay: Duration,
+        /// When set, RCPT answers `Close` once this many were accepted.
+        close_after_rcpts: Option<usize>,
     }
 
     impl TestSession {
@@ -1052,6 +1083,12 @@ mod tests {
         }
 
         fn do_rcpt_to(&mut self, path: &str) -> Control {
+            if self
+                .close_after_rcpts
+                .is_some_and(|n| self.rcpt_to.len() >= n)
+            {
+                return Control::close(b"421 4.7.0 Too many recipients, closing\r\n");
+            }
             self.rcpt_to.push(path.to_string());
             Control::accept(Self::OK)
         }
@@ -2533,6 +2570,34 @@ mod tests {
             client.write_all(cmd).await.unwrap();
             assert_eq!(read_reply(client).await, reply);
         }
+    }
+
+    /// A `Close` from RCPT sends its `421` and ends the session: nothing
+    /// the client sends afterwards is processed.
+    #[tokio::test]
+    async fn close_from_rcpt_ends_the_session() {
+        let (mut client, task) = spawn_session(TestSession {
+            close_after_rcpts: Some(1),
+            ..Default::default()
+        });
+        let mut greet = String::new();
+        client.read_line(&mut greet).await.unwrap();
+        for (cmd, reply) in [
+            (&b"HELO client.example\r\n"[..], "250 hello\r\n"),
+            (b"MAIL FROM:<a@b>\r\n", "250 Ok\r\n"),
+            (b"RCPT TO:<c@d>\r\n", "250 Ok\r\n"),
+            (
+                b"RCPT TO:<e@f>\r\n",
+                "421 4.7.0 Too many recipients, closing\r\n",
+            ),
+        ] {
+            client.write_all(cmd).await.unwrap();
+            assert_eq!(read_reply(&mut client).await, reply);
+        }
+        let _ = client.write_all(b"RCPT TO:<g@h>\r\n").await;
+        let (session, result) = task.await.unwrap();
+        assert_eq!(result.unwrap(), EndReason::Closed);
+        assert_eq!(session.rcpt_to, vec!["<c@d>"]);
     }
 
     /// An idle session that reaches its deadline is told so (`421`) and

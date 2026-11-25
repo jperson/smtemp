@@ -374,6 +374,10 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     // socket is simply closed.
     let refuse_capacity = Arc::new(tokio::sync::Semaphore::new(32));
     let fast_path = Arc::new(tokio::sync::Semaphore::new(MAX_FAST_PATH_DELIVERIES));
+    let probing = Arc::new(limit::ProbeLimits::new(
+        config.max_refused_rcpt_per_session,
+        config.max_refused_rcpt_per_ip,
+    ));
     let storage = Arc::new(quota::StorageLimits {
         mailbox_quota: config.mailbox_quota_bytes,
         min_free_disk: config.min_free_disk_bytes,
@@ -403,6 +407,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         max_conn_per_ip = config.max_conn_per_ip,
         mailbox_quota_bytes = ?config.mailbox_quota_bytes,
         min_free_disk_bytes = ?config.min_free_disk_bytes,
+        max_refused_rcpt_per_session = config.max_refused_rcpt_per_session,
+        max_refused_rcpt_per_ip = config.max_refused_rcpt_per_ip,
         max_conn_rate_per_ip = config.max_conn_rate_per_ip,
         "listening"
     );
@@ -485,6 +491,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             deadline: Some(deadline),
             fast_path: Arc::clone(&fast_path),
             storage: Arc::clone(&storage),
+            probing: Arc::clone(&probing),
         };
 
         tokio::spawn(async move {

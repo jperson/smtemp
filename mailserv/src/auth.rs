@@ -30,7 +30,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHashString, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 
-use crate::limit::{AuthFailureLimiter, AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW};
+use crate::limit::{FailureLimiter, AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW};
 
 /// Hash `password` for the credentials file: argon2id (v19) with the
 /// crate's default parameters (19 MiB of memory, 2 passes, 1 lane: the
@@ -267,7 +267,7 @@ pub struct AuthConfig {
     /// The `--auth-senders` spec, re-applied to each reloaded file.
     senders_spec: Option<String>,
     /// Failed attempts per source IP.
-    failures: AuthFailureLimiter,
+    failures: FailureLimiter,
     /// Bounds concurrent hash checks to the number of CPUs, so AUTH
     /// attempts can't monopolize the blocking pool.
     checks: tokio::sync::Semaphore,
@@ -328,7 +328,7 @@ impl AuthConfig {
             logins: RwLock::new(Arc::new(logins)),
             path,
             senders_spec: senders_spec.map(str::to_string),
-            failures: AuthFailureLimiter::new(AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW),
+            failures: FailureLimiter::new(AUTH_FAILURES_PER_IP, AUTH_FAILURE_WINDOW),
             checks: tokio::sync::Semaphore::new(cpus),
         }
     }

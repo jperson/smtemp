@@ -216,7 +216,7 @@ message.
 |---|---|
 | **HELO/EHLO** | The argument must be a domain (letters, digits, `-`, `_`; 1–63-octet labels, ≤ 255 total) or an address literal, else `501 5.5.2`, refused *before* it is recorded, because it's copied into `Received:` (a bare CR there would inject a header). SPF is evaluated for the HELO identity under a per-IP DNS permit: Fail → `550`, anything else is just recorded. On a submission listener HELO SPF isn't evaluated (clients send from any network). The EHLO reply advertises `SIZE`, `STARTTLS` (plaintext only) and `AUTH` (submission listeners only, over TLS, when configured). |
 | **MAIL FROM** | Below the free-disk floor (`min-free-disk-bytes`, on the spool and maildir filesystems) → `452 4.3.1`, and no transaction starts. The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. A submission listener requires AUTH first (`530 5.7.0`). For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
-| **RCPT TO** | MAIL must come first, and at most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. Then the mailbox quota (the authority's `quota_bytes` for the routing mailbox, else `mailbox-quota-bytes`): the routing mailbox's stored bytes (`DeliverySink::usage`) must be under the quota, with room for any declared `SIZE=`, else `452 4.2.2` for that recipient only. |
+| **RCPT TO** | MAIL must come first. A connection that has had `max-refused-rcpt-per-session` refused recipients, or whose IP has had `max-refused-rcpt-per-ip` in the last 15 minutes, gets `421 4.7.0` and is closed (`Control::Close`), before the authority is asked; valid recipients get the same `421`, so probing learns nothing more. At most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. Then the mailbox quota (the authority's `quota_bytes` for the routing mailbox, else `mailbox-quota-bytes`): the routing mailbox's stored bytes (`DeliverySink::usage`) must be under the quota, with room for any declared `SIZE=`, else `452 4.2.2` for that recipient only. |
 | **DATA** | Needs a sender and at least one recipient. Bytes are counted against the transaction's limit; going over it gets `552` and `Discard`. |
 | **End of data** | See below. |
 
@@ -256,6 +256,13 @@ How the ordering is constrained:
   hashing the whole message, a public-key operation per signature), so only
   the key lookups run on the async workers (`dkim::fetch_keys`); the checks
   run on the blocking pool (`dkim::verify_with_keys`).
+- Refused recipients count against two budgets: the connection's (on the
+  session, not the transaction, so RSET doesn't reset it) and the source
+  IP's (a `FailureLimiter`, the same fixed window the AUTH failures use).
+  Only authority refusals and relay attempts count; deferrals (quota,
+  size, authority outage) don't. Closing with `421` is temporary: a real
+  MTA has already bounced the recipients that got `550`, and retries the
+  rest later.
 - The quota is soft: it is checked at RCPT, before the data, so a mailbox
   can exceed it by at most one message (whose size wasn't declared).
   Deferring a full mailbox's recipient with `452` does reveal that the
@@ -596,7 +603,7 @@ bound only protects library callers that use it.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 297 tests in four layers:
+- **Testing.** 301 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
@@ -628,7 +635,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | Gap | Impact | Plan |
 |---|---|---|
 | The mailbox quota is soft (one message over) and doesn't count mail still queued for the mailbox | A mailbox can exceed its quota by one message plus its queue backlog | §2.4.1 |
-| No session-wide limit on refused RCPTs (`RSET` resets the 100 cap) | Unlimited probing for which addresses exist; a privacy problem for disposable addresses | §2.4.2 |
+| The refused-recipient budget is per IP address (no IPv6 /64 aggregation), and a large provider's shared outbound IP can exhaust it with legitimate refusals | An IPv6 prober can rotate addresses; mail from a busy shared IP can be deferred for up to 15 minutes | §2.4.2, §6 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
 | The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.5 |
 

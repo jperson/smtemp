@@ -207,5 +207,6 @@ pub(crate) fn size_limit_session(dir: &std::path::Path) -> SessionConfig {
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
         storage: Arc::new(crate::quota::StorageLimits::unlimited()),
+        probing: Arc::new(crate::limit::ProbeLimits::default()),
     }
 }

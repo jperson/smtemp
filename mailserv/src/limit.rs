@@ -326,24 +326,80 @@ pub const AUTH_FAILURES_PER_IP: u32 = 10;
 /// The fixed window over which [`AUTH_FAILURES_PER_IP`] is counted.
 pub const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
-/// The most IPs [`AuthFailureLimiter`] tracks at once. Past it, expired
-/// entries are swept; if every entry is still live, a new IP is not
-/// tracked (its attempts are still bounded per session and by the
-/// verification concurrency cap).
-const AUTH_FAILURE_MAX_TRACKED: usize = 65_536;
+/// Refused recipients allowed per source IP within
+/// [`RCPT_REFUSAL_WINDOW`] (default for `max-refused-rcpt-per-ip`).
+pub const DEFAULT_REFUSED_RCPT_PER_IP: u32 = 100;
 
-/// Per-source-IP budget of failed AUTH attempts, so a password-guessing
-/// client can't reset its budget by reconnecting.
+/// Refused recipients allowed per connection before it is closed (default
+/// for `max-refused-rcpt-per-session`).
+pub const DEFAULT_REFUSED_RCPT_PER_SESSION: u32 = 20;
+
+/// The fixed window over which refused recipients per IP are counted.
+pub const RCPT_REFUSAL_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// The limits on refused recipients (address probing): a budget per
+/// connection and one per source IP, either of which can be off. Shared
+/// by every session.
+#[derive(Debug, Default)]
+pub struct ProbeLimits {
+    /// Refused recipients a connection may have before it is closed; `None`
+    /// for no limit.
+    pub per_session: Option<u32>,
+    /// Refused recipients per source IP per [`RCPT_REFUSAL_WINDOW`]; `None`
+    /// for no limit.
+    pub per_ip: Option<FailureLimiter>,
+}
+
+impl ProbeLimits {
+    /// Limits of `per_session` refusals per connection and `per_ip` per
+    /// source IP per [`RCPT_REFUSAL_WINDOW`]; 0 turns either off.
+    pub fn new(per_session: u32, per_ip: u32) -> Self {
+        ProbeLimits {
+            per_session: (per_session > 0).then_some(per_session),
+            per_ip: (per_ip > 0).then(|| FailureLimiter::new(per_ip, RCPT_REFUSAL_WINDOW)),
+        }
+    }
+
+    /// Returns why a connection from `ip` that has had `refused` refusals
+    /// must not try another recipient (`"session"` or `"ip"`), or `None`
+    /// when it may.
+    pub fn exhausted(&self, ip: IpAddr, refused: u32) -> Option<&'static str> {
+        if self.per_session.is_some_and(|limit| refused >= limit) {
+            return Some("session");
+        }
+        if self.per_ip.as_ref().is_some_and(|l| l.is_blocked(ip)) {
+            return Some("ip");
+        }
+        None
+    }
+
+    /// Count one refused recipient from `ip` against its per-IP budget.
+    pub fn record_refusal(&self, ip: IpAddr) {
+        if let Some(limiter) = &self.per_ip {
+            limiter.record_failure(ip);
+        }
+    }
+}
+
+/// The most IPs a [`FailureLimiter`] tracks at once. Past it, expired
+/// entries are swept; if every entry is still live, a new IP is not
+/// tracked (its attempts are still bounded per session).
+const FAILURE_MAX_TRACKED: usize = 65_536;
+
+/// A per-source-IP failure budget that survives reconnecting: failed AUTH
+/// attempts (password guessing) and refused recipients (address probing)
+/// each have one.
 ///
-/// A fixed window per IP: once an IP has [`AuthFailureLimiter::new`]'s
+/// A fixed window per IP: once an IP has [`FailureLimiter::new`]'s
 /// `max_failures` failures within the window, [`is_blocked`] is true until
-/// the window started by its first failure ends. Successful logins don't
-/// reset the count (a login an attacker owns must not buy more guesses at
-/// other accounts). Synchronous and cheap: one map lookup under a mutex.
+/// the window started by its first failure ends. Successes don't reset
+/// the count (a login an attacker owns, or an address that exists, must
+/// not buy more attempts). Synchronous and cheap: one map lookup under a
+/// mutex.
 ///
-/// [`is_blocked`]: AuthFailureLimiter::is_blocked
+/// [`is_blocked`]: FailureLimiter::is_blocked
 #[derive(Debug)]
-pub struct AuthFailureLimiter {
+pub struct FailureLimiter {
     /// Failures allowed per IP per window.
     max_failures: u32,
     /// Length of the fixed window.
@@ -352,11 +408,11 @@ pub struct AuthFailureLimiter {
     entries: std::sync::Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
-impl AuthFailureLimiter {
+impl FailureLimiter {
     /// A limiter allowing `max_failures` failed attempts per IP per
     /// `window`.
     pub fn new(max_failures: u32, window: Duration) -> Self {
-        AuthFailureLimiter {
+        FailureLimiter {
             max_failures,
             window,
             entries: std::sync::Mutex::new(HashMap::new()),
@@ -378,7 +434,7 @@ impl AuthFailureLimiter {
         self.is_blocked_at(ip, Instant::now())
     }
 
-    /// [`AuthFailureLimiter::is_blocked`] at time `now`.
+    /// [`FailureLimiter::is_blocked`] at time `now`.
     fn is_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
         self.lock().get(&ip).is_some_and(|&(start, count)| {
             now.duration_since(start) < self.window && count >= self.max_failures
@@ -390,13 +446,13 @@ impl AuthFailureLimiter {
         self.record_failure_at(ip, Instant::now());
     }
 
-    /// [`AuthFailureLimiter::record_failure`] at time `now`.
+    /// [`FailureLimiter::record_failure`] at time `now`.
     fn record_failure_at(&self, ip: IpAddr, now: Instant) {
         let mut entries = self.lock();
-        if !entries.contains_key(&ip) && entries.len() >= AUTH_FAILURE_MAX_TRACKED {
+        if !entries.contains_key(&ip) && entries.len() >= FAILURE_MAX_TRACKED {
             let window = self.window;
             entries.retain(|_, (start, _)| now.duration_since(*start) < window);
-            if entries.len() >= AUTH_FAILURE_MAX_TRACKED {
+            if entries.len() >= FAILURE_MAX_TRACKED {
                 return;
             }
         }
@@ -412,11 +468,32 @@ impl AuthFailureLimiter {
 mod tests {
     use super::*;
 
+    /// A session at its own limit is exhausted whatever its IP's count; an
+    /// IP over its budget is exhausted for every session; 0 disables each.
+    #[test]
+    fn probe_limits_per_session_and_per_ip() {
+        let (a, b): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        let limits = ProbeLimits::new(3, 5);
+        assert_eq!(limits.exhausted(a, 2), None);
+        assert_eq!(limits.exhausted(a, 3), Some("session"));
+        for _ in 0..5 {
+            limits.record_refusal(a);
+        }
+        assert_eq!(limits.exhausted(a, 0), Some("ip"), "a new session from a");
+        assert_eq!(limits.exhausted(b, 0), None);
+
+        let off = ProbeLimits::new(0, 0);
+        for _ in 0..1000 {
+            off.record_refusal(a);
+        }
+        assert_eq!(off.exhausted(a, 1000), None);
+    }
+
     /// An IP is blocked after its budget of failures, only for the rest of
     /// the window, and other IPs are unaffected.
     #[test]
     fn auth_failures_block_per_ip_for_the_window() {
-        let limiter = AuthFailureLimiter::new(3, Duration::from_secs(60));
+        let limiter = FailureLimiter::new(3, Duration::from_secs(60));
         let (a, b) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
         let t0 = Instant::now();
         for _ in 0..2 {

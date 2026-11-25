@@ -189,6 +189,12 @@ impl ListenerMode {
     }
 }
 
+/// `421` for a connection, or source IP, that has had too many recipients
+/// refused (address probing): the session ends and the sender retries
+/// later.
+pub(crate) const TOO_MANY_REFUSED: &[u8] =
+    b"421 4.7.0 Too many refused recipients, closing connection\r\n";
+
 /// `530`: a submission listener requires AUTH before MAIL FROM (RFC 4954
 /// §6).
 pub(crate) const AUTH_REQUIRED: &[u8] = b"530 5.7.0 Authentication required\r\n";
@@ -357,6 +363,13 @@ pub(crate) struct UserSession<'session> {
     /// The mailbox quota and free-disk floor.
     #[serde(skip_serializing)]
     storage: Arc<StorageLimits>,
+    /// The refused-recipient limits.
+    #[serde(skip_serializing)]
+    probing: Arc<limit::ProbeLimits>,
+    /// Recipients refused on this connection (unknown addresses and relay
+    /// attempts). Per connection, not per transaction: RSET doesn't reset
+    /// it.
+    refused_rcpts: u32,
 }
 
 impl<'session> UserSession<'session> {
@@ -399,6 +412,8 @@ impl<'session> UserSession<'session> {
             deadline: cfg.deadline,
             fast_path: Arc::clone(&cfg.fast_path),
             storage: Arc::clone(&cfg.storage),
+            probing: Arc::clone(&cfg.probing),
+            refused_rcpts: 0,
             txn: None,
         }
     }
@@ -426,6 +441,13 @@ impl<'session> UserSession<'session> {
             detail,
             "message refused: size limit"
         );
+    }
+
+    /// Count a refused recipient against this connection's and its source
+    /// IP's probing budgets.
+    fn count_refusal(&mut self) {
+        self.refused_rcpts = self.refused_rcpts.saturating_add(1);
+        self.probing.record_refusal(self.peer.ip());
     }
 
     /// Whether a watched filesystem is below the free-disk floor (logged
@@ -874,6 +896,19 @@ impl smtp::SmtpSession for UserSession<'_> {
         let Some(txn) = &self.txn else {
             return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
         };
+        // Address probing: a connection that has had too many refusals, or
+        // from an IP that has, ends here, before the authority is asked, so
+        // a prober learns nothing more. Every RCPT gets the same 421,
+        // valid recipients included.
+        if let Some(scope) = self.probing.exhausted(self.peer.ip(), self.refused_rcpts) {
+            warn!(
+                peer = %self.peer,
+                scope,
+                refused_rcpts = self.refused_rcpts,
+                "connection closed: too many refused recipients"
+            );
+            return smtp::Control::close(TOO_MANY_REFUSED);
+        }
         // RFC 5321 Section 4.5.3.1.8: at least 100 recipients.
         if txn.rcpt_to.len() >= MAX_RCPT {
             return smtp::Control::tempfail(b"452 4.5.3 Too many recipients\r\n");
@@ -994,10 +1029,12 @@ impl smtp::SmtpSession for UserSession<'_> {
                 smtp::Control::accept(UserSession::OK)
             }
             AuthorityAnswer::NotHosted => {
+                self.count_refusal();
                 info!(rcpt = %addr, domain = %domain, "relay access denied");
                 smtp::Control::reject(b"550 5.7.1 Relay access denied\r\n")
             }
             AuthorityAnswer::Refuse { mode, reason } => {
+                self.count_refusal();
                 // Structured refusal event (the ops-side mirror of the
                 // authority's event stream). One SMTP reply for every
                 // reason: distinguishing "expired" from "nonexistent"
@@ -1144,6 +1181,8 @@ pub(crate) struct SessionConfig {
     pub(crate) fast_path: Arc<tokio::sync::Semaphore>,
     /// The mailbox quota and free-disk floor.
     pub(crate) storage: Arc<StorageLimits>,
+    /// The refused-recipient limits (per connection and per source IP).
+    pub(crate) probing: Arc<limit::ProbeLimits>,
 }
 
 mod message;

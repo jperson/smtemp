@@ -110,7 +110,7 @@ the section given.
 | F6 | Duplicates when the cap fires after commit | Fixed (= M11) |
 | F7 | Accepted mail dead-lettered after ~5 minutes | Fixed (5-day retry with backoff) |
 | F8 | No storage bound; drain loaded every payload | Payload loading fixed; per-mailbox quotas and a free-disk floor added (2026-11-24) |
-| F9 | Unlimited recipient probing | Open (§2.4.2) |
+| F9 | Unlimited recipient probing | Fixed (2026-11-24): per-connection and per-IP refused-recipient limits; IPv6 /64 aggregation open (§6) |
 | F10 | AUTH hardening | Fixed; see M16 |
 | L1 | `create_owned_dir_all` `chown`s by path | Open (§2.4.5) |
 | L2 | `create_private_file` follows symlinks | Open, low (parent directories are private) |

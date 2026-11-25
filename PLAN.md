@@ -1,6 +1,6 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-24:** 297 tests pass (1 ignored) with no network beyond
+**As of 2026-11-24:** 301 tests pass (1 ignored) with no network beyond
 loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
@@ -24,7 +24,7 @@ optional. Send-side work is post-V1 (§6).
 | SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, and bounce alignment (§2.4 item 3) |
 | Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
 | Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: maildir fsync and `tmp/` debris (§2.4) |
-| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Open: recipient probing (§2.4) |
+| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Recipient probing limited per connection and per IP |
 | Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file reloaded on SIGHUP, attempt limits |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
 | S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§5) |
@@ -72,8 +72,12 @@ Fix these after the pilot starts and before GA, in this order:
    (`min-free-disk-bytes`, `452 4.3.1`). Open: count mail still queued for
    a mailbox, and a total cap per domain (today each mailbox is capped, not
    the tenant as a whole). `catch-all` can be offered.
-2. **Recipient probing:** close the session after N refused RCPTs, and keep
-   a refused-RCPT budget per IP (`RSET` resets today's 100-recipient cap).
+2. **Recipient probing.** Done: refused recipients close the connection
+   past `max-refused-rcpt-per-session` (20; RSET doesn't reset it) and are
+   budgeted per source IP across connections (`max-refused-rcpt-per-ip`,
+   100 per 15 minutes). Open: aggregate the per-IP budget per IPv6 /64
+   (§6, IPv6 readiness), and watch whether large providers' shared
+   outbound IPs need an allow-list.
 3. **SPF and DMARC correctness** (the first three reject legitimate mail):
    - stop charging the address lookups behind `mx` and `ptr` to SPF's
      10-term budget, but add RFC 7208 §4.6.4's 10-address cap per
@@ -109,7 +113,6 @@ One line per open item; DESIGN.md §13 has the impact of each.
 | Gap | DESIGN §13 area | Planned in |
 |---|---|---|
 | Quotas are soft and don't count queued mail; no per-domain total | Abuse resistance | §2.4.1 |
-| Unlimited recipient probing per session | Abuse resistance | §2.4.2 |
 | SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.3 |
 | Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.3 |
 | No SPF alignment for the null sender | Correctness and delivery | §2.4.3 |
@@ -197,6 +200,27 @@ addresses exist lives in the external console. Order: recipient authority
 **Sending and submission (post-V1, low priority):**
 - DKIM signing, and relaying submitted mail to other domains (today a
   submitted message can only go to hosted recipients).
+- **Outbound reputation** (design these in with sending, not after). Our
+  sending IPs and domains are scored by every receiver, and on shared IPs
+  one tenant's behaviour affects all of them:
+  - **Bounces:** suppress addresses that hard-bounced (`5xx`), so they
+    aren't sent to again; a high rate of sends to nonexistent addresses is
+    one of the strongest spam signals.
+  - **Complaints:** Gmail and Yahoo expect a spam-complaint rate under 0.3%
+    (ideally under 0.1%); process feedback loops where providers offer
+    them, and suppress complainers.
+  - **Authentication:** SPF and DKIM on every message, a DMARC record, and
+    alignment with the From domain (required for bulk senders since 2024).
+  - **Infrastructure:** reverse DNS (PTR) that matches the HELO name and
+    resolves back (forward-confirmed), TLS to every receiver that offers
+    it, and new IPs warmed up gradually.
+  - **Bulk mail:** one-click unsubscribe (`List-Unsubscribe` and
+    `List-Unsubscribe-Post`, RFC 8058).
+  - **Multi-tenant controls:** per-tenant sending limits, and possibly
+    separate IP pools for transactional and bulk mail, so one bad list
+    can't damage every customer's delivery.
+  - **Monitoring:** watch bounce and complaint rates per tenant, and the
+    providers' reputation tools (Google Postmaster Tools, Microsoft SNDS).
 - **Credential storage (decided):**
   - **Done:** a credentials file separate from the sender grants
     (`--auth-users-file`) holding argon2id hashes only, refused if other

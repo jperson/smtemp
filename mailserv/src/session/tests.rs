@@ -81,6 +81,7 @@ async fn per_ip_dns_limit_tempfails_each_stage() {
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
         storage: Arc::new(crate::quota::StorageLimits::unlimited()),
+        probing: Arc::new(crate::limit::ProbeLimits::default()),
     };
     let peer: SocketAddr = "192.0.2.7:40000".parse().unwrap();
     let mut session = UserSession::new(peer, false, &cfg);
@@ -247,6 +248,7 @@ async fn end_of_data_dns_deadline_tempfails() {
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
         storage: Arc::new(crate::quota::StorageLimits::unlimited()),
+        probing: Arc::new(crate::limit::ProbeLimits::default()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
 
@@ -318,6 +320,7 @@ async fn dkim_verdicts_do_not_leak_across_messages() {
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
         storage: Arc::new(crate::quota::StorageLimits::unlimited()),
+        probing: Arc::new(crate::limit::ProbeLimits::default()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
 
@@ -372,6 +375,7 @@ async fn dmarc_lookup_failure_defers_instead_of_delivering() {
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
         storage: Arc::new(crate::quota::StorageLimits::unlimited()),
+        probing: Arc::new(crate::limit::ProbeLimits::default()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
     session.begin("x@attacker.example");
@@ -786,4 +790,71 @@ async fn authority_quota_overrides_the_server_default() {
         session.rcpt_to("<std@q.example>").await,
         smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
     );
+}
+
+/// Address probing, per connection: each refusal up to the limit gets its
+/// `550`, then the next RCPT (even a valid one) gets `421` and closes the
+/// connection. RSET doesn't reset the count, and relay attempts count too.
+#[tokio::test]
+async fn refused_recipients_close_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        probing: Arc::new(crate::limit::ProbeLimits::new(3, 0)),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@sender.example");
+    for rcpt in ["<nobody@small.example>", "<ghost@small.example>"] {
+        assert_eq!(
+            session.rcpt_to(rcpt).await,
+            smtp::Control::reject(b"550 5.1.1 No such mailbox\r\n".to_vec())
+        );
+    }
+    assert!(
+        session.rcpt_to("<a@small.example>").await.is_accept(),
+        "not a refusal"
+    );
+
+    // RSET keeps the count; a relay attempt is the third refusal.
+    session.clear_envelope();
+    session.begin("x@sender.example");
+    assert_eq!(
+        session.rcpt_to("<victim@elsewhere.example>").await,
+        smtp::Control::reject(b"550 5.7.1 Relay access denied\r\n".to_vec())
+    );
+    assert_eq!(
+        session.rcpt_to("<b@small.example>").await,
+        smtp::Control::close(TOO_MANY_REFUSED),
+        "a valid recipient gets the same 421"
+    );
+}
+
+/// Address probing, per source IP: refusals count across connections, so
+/// reconnecting doesn't reset them; another IP is unaffected.
+#[tokio::test]
+async fn refused_recipients_are_limited_per_ip() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        probing: Arc::new(crate::limit::ProbeLimits::new(0, 2)),
+        ..size_limit_session(dir.path())
+    };
+    let mut first = UserSession::new("192.0.2.5:40000".parse().unwrap(), false, &cfg);
+    first.begin("x@sender.example");
+    for rcpt in ["<nobody@small.example>", "<ghost@small.example>"] {
+        assert!(matches!(
+            first.rcpt_to(rcpt).await,
+            smtp::Control::Reject(_)
+        ));
+    }
+
+    let mut again = UserSession::new("192.0.2.5:40001".parse().unwrap(), false, &cfg);
+    again.begin("x@sender.example");
+    assert_eq!(
+        again.rcpt_to("<a@small.example>").await,
+        smtp::Control::close(TOO_MANY_REFUSED)
+    );
+
+    let mut other = UserSession::new("192.0.2.6:40000".parse().unwrap(), false, &cfg);
+    other.begin("x@sender.example");
+    assert!(other.rcpt_to("<a@small.example>").await.is_accept());
 }

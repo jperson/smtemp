@@ -77,6 +77,7 @@ async fn spawn_server_in(
         sink,
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(crate::quota::StorageLimits::unlimited()),
     };
     spawn_server_with(mode, acceptor, cfg).await
 }

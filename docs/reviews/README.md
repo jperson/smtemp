@@ -51,7 +51,7 @@ the section given.
 | M7 | No `Authentication-Results:` | Open (§2.4.4) |
 | M8 | HELO/MAIL FROM text copied into trace headers | Fixed |
 | M9 | Catch-all copies collapse | Fixed (2026-11-23): one file per envelope address |
-| M10 | State-machine sequencing | Partly fixed; pre-EHLO `503`, EHLO reset, long AUTH PLAIN open (§2.4.5) |
+| M10 | State-machine sequencing | Partly fixed (EHLO now resets the transaction); pre-EHLO `503` and long AUTH PLAIN open (§2.4.5) |
 | M11 | Connection cap can fire after the spool commit (duplicates) | Fixed (2026-11-23): the deadline is enforced between reads, and the fast path runs after the reply |
 | M12 | Per-IP connection count released by hand | Open (§2.4.5) |
 | M13 | Drain loaded every queued payload each pass | Fixed |
@@ -80,7 +80,7 @@ the section given.
 | N7 | Documentation accuracy | Fixed |
 | N8 | Bare CR hid a header from the `From:` scanner | Fixed (`550 5.6.0`) |
 | N9 | Display-name spoofing | Open (§2.4.4) |
-| N10 | No storage quotas | Open (§2.4.1) |
+| N10 | No storage quotas | Fixed (2026-11-24): per-mailbox quotas (authority file, server default) and a free-disk floor; per-domain totals and queued mail open (§2.4.1) |
 | N11 | DKIM gave no result when `mailparse` rejected the message | Fixed (raw view) |
 | N12 | SPF macro expander lenient on malformed input | Fixed (malformed macros are PermError) |
 | N13 | A deadline threw away a warm DNS connection | Fixed (pipelining) |
@@ -109,7 +109,7 @@ the section given.
 | F5 | DKIM: short RSA keys, `l=`, From not required in `h=` | Fixed |
 | F6 | Duplicates when the cap fires after commit | Fixed (= M11) |
 | F7 | Accepted mail dead-lettered after ~5 minutes | Fixed (5-day retry with backoff) |
-| F8 | No storage bound; drain loaded every payload | Payload loading fixed; quotas open (§2.4.1) |
+| F8 | No storage bound; drain loaded every payload | Payload loading fixed; per-mailbox quotas and a free-disk floor added (2026-11-24) |
 | F9 | Unlimited recipient probing | Open (§2.4.2) |
 | F10 | AUTH hardening | Fixed; see M16 |
 | L1 | `create_owned_dir_all` `chown`s by path | Open (§2.4.5) |
@@ -120,7 +120,7 @@ the section given.
 | L6 | No `Authentication-Results:` | Open (= M7) |
 | L7 | RCPT success cache outlives a revocation for the session | Accepted (bounded by the 5-minute cap) |
 | L8 | No SPF alignment for the null sender | Open (= N16) |
-| L9 | EHLO doesn't reset the envelope; pre-EHLO `500` | Open (= M10) |
+| L9 | EHLO doesn't reset the envelope; pre-EHLO `500` | EHLO reset fixed (2026-11-24); pre-EHLO `500` open (= M10) |
 
 ### DEPLOYMENT.md (D1–D7, in git history)
 

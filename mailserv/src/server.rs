@@ -18,7 +18,7 @@ use crate::authority::RecipientResolver as _;
 use crate::config::Config;
 use crate::session::{ListenerMode, SessionConfig, UserSession, END_OF_DATA_DNS_DEADLINE};
 use crate::tls::{build_tls_acceptor, load_resolver_ca, tls_handshake};
-use crate::{auth, authority, delivery, fsutil, limit, privdrop, spool};
+use crate::{auth, authority, delivery, fsutil, limit, privdrop, quota, spool};
 use smtp::SmtpSession as _;
 
 /// How long past its `max-conn-duration-ms` deadline a connection task
@@ -374,6 +374,22 @@ pub(crate) async fn run(config: Config) -> Result<()> {
     // socket is simply closed.
     let refuse_capacity = Arc::new(tokio::sync::Semaphore::new(32));
     let fast_path = Arc::new(tokio::sync::Semaphore::new(MAX_FAST_PATH_DELIVERIES));
+    let storage = Arc::new(quota::StorageLimits {
+        mailbox_quota: config.mailbox_quota_bytes,
+        min_free_disk: config.min_free_disk_bytes,
+        watched: vec![
+            std::path::PathBuf::from(&config.spool_dir),
+            std::path::PathBuf::from(&config.maildir_dir),
+        ],
+    });
+    if let Some((dir, free)) = storage.low_disk() {
+        warn!(
+            dir = %dir.display(),
+            free_bytes = free,
+            min_free_disk_bytes = config.min_free_disk_bytes,
+            "starting below the free-disk floor: new mail is deferred until space is freed"
+        );
+    }
 
     info!(
         host = %config.host,
@@ -385,6 +401,8 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         spool_dir = %config.spool_dir,
         max_connections = config.max_connections,
         max_conn_per_ip = config.max_conn_per_ip,
+        mailbox_quota_bytes = ?config.mailbox_quota_bytes,
+        min_free_disk_bytes = ?config.min_free_disk_bytes,
         max_conn_rate_per_ip = config.max_conn_rate_per_ip,
         "listening"
     );
@@ -466,6 +484,7 @@ pub(crate) async fn run(config: Config) -> Result<()> {
             sink: Some(sink.clone()),
             deadline: Some(deadline),
             fast_path: Arc::clone(&fast_path),
+            storage: Arc::clone(&storage),
         };
 
         tokio::spawn(async move {

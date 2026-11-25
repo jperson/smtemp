@@ -19,6 +19,7 @@ use crate::authority::{self, Resolution};
 use crate::headers::{
     from_authors, from_header_domain, header_has_bare_cr, single_from_value, FromHeader,
 };
+use crate::quota::{StorageLimits, INSUFFICIENT_STORAGE, MAILBOX_FULL};
 use crate::verdict::{DkimSummary, DmarcSummary};
 use crate::{auth, delivery, limit, spool};
 use smtp::SmtpSession;
@@ -192,6 +193,73 @@ impl ListenerMode {
 /// §6).
 pub(crate) const AUTH_REQUIRED: &[u8] = b"530 5.7.0 Authentication required\r\n";
 
+/// One mail transaction (RFC 5321 §3.3): created when MAIL FROM is
+/// accepted, dropped at end of data, RSET (including the reset after an
+/// aborted transfer), a new HELO/EHLO, or STARTTLS. Owning a message's
+/// state in one value means ending the transaction is dropping it: no
+/// field can be forgotten and carried into the next message.
+#[derive(Serialize)]
+pub(crate) struct Transaction {
+    /// The envelope sender (brackets removed; `""` for the null sender).
+    mail_from: String,
+    /// The size the client declared with `MAIL FROM ... SIZE=` (RFC 1870),
+    /// checked against each recipient's limit at RCPT time.
+    #[serde(skip)]
+    declared_size: Option<u64>,
+    /// SPF verdict for the MAIL FROM identity; `None` for authenticated
+    /// sessions (SPF skipped).
+    spf_result: Option<SpfResult>,
+    /// Accepted recipients with their authority-resolved routing.
+    rcpt_to: Vec<spool::SpoolRcpt>,
+    /// The size limit: the server's, lowered to the accepted recipients'
+    /// domain limit (`max-message-bytes`) when their domain set one. Every
+    /// recipient shares it (see `rcpt_to`).
+    #[serde(skip)]
+    limit: usize,
+    /// The message so far, raw bytes exactly as received (only while
+    /// within `limit`).
+    #[serde(skip)]
+    data: Vec<u8>,
+    /// Bytes of message data received, including any past `limit`.
+    #[serde(skip)]
+    received: usize,
+}
+
+impl Transaction {
+    /// A transaction for the accepted envelope sender `mail_from`, with
+    /// the declared size `declared_size`, the sender's SPF verdict
+    /// `spf_result`, and the server's size limit `limit`.
+    fn new(
+        mail_from: String,
+        declared_size: Option<u64>,
+        spf_result: Option<SpfResult>,
+        limit: usize,
+    ) -> Self {
+        Transaction {
+            mail_from,
+            declared_size,
+            spf_result,
+            rcpt_to: Vec::new(),
+            limit,
+            data: Vec::new(),
+            received: 0,
+        }
+    }
+
+    /// Returns the domains of the accepted recipients, lowercased, sorted
+    /// and deduplicated, for logs.
+    fn rcpt_domains(&self) -> Vec<String> {
+        let mut domains: Vec<String> = self
+            .rcpt_to
+            .iter()
+            .filter_map(|r| path_domain(&r.address).map(str::to_ascii_lowercase))
+            .collect();
+        domains.sort();
+        domains.dedup();
+        domains
+    }
+}
+
 /// The state of one SMTP connection: the [`smtp::SmtpSession`]
 /// implementation that applies this server's policy (HELO and MAIL FROM
 /// SPF, recipient authority, size limits, AUTH, end-of-data DKIM/DMARC,
@@ -204,21 +272,13 @@ pub(crate) struct UserSession<'session> {
     #[serde(skip_serializing)]
     pub max_data: usize,
 
-    /// Bytes of message data received so far in this transaction.
-    #[serde(skip_serializing)]
-    pub total_data: usize,
-
-    /// This transaction's size limit: `max_data`, lowered to the
-    /// accepted recipients' domain limit (`max-message-bytes`) when their
-    /// domain set one. Every recipient in one transaction shares the same
-    /// limit (see `rcpt_to`).
-    #[serde(skip_serializing)]
-    txn_limit: usize,
-
-    /// The size the client declared with `MAIL FROM ... SIZE=` (RFC 1870),
-    /// checked against each recipient's limit at RCPT time.
-    #[serde(skip_serializing)]
-    declared_size: Option<u64>,
+    /// The mail transaction in progress, from an accepted MAIL FROM to end
+    /// of data or RSET; `None` between transactions. Everything that
+    /// belongs to one message lives in it, so nothing outlives the message.
+    /// Logged with the session (flattened) when the connection ends
+    /// mid-transaction.
+    #[serde(flatten)]
+    txn: Option<Transaction>,
 
     /// Unique ID of this connection, for log correlation.
     pub session_id: Uuid,
@@ -237,17 +297,6 @@ pub(crate) struct UserSession<'session> {
 
     /// The accepted HELO/EHLO identity.
     helo: Option<String>,
-    /// The accepted envelope sender (brackets removed; `""` for the null
-    /// sender); `None` outside a transaction.
-    mail_from: Option<String>,
-    /// Accepted recipients with their authority-resolved routing.
-    rcpt_to: Vec<spool::SpoolRcpt>,
-    /// Partial message body, raw bytes exactly as received.
-    #[serde(skip_serializing)]
-    data: Vec<u8>,
-    /// SPF verdict for the MAIL FROM identity; `None` before MAIL FROM and
-    /// for authenticated sessions (SPF skipped).
-    spf_result: Option<SpfResult>,
     /// SPF verdict for the HELO/EHLO identity; `None` before HELO and for
     /// address-literal HELOs.
     spf_helo: Option<SpfResult>,
@@ -305,6 +354,9 @@ pub(crate) struct UserSession<'session> {
     /// Server-wide bound on fast-path deliveries in flight.
     #[serde(skip_serializing)]
     fast_path: Arc<tokio::sync::Semaphore>,
+    /// The mailbox quota and free-disk floor.
+    #[serde(skip_serializing)]
+    storage: Arc<StorageLimits>,
 }
 
 impl<'session> UserSession<'session> {
@@ -318,9 +370,6 @@ impl<'session> UserSession<'session> {
     ) -> Self {
         UserSession {
             max_data: cfg.max_data,
-            total_data: 0,
-            txn_limit: cfg.max_data,
-            declared_size: None,
             session_id: Uuid::new_v4(),
 
             domain: &cfg.domain,
@@ -329,10 +378,6 @@ impl<'session> UserSession<'session> {
             peer,
 
             helo: None,
-            mail_from: None,
-            rcpt_to: Vec::new(),
-            data: Vec::new(),
-            spf_result: None,
             spf_helo: None,
             dkim: Vec::new(),
             message_count: 0,
@@ -353,34 +398,16 @@ impl<'session> UserSession<'session> {
             shutdown: cfg.shutdown.clone(),
             deadline: cfg.deadline,
             fast_path: Arc::clone(&cfg.fast_path),
+            storage: Arc::clone(&cfg.storage),
+            txn: None,
         }
     }
 
-    /// Abandon the current transaction: clear the envelope, the MAIL FROM
-    /// SPF verdict, the size state, and any partial message data.
+    /// Abandon the transaction in progress, if any, dropping its envelope,
+    /// verdicts and buffered data (the allocation too: an aborted 10 MiB
+    /// transfer must not keep its memory for the rest of the session).
     fn clear_envelope(&mut self) {
-        self.mail_from = None;
-        self.rcpt_to.clear();
-        // Release the buffer, not just its contents: an aborted 10 MiB
-        // transfer must not keep its allocation for the rest of the session.
-        self.data = Vec::new();
-        self.total_data = 0;
-        self.txn_limit = self.max_data;
-        self.declared_size = None;
-        self.spf_result = None;
-    }
-
-    /// Returns the domains of this transaction's accepted recipients,
-    /// lowercased, sorted and deduplicated, for logs.
-    fn rcpt_domains(&self) -> Vec<String> {
-        let mut domains: Vec<String> = self
-            .rcpt_to
-            .iter()
-            .filter_map(|r| path_domain(&r.address).map(str::to_ascii_lowercase))
-            .collect();
-        domains.sort();
-        domains.dedup();
-        domains
+        self.txn = None;
     }
 
     /// Log a message refused for its size (`stage`: mail_from, rcpt_to,
@@ -393,12 +420,80 @@ impl<'session> UserSession<'session> {
             size,
             limit,
             server_limit = self.max_data,
-            mail_from = ?self.mail_from,
-            recipients = self.rcpt_to.len(),
-            rcpt_domains = ?self.rcpt_domains(),
+            mail_from = ?self.txn.as_ref().map(|t| &t.mail_from),
+            recipients = self.txn.as_ref().map_or(0, |t| t.rcpt_to.len()),
+            rcpt_domains = ?self.txn.as_ref().map(Transaction::rcpt_domains),
             detail,
             "message refused: size limit"
         );
+    }
+
+    /// Whether a watched filesystem is below the free-disk floor (logged
+    /// at `warn` when it is).
+    fn storage_is_low(&self) -> bool {
+        match self.storage.low_disk() {
+            Some((dir, free)) => {
+                warn!(
+                    dir = %dir.display(),
+                    free_bytes = free,
+                    min_free_disk_bytes = self.storage.min_free_disk,
+                    "storage low; deferring new mail"
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Apply the mailbox quota to the recipient `address`, routed to
+    /// `mailbox`, whose authority set the quota `authority_quota` (see
+    /// [`StorageLimits::quota_for`]): its stored bytes
+    /// ([`delivery::DeliverySink::usage`], on the blocking pool) plus any
+    /// size declared at MAIL FROM must fit.
+    ///
+    /// Returns `None` when the recipient may be accepted (or there is no
+    /// quota or sink), `452 4.2.2` when the mailbox is full, and `451` when
+    /// its usage can't be measured (fail closed: the sender retries).
+    async fn check_mailbox_quota(
+        &self,
+        address: &str,
+        mailbox: &str,
+        authority_quota: Option<u64>,
+    ) -> Option<smtp::Control> {
+        let (Some(quota), Some(sink)) =
+            (self.storage.quota_for(authority_quota), self.sink.clone())
+        else {
+            return None;
+        };
+        let incoming = self.txn.as_ref().and_then(|t| t.declared_size).unwrap_or(0);
+        let lookup = mailbox.to_string();
+        let usage = tokio::task::spawn_blocking(move || sink.usage(&lookup)).await;
+        match usage {
+            Ok(Ok(usage)) if crate::quota::has_room(quota, usage, incoming) => None,
+            Ok(Ok(usage)) => {
+                info!(
+                    rcpt = %address,
+                    mailbox = %mailbox,
+                    usage_bytes = usage,
+                    declared_bytes = incoming,
+                    quota_bytes = quota,
+                    "recipient deferred: mailbox over quota"
+                );
+                Some(smtp::Control::tempfail(MAILBOX_FULL))
+            }
+            Ok(Err(e)) => {
+                warn!(rcpt = %address, mailbox = %mailbox, error = %format!("{e:#}"), "mailbox usage unavailable; refusing temporarily");
+                Some(smtp::Control::tempfail(
+                    b"451 4.3.0 Mailbox check failed, try again later\r\n",
+                ))
+            }
+            Err(e) => {
+                warn!(rcpt = %address, error = %e, "mailbox usage task panicked; refusing temporarily");
+                Some(smtp::Control::tempfail(
+                    b"451 4.3.0 Mailbox check failed, try again later\r\n",
+                ))
+            }
+        }
     }
 
     /// Check `user`/`pass` against `auth` (an argon2id check on the
@@ -502,6 +597,9 @@ impl smtp::SmtpSession for UserSession<'_> {
         if self.spf_helo == Some(SpfResult::Fail) {
             return smtp::Control::reject(SPF_FAILED);
         }
+        // RFC 5321 §4.1.4: an accepted HELO/EHLO resets the session as RSET
+        // does, so a transaction in progress ends here.
+        self.clear_envelope();
 
         if !ehlo {
             // HELO: single-line reply (RFC 5321 Section 4.1.1.1).
@@ -645,12 +743,18 @@ impl smtp::SmtpSession for UserSession<'_> {
 
     #[instrument(skip(self, path), fields(session = self.session_id.to_string(), peer = self.peer.to_string()))]
     async fn mail_from(&mut self, path: &str) -> smtp::Control {
-        if self.mail_from.is_some() {
+        if self.txn.is_some() {
             return smtp::Control::reject(UserSession::MULTI_MAIL);
         }
         // Submission is for authenticated users only (RFC 6409 §4.3).
         if self.mode.is_submission() && self.authenticated.is_none() {
             return smtp::Control::reject(AUTH_REQUIRED);
+        }
+
+        // No new transaction while storage is low: the sender retries, and
+        // mail already accepted keeps the remaining space for delivery.
+        if self.storage_is_low() {
+            return smtp::Control::tempfail(INSUFFICIENT_STORAGE);
         }
 
         let Some((addr, params)) = clean_path(path) else {
@@ -705,14 +809,12 @@ impl smtp::SmtpSession for UserSession<'_> {
                 );
                 return smtp::Control::reject(SENDER_NOT_OWNED);
             }
-            self.spf_result = None;
             info!(
                 auth_user = self.authenticated.as_deref().unwrap_or("?"),
                 mail_from = %addr,
                 "authenticated mail from (spf skipped)"
             );
-            self.mail_from = Some(addr);
-            self.declared_size = declared_size;
+            self.txn = Some(Transaction::new(addr, declared_size, None, self.max_data));
             return smtp::Control::accept(UserSession::OK);
         }
 
@@ -749,15 +851,18 @@ impl smtp::SmtpSession for UserSession<'_> {
             None => SpfResult::None,
         };
 
-        self.spf_result = Some(result.clone());
         info!(spf_result = ?result, mail_from = %addr, "mail from identity spf");
 
         let control = mail_from_reply(&result);
-        // The envelope sender is recorded only when accepted, so a
-        // rejected MAIL FROM can be retried.
+        // The transaction starts only when MAIL FROM is accepted, so a
+        // rejected one can be retried.
         if control.is_accept() {
-            self.mail_from = Some(addr);
-            self.declared_size = declared_size;
+            self.txn = Some(Transaction::new(
+                addr,
+                declared_size,
+                Some(result),
+                self.max_data,
+            ));
         }
         control
     }
@@ -766,11 +871,11 @@ impl smtp::SmtpSession for UserSession<'_> {
     async fn rcpt_to(&mut self, path: &str) -> smtp::Control {
         // The envelope sender must come first (RFC 5321 Section 3.3: the
         // transaction is MAIL, then RCPT, then DATA).
-        if self.mail_from.is_none() {
+        let Some(txn) = &self.txn else {
             return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
-        }
+        };
         // RFC 5321 Section 4.5.3.1.8: at least 100 recipients.
-        if self.rcpt_to.len() >= MAX_RCPT {
+        if txn.rcpt_to.len() >= MAX_RCPT {
             return smtp::Control::tempfail(b"452 4.5.3 Too many recipients\r\n");
         }
 
@@ -839,7 +944,10 @@ impl smtp::SmtpSession for UserSession<'_> {
                 // RFC 1870 §6.1: a declared SIZE over this recipient's
                 // limit is refused here, before any data is sent; the
                 // sender's MTA bounces (we never self-bounce).
-                if let Some(size) = self.declared_size.filter(|&s| s > limit as u64) {
+                let Some(txn) = &self.txn else {
+                    return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
+                };
+                if let Some(size) = txn.declared_size.filter(|&s| s > limit as u64) {
                     self.log_size_refusal(
                         "rcpt_to",
                         Some(size),
@@ -855,19 +963,28 @@ impl smtp::SmtpSession for UserSession<'_> {
                 // a separate transaction (RFC 5321 §4.5.3.1.10), so one
                 // tenant's lower limit can never cause mail to another
                 // tenant to be refused.
-                if !self.rcpt_to.is_empty() && limit != self.txn_limit {
+                if !txn.rcpt_to.is_empty() && limit != txn.limit {
                     info!(
                         rcpt = %addr,
                         limit,
-                        transaction_limit = self.txn_limit,
+                        transaction_limit = txn.limit,
                         "recipient deferred: different message size limit"
                     );
                     return smtp::Control::tempfail(
                         b"452 4.5.3 Recipient has a different size limit; send it in a separate transaction\r\n",
                     );
                 }
-                self.txn_limit = limit;
-                self.rcpt_to.push(spool::SpoolRcpt {
+                if let Some(reply) = self
+                    .check_mailbox_quota(&addr, &recipient.mailbox, recipient.quota_bytes)
+                    .await
+                {
+                    return reply;
+                }
+                let Some(txn) = self.txn.as_mut() else {
+                    return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
+                };
+                txn.limit = limit;
+                txn.rcpt_to.push(spool::SpoolRcpt {
                     address: addr,
                     mailbox: recipient.mailbox,
                     user: recipient.user,
@@ -888,7 +1005,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                 // existed; the reason lives here and in the authority.
                 info!(
                     peer = %self.peer,
-                    mail_from = ?self.mail_from,
+                    mail_from = ?self.txn.as_ref().map(|t| &t.mail_from),
                     rcpt = %addr,
                     domain = %domain,
                     mode = ?mode,
@@ -915,15 +1032,12 @@ impl smtp::SmtpSession for UserSession<'_> {
     async fn start_data(&mut self) -> smtp::Control {
         // RFC 5321 Section 3.3: DATA with no valid recipients is refused;
         // the session stays in Ready.
-        if self.rcpt_to.is_empty() {
-            return smtp::Control::reject(NO_RECIPIENTS);
+        // Without a transaction (no MAIL, or a rejected one) there are no
+        // recipients either.
+        match &self.txn {
+            Some(txn) if !txn.rcpt_to.is_empty() => smtp::Control::accept(UserSession::SEND_DATA),
+            _ => smtp::Control::reject(NO_RECIPIENTS),
         }
-        // The transaction must have a sender: the same RCPT-without-MAIL
-        // hole applies to DATA via a rejected MAIL.
-        if self.mail_from.is_none() {
-            return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
-        }
-        smtp::Control::accept(UserSession::SEND_DATA)
     }
 
     // TRACE, not the INFO default: this runs once per line of message
@@ -935,19 +1049,24 @@ impl smtp::SmtpSession for UserSession<'_> {
     async fn recv_data(&mut self, line: &[u8]) -> smtp::DataControl {
         // Enforce the transaction's size limit (the server's, or the
         // recipients' domain limit if lower) across the whole message.
-        self.total_data += line.len();
-        if self.total_data > self.txn_limit {
+        // DATA is only accepted inside a transaction (`start_data`).
+        let Some(txn) = self.txn.as_mut() else {
+            return smtp::DataControl::Abort(NO_RECIPIENTS.to_vec());
+        };
+        txn.received += line.len();
+        if txn.received > txn.limit {
+            let (received, limit) = (txn.received, txn.limit);
             // The state machine replies 552 once and discards the rest of
             // the transfer; the terminator then resets the transaction.
             self.log_size_refusal(
                 "data",
-                Some(self.total_data as u64),
-                self.txn_limit,
+                Some(received as u64),
+                limit,
                 "message data over the size limit; rest of the transfer discarded",
             );
             return smtp::DataControl::Abort(MESSAGE_TOO_BIG.to_vec());
         }
-        self.data.extend_from_slice(line);
+        txn.data.extend_from_slice(line);
         smtp::DataControl::Continue
     }
 
@@ -955,7 +1074,7 @@ impl smtp::SmtpSession for UserSession<'_> {
         // Logged like an oversized message.
         self.log_size_refusal(
             "data_line",
-            Some(self.total_data as u64),
+            self.txn.as_ref().map(|t| t.received as u64),
             Self::MAX_DATA_LINE,
             "a message line exceeded the line-length limit; rest of the transfer discarded",
         );
@@ -1023,6 +1142,8 @@ pub(crate) struct SessionConfig {
     /// sent, server-wide. When none is free the fast path is skipped and
     /// the drain delivers the message.
     pub(crate) fast_path: Arc<tokio::sync::Semaphore>,
+    /// The mailbox quota and free-disk floor.
+    pub(crate) storage: Arc<StorageLimits>,
 }
 
 mod message;

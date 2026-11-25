@@ -1635,39 +1635,88 @@ pub const MAX_SIGNATURES: usize = 5;
 /// memory one signature can ask for.
 pub const MAX_SIGNED_HEADERS: usize = 256;
 
-/// Verify every DKIM signature on the raw message `raw`: parse, check
-/// body hashes, fetch each signer's public key through `resolver`, and
-/// cryptographically verify the signed header data. At most
+/// Verify every DKIM signature on the raw message `raw`: fetch each
+/// signer's public key through `resolver` ([`fetch_keys`]), then check the
+/// body hashes and cryptographically verify the signed header data
+/// ([`verify_with_keys`], at the current time). At most
 /// [`MAX_SIGNATURES`] signatures (the topmost) are evaluated.
+///
+/// The verification step is CPU work (canonicalization, hashing, a public
+/// key operation per signature); a server should call the two halves
+/// itself and run [`verify_with_keys`] off its async workers.
 ///
 /// Returns one result per evaluated signature (a failed key lookup is
 /// recorded as that result's error); an empty result means the message
 /// had no parseable DKIM signature or could not be split into headers
 /// and body.
 pub async fn verify_dkim<'m>(raw: &'m [u8], resolver: &DnsClient) -> Vec<DkimResult<'m>> {
+    let keys = fetch_keys(raw, resolver).await;
+    verify_with_keys(raw, &keys, unix_now())
+}
+
+/// The public-key lookup for each signature [`verify_with_keys`] will
+/// evaluate, in the same order: the key record, or why it couldn't be
+/// fetched.
+pub type KeyLookups = Vec<Result<DkimKeyRecord, DkimError>>;
+
+/// The DNS half of verification: find the signatures on the raw message
+/// `raw` (the topmost [`MAX_SIGNATURES`]) and fetch each signer's public
+/// key through `resolver`. No canonicalization or cryptography happens
+/// here.
+///
+/// Returns one lookup per signature, in order (empty when the message has
+/// no parseable signature or can't be split into headers and body); pass
+/// it, with the same `raw`, to [`verify_with_keys`].
+pub async fn fetch_keys(raw: &[u8], resolver: &DnsClient) -> KeyLookups {
     let Ok(msg) = parse_raw_message(raw) else {
         return Vec::new();
     };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut results = Vec::new();
+    let mut keys = Vec::new();
     for parsed in find_signatures(&msg).into_iter().take(MAX_SIGNATURES) {
-        let result = match fetch_public_key(resolver, &parsed.signature).await {
-            Ok(key) => verify_with_key(&msg, &parsed, &key, now),
+        keys.push(fetch_public_key(resolver, &parsed.signature).await);
+    }
+    keys
+}
+
+/// The CPU half of verification, with no I/O: check each signature on the
+/// raw message `raw` against its key from `keys` (from [`fetch_keys`] on
+/// the same `raw`) at time `now` (Unix seconds; see [`verify_with_key`]).
+/// A signature whose lookup failed gets that error and no signature check;
+/// its body hash is still checked.
+///
+/// Returns one result per signature that has a lookup, in order.
+pub fn verify_with_keys<'m>(
+    raw: &'m [u8],
+    keys: &[Result<DkimKeyRecord, DkimError>],
+    now: u64,
+) -> Vec<DkimResult<'m>> {
+    let Ok(msg) = parse_raw_message(raw) else {
+        return Vec::new();
+    };
+    // The same parse and the same selection as `fetch_keys`, so the
+    // signatures pair up with their lookups.
+    find_signatures(&msg)
+        .into_iter()
+        .take(MAX_SIGNATURES)
+        .zip(keys)
+        .map(|(parsed, key)| match key {
+            Ok(key) => verify_with_key(&msg, &parsed, key, now),
             Err(e) => DkimResult {
                 body_hash_ok: body_hash_matches(&msg, &parsed.signature).unwrap_or(false),
                 signature: parsed.signature.clone(),
                 signature_ok: false,
-                error: Some(e),
+                error: Some(e.clone()),
             },
-        };
-        results.push(result);
-    }
-    results
+        })
+        .collect()
+}
+
+/// Returns the current time in Unix seconds (0 if the clock is before
+/// 1970).
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Verifier policy: weak keys, partial-body `l=`, and signatures that don't
@@ -1709,6 +1758,38 @@ mod verifier_policy_tests {
     }
 
     const SIGNED: &str = "DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=victim.example; s=s; h=From:Subject; bh=BH; b=SIG\r\nFrom: ceo@victim.example\r\nSubject: hi\r\n\r\nhello\r\n";
+
+    /// `verify_with_keys` pairs each signature with its lookup from
+    /// `fetch_keys` order: a fetched key verifies, a failed lookup records
+    /// its error (with the body hash still checked), and a missing lookup
+    /// means no result.
+    #[test]
+    fn verify_with_keys_pairs_signatures_with_lookups() {
+        let (msg, key) = rsa_signed(SIGNED, 1024);
+        let ok = verify_with_keys(&msg, &[Ok(key)], 0);
+        assert_eq!(ok.len(), 1);
+        assert!(
+            ok[0].signature_ok && ok[0].body_hash_ok,
+            "{:?}",
+            ok[0].error
+        );
+
+        let failed = verify_with_keys(
+            &msg,
+            &[Err(DkimError::NoKeyRecord(
+                "s._domainkey.victim.example".into(),
+            ))],
+            0,
+        );
+        assert!(!failed[0].signature_ok);
+        assert!(failed[0].body_hash_ok, "the body hash is still checked");
+        assert_eq!(
+            failed[0].error,
+            Some(DkimError::NoKeyRecord("s._domainkey.victim.example".into()))
+        );
+
+        assert!(verify_with_keys(&msg, &[], 0).is_empty());
+    }
 
     /// RFC 8301: a 512-bit key never verifies; 1024 bits does.
     #[test]

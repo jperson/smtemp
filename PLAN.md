@@ -1,6 +1,6 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-23:** 284 tests pass (1 ignored) with no network beyond
+**As of 2026-11-24:** 297 tests pass (1 ignored) with no network beyond
 loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
@@ -24,7 +24,7 @@ optional. Send-side work is post-V1 (§6).
 | SPF, DKIM, DMARC verification (fail-closed) | ✅ Done. Open: the SPF lookup budget, relaxed alignment without a Public Suffix List, and bounce alignment (§2.4 item 3) |
 | Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
 | Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done. Open: maildir fsync and `tmp/` debris (§2.4) |
-| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done. Open: storage quotas and recipient probing (§2.4) |
+| Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Open: recipient probing (§2.4) |
 | Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file reloaded on SIGHUP, attempt limits |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
 | S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§5) |
@@ -66,9 +66,12 @@ credentials file, so a login is revoked by removing it and reloading.
 
 Fix these after the pilot starts and before GA, in this order:
 
-1. **Storage quotas:** per-message, per-mailbox and per-domain caps on
-   stored bytes, plus a free-disk tempfail (`452 4.3.1`). After that,
-   `catch-all` can be offered.
+1. **Storage quotas.** Done: per-mailbox quotas from the authority file
+   (`quota-bytes` on a mailbox or its domain, falling back to the server's
+   `mailbox-quota-bytes`; `452 4.2.2` at RCPT) and a free-disk floor
+   (`min-free-disk-bytes`, `452 4.3.1`). Open: count mail still queued for
+   a mailbox, and a total cap per domain (today each mailbox is capped, not
+   the tenant as a whole). `catch-all` can be offered.
 2. **Recipient probing:** close the session after N refused RCPTs, and keep
    a refused-RCPT budget per IP (`RSET` resets today's 100-recipient cap).
 3. **SPF and DMARC correctness** (the first three reject legitimate mail):
@@ -86,8 +89,8 @@ Fix these after the pilot starts and before GA, in this order:
    - an RAII guard for the per-IP connection count;
    - fsync the maildir directory after the rename, and sweep old files from
      the maildirs' `tmp/` (the spool's debris is already swept);
-   - `503` for commands before EHLO; EHLO resets the envelope; allow long
-     AUTH PLAIN initial responses;
+   - `503` for commands before EHLO; allow long AUTH PLAIN initial
+     responses;
    - refuse duplicate DKIM tags; check the key's `k=` against the
      signature's `a=`;
    - `create_owned_dir_all`: `fchown` and `O_NOFOLLOW` instead of
@@ -105,7 +108,7 @@ One line per open item; DESIGN.md §13 has the impact of each.
 
 | Gap | DESIGN §13 area | Planned in |
 |---|---|---|
-| No storage quotas or free-disk check | Abuse resistance | §2.4.1 |
+| Quotas are soft and don't count queued mail; no per-domain total | Abuse resistance | §2.4.1 |
 | Unlimited recipient probing per session | Abuse resistance | §2.4.2 |
 | SPF budget over-counts `mx`/`ptr` address lookups | Correctness and delivery | §2.4.3 |
 | Relaxed alignment is a suffix test (no PSL) | Correctness and delivery | §2.4.3 |
@@ -123,20 +126,20 @@ One line per open item; DESIGN.md §13 has the impact of each.
 
 From the design and code assessment in
 [docs/reviews/FINDINGS.md](docs/reviews/FINDINGS.md). None blocks the
-pilot; items 1–3 most reduce the kind of bug the reviews kept finding.
+pilot; items 1 and 2 most reduce the kind of bug the reviews kept finding.
 
 Done: `mailserv/src/main.rs` is split into `config`, `server`, `session`
 (with `session/message.rs` for end of data), `address`, `headers`, `tls`
-and `verdict` (DESIGN §2); the `mailserv` tests are hermetic.
+and `verdict` (DESIGN §2); the `mailserv` tests are hermetic; per-message
+state is one `Transaction` value; DKIM verification runs on the blocking
+pool.
 
 | # | Change | Why | Effort |
 |---|---|---|---|
-| 1 | Introduce a `Transaction` type in `session`, created at an accepted MAIL and dropped at end of data, RSET or abort | Per-message state is loose fields reset by hand in `clear_envelope`, which is how a DKIM verdict once leaked across messages | Medium |
-| 2 | One raw header scanner, in `mailparse`, used by DKIM, the From extraction and the bare-CR check; one shared mailbox-safe character set for RCPT validation and the maildir sink | Two scanners can disagree about line boundaries; two copies of a rule can drift | Small–medium |
-| 3 | Run DKIM canonicalisation and verification on the blocking pool (fetch keys first, async) | Attacker-controlled CPU work currently runs on async workers | Small |
-| 4 | Fuzz targets | No fuzzing | Small to set up |
-| 5 | Total lookup results (`Found / Absent / TempError`) for SPF and DKIM key lookups, matched exhaustively | Fail-closed is enforced case by case, not by the types | Medium |
-| 6 | Typed errors in `dns`/`spf`; `serde` enums with stable names for the verdicts in spool metadata (today `format!("{:?}")`) | Renaming a variant silently changes stored data | Small–medium |
+| 1 | One raw header scanner, in `mailparse`, used by DKIM, the From extraction and the bare-CR check; one shared mailbox-safe character set for RCPT validation and the maildir sink | Two scanners can disagree about line boundaries; two copies of a rule can drift | Small–medium |
+| 2 | Fuzz targets | No fuzzing | Small to set up |
+| 3 | Total lookup results (`Found / Absent / TempError`) for SPF and DKIM key lookups, matched exhaustively | Fail-closed is enforced case by case, not by the types | Medium |
+| 4 | Typed errors in `dns`/`spf`; `serde` enums with stable names for the verdicts in spool metadata (today `format!("{:?}")`) | Renaming a variant silently changes stored data | Small–medium |
 
 ---
 

@@ -46,6 +46,19 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) max_data_bytes: Option<usize>,
 
+    /// Default storage quota for each mailbox, in bytes (default 10 MiB; 0
+    /// for no default), used when the authority file sets no `quota-bytes`
+    /// for the mailbox or its domain. A recipient whose mailbox holds its
+    /// quota gets `452 4.2.2 Mailbox full` at RCPT, so the sender retries.
+    #[arg(long, value_name = "BYTES")]
+    pub(crate) mailbox_quota_bytes: Option<u64>,
+
+    /// Free space the spool and maildir filesystems must keep, in bytes
+    /// (default 1 GiB; 0 for no check). Below it, new mail gets
+    /// `452 4.3.1 Insufficient system storage`.
+    #[arg(long, value_name = "BYTES")]
+    pub(crate) min_free_disk_bytes: Option<u64>,
+
     /// Whole-connection time limit in milliseconds (default 300000).
     #[arg(long)]
     pub(crate) max_conn_duration_ms: Option<u64>,
@@ -161,7 +174,8 @@ pub(crate) struct Args {
     /// TOML configuration file; CLI flags override file values. Keys are
     /// the same as the flags in kebab-case (host, port, submission-port,
     /// submissions-port, domain,
-    /// max-data-bytes, max-conn-duration-ms, max-read-duration-ms,
+    /// max-data-bytes, mailbox-quota-bytes, min-free-disk-bytes,
+    /// max-conn-duration-ms, max-read-duration-ms,
     /// tls-cert, tls-key, auth-users-file, auth-senders, resolver, resolver-ca,
     /// dns-connections, spool-dir, maildir-dir, max-connections,
     /// max-conn-per-ip, max-conn-rate-per-ip, max-dns-per-ip, user, group,
@@ -190,6 +204,8 @@ pub(crate) struct FileConfig {
     pub(crate) submissions_port: Option<u16>,
     pub(crate) domain: Option<String>,
     pub(crate) max_data_bytes: Option<usize>,
+    pub(crate) mailbox_quota_bytes: Option<u64>,
+    pub(crate) min_free_disk_bytes: Option<u64>,
     pub(crate) max_conn_duration_ms: Option<u64>,
     pub(crate) max_read_duration_ms: Option<u64>,
     pub(crate) max_connections: Option<u32>,
@@ -231,6 +247,13 @@ pub(crate) struct Config {
     pub(crate) domain: String,
     /// Server-wide message size limit (default [`DEFAULT_MAX_DATA_BYTES`]).
     pub(crate) max_data_bytes: usize,
+    /// Default per-mailbox storage quota (default
+    /// [`DEFAULT_MAILBOX_QUOTA_BYTES`]), for mailboxes the authority sets
+    /// none for; `None` when set to 0.
+    pub(crate) mailbox_quota_bytes: Option<u64>,
+    /// Free-space floor for the spool and maildir filesystems (default
+    /// [`DEFAULT_MIN_FREE_DISK_BYTES`]); `None` when set to 0.
+    pub(crate) min_free_disk_bytes: Option<u64>,
     /// Whole-connection time limit (default
     /// [`DEFAULT_MAX_CONN_DURATION_MS`]).
     pub(crate) max_conn_duration_ms: u64,
@@ -298,6 +321,15 @@ pub(crate) const DEFAULT_PORT: u16 = 25;
 /// more. Hosted domains can set a lower limit of
 /// their own (`max-message-bytes` in the authority file).
 pub(crate) const DEFAULT_MAX_DATA_BYTES: usize = 10 * 1024 * 1024;
+
+/// The default per-mailbox storage quota: 10 MiB, deliberately small until
+/// the server has run live. Mailboxes and domains can set their own in the
+/// authority file (`quota-bytes`).
+pub(crate) const DEFAULT_MAILBOX_QUOTA_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The default free-space floor for the spool and maildir filesystems:
+/// 1 GiB, enough headroom for mail already accepted to be delivered.
+pub(crate) const DEFAULT_MIN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The default whole-connection time limit: 5 minutes. RFC 5321
 /// §4.5.3.2 recommends a 3-minute timeout per DATA block and 10 minutes
@@ -388,6 +420,19 @@ pub(crate) fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .max_data_bytes
             .or(file.max_data_bytes)
             .unwrap_or(DEFAULT_MAX_DATA_BYTES),
+        // 0 disables either limit.
+        mailbox_quota_bytes: Some(
+            cli.mailbox_quota_bytes
+                .or(file.mailbox_quota_bytes)
+                .unwrap_or(DEFAULT_MAILBOX_QUOTA_BYTES),
+        )
+        .filter(|&q| q > 0),
+        min_free_disk_bytes: Some(
+            cli.min_free_disk_bytes
+                .or(file.min_free_disk_bytes)
+                .unwrap_or(DEFAULT_MIN_FREE_DISK_BYTES),
+        )
+        .filter(|&q| q > 0),
         max_conn_duration_ms: cli
             .max_conn_duration_ms
             .or(file.max_conn_duration_ms)
@@ -656,6 +701,8 @@ mod tests {
         assert!(std::path::Path::new(&resolved.spool_dir).is_absolute());
         assert!(std::path::Path::new(&resolved.maildir_dir).is_absolute());
         assert_eq!(resolved.max_data_bytes, 10 * 1024 * 1024);
+        assert_eq!(resolved.mailbox_quota_bytes, Some(10 * 1024 * 1024));
+        assert_eq!(resolved.min_free_disk_bytes, Some(1024 * 1024 * 1024));
         assert_eq!(resolved.max_conn_duration_ms, 300_000);
         assert_eq!(resolved.max_connections, 100);
         assert_eq!(resolved.shutdown_grace_ms, 60_000);
@@ -663,6 +710,41 @@ mod tests {
         assert_eq!(resolved.group, None);
         assert_eq!(resolved.submission_port, None);
         assert_eq!(resolved.submissions_port, None);
+    }
+
+    /// The storage limits resolve CLI > file > default, and 0 disables
+    /// each.
+    #[test]
+    fn storage_limit_resolution() {
+        use clap::Parser as _;
+        let file = FileConfig {
+            mailbox_quota_bytes: Some(5000),
+            min_free_disk_bytes: Some(0),
+            ..FileConfig::default()
+        };
+        let resolved = resolve_config(
+            Args::parse_from(["mailserv", "--domain", "d.example"]),
+            file.clone(),
+        )
+        .unwrap();
+        assert_eq!(resolved.mailbox_quota_bytes, Some(5000));
+        assert_eq!(resolved.min_free_disk_bytes, None, "0 disables the check");
+
+        let resolved = resolve_config(
+            Args::parse_from([
+                "mailserv",
+                "--domain",
+                "d.example",
+                "--mailbox-quota-bytes",
+                "0",
+                "--min-free-disk-bytes",
+                "77",
+            ]),
+            file,
+        )
+        .unwrap();
+        assert_eq!(resolved.mailbox_quota_bytes, None);
+        assert_eq!(resolved.min_free_disk_bytes, Some(77));
     }
 
     /// Submission ports resolve CLI > file, and each needs TLS and a

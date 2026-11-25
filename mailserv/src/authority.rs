@@ -129,6 +129,10 @@ pub struct Recipient {
     /// (`max-message-bytes`), if it set one. The session enforces the
     /// lower of this and the server-wide `max-data-bytes`.
     pub max_message_bytes: Option<usize>,
+    /// The routing mailbox's storage quota in bytes, from the authority:
+    /// `None` when the authority sets none (the server's
+    /// `mailbox-quota-bytes` applies), `Some(0)` for no quota.
+    pub quota_bytes: Option<u64>,
 }
 
 /// What the authority answered for one candidate recipient.
@@ -184,6 +188,9 @@ struct Mailbox {
     public_key: Option<String>,
     /// Key-rotation generation for `public_key`.
     key_generation: Option<u32>,
+    /// This mailbox's own quota (`quota-bytes`; 0 for none), overriding
+    /// its domain's default.
+    quota_bytes: Option<u64>,
 }
 
 /// Internal policy for one hosted domain (the validated [`PolicyMode`]).
@@ -205,6 +212,9 @@ struct AuthorityData {
     /// Per-domain message size limits (`max-message-bytes`), for domains
     /// that set one.
     domain_limits: HashMap<String, usize>,
+    /// Per-domain default mailbox quotas (`quota-bytes`; 0 for none), for
+    /// domains that set one.
+    domain_quotas: HashMap<String, u64>,
     /// Full address -> mailbox record.
     mailboxes: HashMap<String, Mailbox>,
 }
@@ -212,7 +222,8 @@ struct AuthorityData {
 impl AuthorityData {
     /// Resolve `address`: the domain's policy decides acceptance and
     /// routing (see [`AuthorityData::resolve_policy`]), and an accepted
-    /// recipient carries the domain's size limit.
+    /// recipient carries the domain's size limit and the routing
+    /// mailbox's quota (see [`AuthorityData::quota_for`]).
     ///
     /// # Errors
     ///
@@ -224,8 +235,24 @@ impl AuthorityData {
             recipient.max_message_bytes = addr
                 .rsplit_once('@')
                 .and_then(|(_, domain)| self.domain_limits.get(domain).copied());
+            recipient.quota_bytes = self.quota_for(&recipient.mailbox);
         }
         Ok(resolution)
+    }
+
+    /// Returns the quota for the routing mailbox `mailbox` (lowercased):
+    /// its own `quota-bytes` if it is a known mailbox that sets one,
+    /// otherwise its domain's default, otherwise `None` (the server's
+    /// default applies). Under catch-all the routing mailbox is the
+    /// catch-all inbox, so its quota is the one that counts.
+    fn quota_for(&self, mailbox: &str) -> Option<u64> {
+        self.mailboxes
+            .get(mailbox)
+            .and_then(|m| m.quota_bytes)
+            .or_else(|| {
+                let (_, domain) = mailbox.rsplit_once('@')?;
+                self.domain_quotas.get(domain).copied()
+            })
     }
 
     /// Apply the hosted domain's policy to `address` (trimmed and
@@ -281,6 +308,7 @@ impl AuthorityData {
                             public_key: owner.and_then(|o| o.public_key.clone()),
                             key_generation: owner.and_then(|o| o.key_generation),
                             max_message_bytes: None,
+                            quota_bytes: None,
                         }))
                     }
                 }
@@ -346,6 +374,7 @@ impl AuthorityData {
             public_key: mb.public_key.clone(),
             key_generation: mb.key_generation,
             max_message_bytes: None,
+            quota_bytes: None,
         }
     }
 }
@@ -379,6 +408,30 @@ struct DomainFile {
     /// The domain's own message size limit in bytes (optional). Only a
     /// *lower* limit than the server's `max-data-bytes` has an effect.
     max_message_bytes: Option<u64>,
+    /// The default storage quota for the domain's mailboxes, in bytes
+    /// (optional; 0 for none). Overrides the server's
+    /// `mailbox-quota-bytes`.
+    quota_bytes: Option<u64>,
+}
+
+/// The smallest accepted non-zero `quota-bytes`: 1 KiB, for the same
+/// reason as [`MIN_DOMAIN_MESSAGE_BYTES`] (a unit mistake would defer all
+/// mail).
+const MIN_QUOTA_BYTES: u64 = 1024;
+
+/// Check a `quota-bytes` value `quota` for the entry `what` (a domain or
+/// mailbox, for the message).
+///
+/// # Errors
+///
+/// A non-zero quota below [`MIN_QUOTA_BYTES`].
+fn check_quota(what: &str, quota: Option<u64>) -> Result<()> {
+    if let Some(q) = quota.filter(|&q| q != 0 && q < MIN_QUOTA_BYTES) {
+        anyhow::bail!(
+            "{what}: quota-bytes must be 0 (no quota) or at least {MIN_QUOTA_BYTES}, got {q}"
+        );
+    }
+    Ok(())
 }
 
 /// The smallest accepted `max-message-bytes`: 1 KiB. Anything smaller
@@ -398,6 +451,9 @@ struct MailboxFile {
     public_key: Option<String>,
     /// Key-rotation generation for `public_key`.
     key_generation: Option<u32>,
+    /// This mailbox's storage quota in bytes (optional; 0 for none),
+    /// overriding its domain's default.
+    quota_bytes: Option<u64>,
 }
 
 impl AuthorityFile {
@@ -407,7 +463,8 @@ impl AuthorityFile {
     /// # Errors
     ///
     /// An unsupported `version`; a `max-message-bytes` below
-    /// [`MIN_DOMAIN_MESSAGE_BYTES`]; a `catch-all` domain without
+    /// [`MIN_DOMAIN_MESSAGE_BYTES`]; a non-zero `quota-bytes` below
+    /// [`MIN_QUOTA_BYTES`]; a `catch-all` domain without
     /// `catch-all-mailbox`; a `grace` domain without `grace-days` or with
     /// a value outside 1–366; or an unparseable `expires` timestamp.
     fn into_data(self) -> Result<AuthorityData> {
@@ -416,7 +473,12 @@ impl AuthorityFile {
         }
         let mut domains = HashMap::new();
         let mut domain_limits = HashMap::new();
+        let mut domain_quotas = HashMap::new();
         for (name, domain) in self.domains {
+            check_quota(&format!("domain {name}"), domain.quota_bytes)?;
+            if let Some(quota) = domain.quota_bytes {
+                domain_quotas.insert(name.to_ascii_lowercase(), quota);
+            }
             if let Some(limit) = domain.max_message_bytes {
                 if limit < MIN_DOMAIN_MESSAGE_BYTES {
                     anyhow::bail!(
@@ -457,6 +519,7 @@ impl AuthorityFile {
 
         let mut mailboxes = HashMap::new();
         for (address, mailbox) in self.mailboxes {
+            check_quota(&format!("mailbox {address}"), mailbox.quota_bytes)?;
             let expires = mailbox
                 .expires
                 .map(|raw| {
@@ -471,12 +534,14 @@ impl AuthorityFile {
                     expires,
                     public_key: mailbox.public_key,
                     key_generation: mailbox.key_generation,
+                    quota_bytes: mailbox.quota_bytes,
                 },
             );
         }
         Ok(AuthorityData {
             domains,
             domain_limits,
+            domain_quotas,
             mailboxes,
         })
     }
@@ -656,6 +721,7 @@ impl RecipientResolver for StaticAuthority {
                 public_key: None,
                 key_generation: None,
                 max_message_bytes: None,
+                quota_bytes: None,
             }))
         } else {
             Ok(Resolution::NotHosted)
@@ -712,6 +778,7 @@ mod tests {
                 public_key: Some("pk-alice".into()),
                 key_generation: Some(2),
                 max_message_bytes: None,
+                quota_bytes: None,
             })
         );
 
@@ -754,6 +821,7 @@ mod tests {
                 public_key: None,
                 key_generation: None,
                 max_message_bytes: None,
+                quota_bytes: None,
             })
         );
 
@@ -793,6 +861,7 @@ mod tests {
                 public_key: None,
                 key_generation: None,
                 max_message_bytes: None,
+                quota_bytes: None,
             })
         );
         // Unknown: the inbox, adopting its owner and key.
@@ -804,6 +873,7 @@ mod tests {
                 public_key: Some("pk-owner".into()),
                 key_generation: Some(4),
                 max_message_bytes: None,
+                quota_bytes: None,
             })
         );
     }
@@ -959,6 +1029,61 @@ mod tests {
             err.contains("max-message-bytes must be at least 1024"),
             "{err}"
         );
+    }
+
+    /// `quota-bytes`: a mailbox's own value beats its domain's default,
+    /// which beats nothing (`None`: the server default applies); 0 is
+    /// carried as "no quota"; under catch-all the inbox's quota applies to
+    /// every routed address; a non-zero value under 1 KiB is a load error.
+    #[test]
+    fn mailbox_quotas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authority.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "domains": {
+                    "tenant.example": { "mode": "reject", "quota-bytes": 2000000 },
+                    "catch.example": { "mode": "catch-all", "catch-all-mailbox": "inbox@catch.example" },
+                    "plain.example": { "mode": "reject" }
+                },
+                "mailboxes": {
+                    "big@tenant.example": { "user": "big", "expires": null, "quota-bytes": 9000000 },
+                    "open@tenant.example": { "user": "open", "expires": null, "quota-bytes": 0 },
+                    "std@tenant.example": { "user": "std", "expires": null },
+                    "inbox@catch.example": { "user": "ops", "expires": null, "quota-bytes": 50000 },
+                    "b@plain.example": { "user": "b", "expires": null }
+                }
+            }"#,
+        )
+        .unwrap();
+        let authority = FileAuthority::open(&path).unwrap();
+        let quota = |addr: &str| match authority.resolve(addr).unwrap() {
+            Resolution::Accept(r) => r.quota_bytes,
+            other => panic!("{addr}: {other:?}"),
+        };
+        assert_eq!(quota("Big@Tenant.Example"), Some(9_000_000), "mailbox wins");
+        assert_eq!(
+            quota("std@tenant.example"),
+            Some(2_000_000),
+            "domain default"
+        );
+        assert_eq!(quota("open@tenant.example"), Some(0), "explicitly none");
+        assert_eq!(quota("whoever@catch.example"), Some(50_000), "the inbox's");
+        assert_eq!(quota("b@plain.example"), None, "server default");
+
+        for bad in [
+            r#"{ "version": 1, "domains": { "x.example": { "mode": "reject", "quota-bytes": 10 } }, "mailboxes": {} }"#,
+            r#"{ "version": 1, "domains": { "x.example": { "mode": "reject" } }, "mailboxes": { "a@x.example": { "user": "a", "quota-bytes": 512 } } }"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let err = FileAuthority::open(&path).unwrap_err().to_string();
+            assert!(
+                err.contains("quota-bytes must be 0 (no quota) or at least 1024"),
+                "{err}"
+            );
+        }
     }
 
     /// The strict file contract: malformed documents are startup

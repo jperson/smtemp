@@ -31,7 +31,7 @@ complete.
 | DNS robustness | ✅ Good. Pipelined DoT connections, per-IP DNS limit, deadlines for SPF and end-of-data checks. |
 | Durability (spool before `250`, idempotent delivery, retry, dead-letter) | ✅ Adequate for a pilot. Failed deliveries are retried for 5 days; crash debris is swept. The connection time limit never cuts a message off between its spool write and its `250`. |
 | Operability (logging, sizing, shutdown, privileges, paths) | ⚠️ **Configuration needed** in Phases B, C and E. |
-| Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** No quotas; unlimited address probing per session. Configuration and monitoring narrow both; only code closes them. |
+| Abuse resistance (disk exhaustion, recipient probing) | ⚠️ **Pilot only.** Per-mailbox quotas and a free-disk floor bound disk use; address probing per session is unlimited (monitoring narrows it; only code closes it). |
 | Legitimate mail wrongly rejected | ⚠️ **Pilot only.** Some legitimate mail can get a permanent `550` (§2). Acceptable while the logs are reviewed daily (G2). |
 | Spoofing that reaches users (display names, no `Authentication-Results:`) | ⚠️ **Pilot only.** |
 
@@ -52,7 +52,7 @@ Each is contained by a step below and fixed in code later (PLAN.md).
 | Limitation | Risk | Contained by | Fix |
 |---|---|---|---|
 | The static authority (no `authority` file) accepts every local-part | Any address at a hosted domain receives mail | C1, C2: always set `authority`, `reject` mode | Configuration |
-| No storage quotas or free-disk check | A sender can fill the disk | B3 dedicated filesystem, G1 alerts, C2 `reject` mode, no `catch-all` | PLAN §2.4.1 |
+| Quotas are soft (one message over) and cap each mailbox, not a domain's total | A sender can fill one mailbox to its quota, and many mailboxes together can fill the disk until the free-disk floor defers mail | C1/C2 quotas sized for B3; G1 alerts | PLAN §2.4.1 |
 | Unlimited refused RCPTs per session | Probing which addresses exist | G1 `recipient refused` alert; firewall abusive sources | PLAN §2.4.2 |
 | SPF budget over-counts `mx`/`ptr` lookups; relaxed DMARC alignment is a suffix test; no SPF alignment for bounces; malformed SPF records are PermError, as RFC 7208 requires | Legitimate mail gets a permanent `550` | G2 daily review of permanent rejections | PLAN §2.4.3 |
 | No `Authentication-Results:`; display names unchecked | Users can be misled by forged headers or names | Tell pilot users that verdicts aren't shown | PLAN §2.4.4 |
@@ -162,6 +162,8 @@ did each one and when in §4.
   port = 25
   domain = "mx1.example.org"       # MX FQDN: banner, EHLO, Received: "by"
   max-data-bytes = 10485760        # 10 MiB, from B2
+  mailbox-quota-bytes = 10485760   # 10 MiB default; raise per mailbox/domain in C2
+  min-free-disk-bytes = 1073741824 # 1 GiB kept free on the spool/maildir disk
   max-connections = 40             # from B2
   max-conn-duration-ms = 300000    # 5 min
   max-read-duration-ms = 15000
@@ -183,8 +185,13 @@ did each one and when in §4.
   `backend":"file"`, `STARTTLS available`, and **no** `AUTH PLAIN/LOGIN
   available` line.
 - [ ] **C2. Write `/etc/mailserv/authority.json`.**
-  - Use `reject` mode for every domain: **no `catch-all`** in the pilot
-    (there are no storage quotas yet).
+  - Set `quota-bytes` per domain (and per mailbox where needed); without
+    one, a mailbox gets the 10 MiB `mailbox-quota-bytes` default, which
+    one large message fills. The quotas of all mailboxes should fit B3's
+    filesystem.
+  - Use `reject` mode for every domain. `catch-all` is possible now that
+    the mailbox quota bounds the catch-all inbox, but keep it out of the
+    pilot unless a customer needs it.
   - Include `postmaster@` (RFC 5321 §4.5.1 requires it for every domain
     the server accepts mail for) and `abuse@` for every hosted domain, and
     for the MX host's own domain if it is listed. Neither is added
@@ -354,7 +361,9 @@ Run the authority-dependent tests against a test domain listed in
 
   | Signal | Source | Alert when |
   |---|---|---|
-  | Disk usage of `/var/lib/mailserv` (bytes **and** inodes) | `df -h`, `df -i` | > 70% warn, > 85% page (no quotas) |
+  | Disk usage of `/var/lib/mailserv` (bytes **and** inodes) | `df -h`, `df -i` | > 70% warn, > 85% page (inodes aren't covered by the free-disk floor) |
+  | `storage low; deferring new mail` | log | any (mail is being deferred with `452 4.3.1`) |
+  | `recipient deferred: mailbox over quota` | log | a sustained rate for one `mailbox` (a full mailbox, or one being flooded) |
   | Dead letters | `ls /var/lib/mailserv/spool/dead-letter/*.json` | any file (accepted mail at risk) |
   | Queue depth | `drain pass` log line (every 60 s while the queue is non-empty): `queued` field; or `ls /var/lib/mailserv/spool/new/*.json \| wc -l` | > 100 for 10 min, or any `queued` > 0 for 1 h (a delivery outage: mail is safe for 5 days, but find the cause) |
   | `removed uncommitted spool file (crash debris)` | log (`warn`) | any (a write was interrupted: look for a crash or a full disk around the file's time) |

@@ -73,12 +73,14 @@ main.rs        entry point: arguments, logging, then config::load and server::ru
 config.rs      CLI flags, the TOML file, their merge (resolve_config), startup checks
 server.rs      startup, listeners, privilege drop, accept loop, limits, signals,
                handle_connection (drives one session over TCP/TLS)
-session.rs     UserSession: the SmtpSession policy (HELO, AUTH, MAIL, RCPT, DATA)
+session.rs     UserSession: the SmtpSession policy (HELO, AUTH, MAIL, RCPT, DATA);
+               Transaction: one message's envelope, verdicts and data
 session/message.rs   end of data: header checks, DKIM, DMARC, spool, fast path
 address.rs     envelope syntax: paths, ESMTP parameters, HELO, local-part rules
 headers.rs     raw header checks: the single From:, its authors, bare CRs
 tls.rs         certificates, resolver CA, handshakes
 verdict.rs     DKIM/DMARC summaries recorded with each message
+quota.rs       storage limits: mailbox quota, free-disk floor
 auth.rs        credentials (argon2id), reload, sender grants
 authority.rs   recipient authority (file-backed, hot-reloaded)
 spool.rs       durable queue (SpoolWriter, SpoolQueue, DiskSpool)
@@ -193,18 +195,28 @@ later, only stops a task stuck in a handshake or a write.
 - **Dot-unstuffing** (RFC 5321 §4.5.2) happens in the protocol layer.
   `recv_data` gets raw, unstuffed bytes with their original line ending; it
   is 8-bit safe.
-- **`RSET`** clears the envelope but keeps the session greeted. Unknown verbs
+- **`RSET`** ends the transaction but keeps the session greeted (so does
+  an accepted HELO/EHLO, RFC 5321 §4.1.4). Unknown verbs
   get `500`, and the state is kept.
 
 ---
 
 ## 5. The message pipeline
 
+**The transaction.** Everything that belongs to one message (envelope
+sender and its SPF verdict, declared size, recipients, size limit, data)
+lives in one `Transaction`, created when MAIL FROM is accepted and held as
+`UserSession::txn`. It ends by being dropped: at end of data (which takes
+it out of the session first, whatever the outcome), at RSET and the reset
+after an aborted transfer, at an accepted HELO/EHLO, and at STARTTLS. No
+per-message field is reset by hand, so none can leak into the next
+message.
+
 | Step | Policy (`UserSession`) |
 |---|---|
 | **HELO/EHLO** | The argument must be a domain (letters, digits, `-`, `_`; 1–63-octet labels, ≤ 255 total) or an address literal, else `501 5.5.2`, refused *before* it is recorded, because it's copied into `Received:` (a bare CR there would inject a header). SPF is evaluated for the HELO identity under a per-IP DNS permit: Fail → `550`, anything else is just recorded. On a submission listener HELO SPF isn't evaluated (clients send from any network). The EHLO reply advertises `SIZE`, `STARTTLS` (plaintext only) and `AUTH` (submission listeners only, over TLS, when configured). |
-| **MAIL FROM** | The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. A submission listener requires AUTH first (`530 5.7.0`). For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
-| **RCPT TO** | MAIL must come first, and at most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. |
+| **MAIL FROM** | Below the free-disk floor (`min-free-disk-bytes`, on the spool and maildir filesystems) → `452 4.3.1`, and no transaction starts. The path is parsed as `<path> [params]`. Control characters are refused, and `SIZE=` over the server limit gets `552`. A submission listener requires AUTH first (`530 5.7.0`). For an authenticated session, the address must be granted (§10). Otherwise SPF is checked for the sender, or `postmaster@<HELO>` for `<>`: Fail or PermError → `550`, TempError → `451`. |
+| **RCPT TO** | MAIL must come first, and at most 100 recipients are allowed. The local-part must be RFC 5321 dot-atom text without `/` or a leading dot (it becomes a directory name), else `553 5.1.3`. Then the authority decides (§7). The recipient's size limit is applied: a declared `SIZE=` over it gets `552`, and a recipient whose limit differs from the transaction's gets `452 4.5.3`. Then the mailbox quota (the authority's `quota_bytes` for the routing mailbox, else `mailbox-quota-bytes`): the routing mailbox's stored bytes (`DeliverySink::usage`) must be under the quota, with room for any declared `SIZE=`, else `452 4.2.2` for that recipient only. |
 | **DATA** | Needs a sender and at least one recipient. Bytes are counted against the transaction's limit; going over it gets `552` and `Discard`. |
 | **End of data** | See below. |
 
@@ -214,17 +226,22 @@ later, only stops a task stuck in a handshake or a write.
 1. bare CR in the header block?      → 550 5.6.0   (no DNS work spent)
 2. take a per-IP DNS permit          → 451 4.7.0 if none frees within 10 s
    ── one 20 s deadline (END_OF_DATA_DNS_DEADLINE) covers 3 and 6 ──
-3. DKIM verify (raw view)            → per-signature verdicts
+3. DKIM: fetch the keys (async), then verify on the blocking pool
+                                     → per-signature verdicts
 4. exactly one From:, one domain     → 550 5.7.1 otherwise
 5. authenticated? every From author granted (§10) → 550 5.7.1 otherwise
 6. DMARC: discover policy, evaluate  → p=reject fail: 550 5.7.1
                                        lookup error:  451 4.4.3
    deadline exceeded at 3 or 6       → 451 4.4.3
 7. release the DNS permit
-8. spool (durable write)             → 451 4.3.0 if it fails
-9. clear the envelope; reply 250
+8. free-disk floor still met?        → 452 4.3.1 otherwise
+9. spool (durable write)             → 451 4.3.0 if it fails
+   reply 250
 10. fast-path delivery to each recipient, in the background (failures
     stay queued for the drain)
+
+(The transaction was taken out of the session before step 1, so every
+exit has already ended it.)
 ```
 
 How the ordering is constrained:
@@ -235,8 +252,15 @@ How the ordering is constrained:
 - Rejected mail is never spooled.
 - The `250` is sent only after the durable write, so accepted mail is never
   silently dropped.
-- Every exit clears the envelope, so the next transaction starts with MAIL
-  again.
+- DKIM verification is attacker-controlled CPU work (canonicalising and
+  hashing the whole message, a public-key operation per signature), so only
+  the key lookups run on the async workers (`dkim::fetch_keys`); the checks
+  run on the blocking pool (`dkim::verify_with_keys`).
+- The quota is soft: it is checked at RCPT, before the data, so a mailbox
+  can exceed it by at most one message (whose size wasn't declared).
+  Deferring a full mailbox's recipient with `452` does reveal that the
+  address exists, unlike the uniform `550` for refused addresses; quotas
+  should rarely be reached.
 
 ---
 
@@ -326,7 +350,11 @@ A `Recipient` carries:
 - the routing **mailbox** (the address itself, or the catch-all inbox);
 - the owning user;
 - `public_key` and `key_generation`, reserved for encryption;
-- the domain's `max-message-bytes`.
+- the domain's `max-message-bytes`;
+- the routing mailbox's quota (`quota_bytes`): its own `quota-bytes`, else
+  its domain's, else `None` (the server's `mailbox-quota-bytes` applies);
+  `Some(0)` means no quota. The authority resolves this, so a console or
+  database backend only has to supply the same field.
 
 All of this travels with the message in the spool metadata (`SpoolRcpt`).
 
@@ -370,6 +398,10 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
 - **Path.** One maildir per routing mailbox: `{root}/{domain}/{local}/new`.
   The sink re-validates each path component, as defence in depth against
   path traversal.
+- **Usage** (`DeliverySink::usage`, for the mailbox quota). The maildir
+  sink sums the files in `new/` and `cur/` and caches the result for 60 s
+  (at most 10,000 mailboxes); deliveries through the sink add to the cached
+  value at once, so only changes made by other tools wait for a rescan.
 - **Idempotent** per (envelope address, queue ID): the file name is
   `{queue ID}.{address}.eml`, so the fast path and the drain can race
   safely, and several catch-all addresses routed to one inbox get one copy
@@ -564,7 +596,7 @@ bound only protects library callers that use it.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 284 tests in four layers:
+- **Testing.** 297 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
@@ -595,7 +627,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 
 | Gap | Impact | Plan |
 |---|---|---|
-| No storage quotas (per message, mailbox or domain) and no free-disk tempfail | A sender can fill the disk. Contained only by a dedicated filesystem and alerts | §2.4.1 |
+| The mailbox quota is soft (one message over) and doesn't count mail still queued for the mailbox | A mailbox can exceed its quota by one message plus its queue backlog | §2.4.1 |
 | No session-wide limit on refused RCPTs (`RSET` resets the 100 cap) | Unlimited probing for which addresses exist; a privacy problem for disposable addresses | §2.4.2 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
 | The per-IP connection count is released manually, not by a drop guard | A panicking session leaks it (no remote panic is known) | §2.4.5 |
@@ -609,7 +641,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | Relaxed DMARC alignment is a suffix test, not an organisational-domain comparison (no PSL) | Sibling subdomains fail alignment → legitimate mail rejected under `p=reject` | §2.4.3 |
 | No SPF alignment for the null sender | Unsigned bounces from `p=reject` domains are rejected | §2.4.3 |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
-| Commands before EHLO get `500`, not `503`; EHLO doesn't reset an in-flight envelope; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.5 |
+| Commands before EHLO get `500`, not `503`; the 512-octet cap truncates long AUTH PLAIN responses | Protocol conformance | §2.4.5 |
 | DKIM accepts duplicate tags; the key's `k=` isn't checked against the signature's `a=` | Low (the cryptography must still verify) | §2.4.5 |
 | `quarantine` is delivered as normal mail | Out of V1 scope by decision | — |
 

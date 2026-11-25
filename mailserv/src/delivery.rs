@@ -22,9 +22,11 @@
 //!   `MAX_QUEUE_LIFETIME` (5 days).
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::spool::{SpoolMeta, SpoolQueue, SpoolRcpt};
 
@@ -50,7 +52,27 @@ pub trait DeliverySink: Send + Sync {
     /// Delivery failed; the message stays queued and the drain loop
     /// retries.
     fn deliver(&self, rcpt: &SpoolRcpt, queue_id: &str, message: &[u8]) -> Result<()>;
+
+    /// Returns the bytes stored for the routing mailbox `mailbox`, for the
+    /// quota check at RCPT (0 for a mailbox with nothing stored yet). May
+    /// come from a short-lived cache, so it can lag deletions slightly.
+    /// Blocking (it may scan storage).
+    ///
+    /// # Errors
+    ///
+    /// The mailbox name is unusable or its storage can't be measured.
+    fn usage(&self, mailbox: &str) -> Result<u64>;
 }
+
+/// How long a measured mailbox size is trusted before the maildir is
+/// scanned again. Deliveries through the sink update the cached value, so
+/// the lag only affects mail removed from (or added to) the maildir by
+/// something else.
+const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// The most mailboxes whose sizes are cached; past this, expired entries
+/// are dropped (and, if still full, all of them).
+const USAGE_CACHE_ENTRIES: usize = 10_000;
 
 /// Maildir delivery: one maildir per routing mailbox, under
 /// `{root}/{domain}/{local}/` (both lowercased). Each copy is written to
@@ -62,6 +84,8 @@ pub trait DeliverySink: Send + Sync {
 pub struct MaildirSink {
     /// Directory holding the per-domain maildir trees.
     root: PathBuf,
+    /// Measured mailbox sizes: maildir path → (when measured, bytes).
+    usage: Arc<Mutex<HashMap<PathBuf, (Instant, u64)>>>,
 }
 
 impl MaildirSink {
@@ -77,7 +101,37 @@ impl MaildirSink {
         let root = root.into();
         crate::fsutil::create_private_dir_all(&root)
             .with_context(|| format!("cannot create maildir root {}", root.display()))?;
-        Ok(MaildirSink { root })
+        Ok(MaildirSink {
+            root,
+            usage: Arc::default(),
+        })
+    }
+
+    /// Returns the bytes in the `new/` and `cur/` files of `maildir`
+    /// (0 for a maildir that doesn't exist yet).
+    ///
+    /// # Errors
+    ///
+    /// A directory or file can't be read.
+    fn scan(maildir: &Path) -> Result<u64> {
+        let mut total = 0u64;
+        for sub in ["new", "cur"] {
+            let dir = maildir.join(sub);
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+            };
+            for entry in entries {
+                let meta = entry
+                    .and_then(|e| e.metadata())
+                    .with_context(|| format!("cannot measure {}", dir.display()))?;
+                if meta.is_file() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -119,7 +173,40 @@ impl DeliverySink for MaildirSink {
         write_durable(&staged, message)?;
         std::fs::rename(&staged, &target)
             .with_context(|| format!("cannot commit delivery to {}", target.display()))?;
+        // Keep a cached size current, so a burst of deliveries is counted
+        // before the next scan.
+        let mut cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, bytes)) = cache.get_mut(&maildir) {
+            *bytes = bytes.saturating_add(message.len() as u64);
+        }
         Ok(())
+    }
+
+    fn usage(&self, mailbox: &str) -> Result<u64> {
+        let (local, domain) = split_recipient(mailbox)
+            .with_context(|| format!("cannot measure malformed mailbox {mailbox:?}"))?;
+        let maildir = self.root.join(&domain).join(&local);
+        let now = Instant::now();
+        {
+            let cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(&(at, bytes)) = cache.get(&maildir) {
+                if now.duration_since(at) < USAGE_CACHE_TTL {
+                    return Ok(bytes);
+                }
+            }
+        }
+        // Scan without holding the lock; a delivery racing the scan is
+        // counted by the next one.
+        let bytes = Self::scan(&maildir)?;
+        let mut cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= USAGE_CACHE_ENTRIES {
+            cache.retain(|_, (at, _)| now.duration_since(*at) < USAGE_CACHE_TTL);
+            if cache.len() >= USAGE_CACHE_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(maildir, (now, bytes));
+        Ok(bytes)
     }
 }
 
@@ -595,6 +682,45 @@ mod tests {
     /// told apart by the envelope address in the file name.
     #[tokio::test]
     async fn catch_all_addresses_get_separate_copies() {
+        catch_all_copies().await;
+    }
+
+    /// `usage` measures a mailbox's `new/` and `cur/` files (0 before the
+    /// first delivery), serves the cached value while fresh, counts
+    /// deliveries through the sink right away, and refuses a malformed
+    /// mailbox name.
+    #[test]
+    fn maildir_usage_is_measured_and_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        let mailbox = "user@example.org";
+        assert_eq!(sink.usage(mailbox).unwrap(), 0);
+
+        sink.deliver(&rcpt(mailbox, mailbox), "q-1", &[b'x'; 100])
+            .unwrap();
+        assert_eq!(
+            sink.usage(mailbox).unwrap(),
+            100,
+            "counted through the cache"
+        );
+
+        // A file added behind the sink's back (another tool, cur/) is
+        // seen once the cached value expires, not before.
+        let cur = dir.path().join("example.org/user/cur");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("read.eml"), [b'y'; 50]).unwrap();
+        assert_eq!(sink.usage(mailbox).unwrap(), 100, "cached");
+        let fresh = MaildirSink::open(dir.path()).unwrap();
+        assert_eq!(
+            fresh.usage(mailbox).unwrap(),
+            150,
+            "a scan sees new/ and cur/"
+        );
+
+        assert!(sink.usage("../etc@example.org").is_err());
+    }
+
+    async fn catch_all_copies() {
         let dir = tempfile::tempdir().unwrap();
         let sink = MaildirSink::open(dir.path()).unwrap();
         for address in ["a@catch.example", "b@catch.example"] {
@@ -710,6 +836,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn usage(&self, _mailbox: &str) -> Result<u64> {
+            Ok(0)
         }
     }
 

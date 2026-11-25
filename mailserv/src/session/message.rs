@@ -9,18 +9,28 @@ use tracing::{error, info, warn};
 use super::*;
 
 impl UserSession<'_> {
-    /// Finish the transaction whose data is in `self.data`: run the
-    /// end-of-data checks, spool the message with its trace headers, and
-    /// start the fast-path delivery. The transaction is cleared and counted
-    /// whatever the outcome.
+    /// Finish the transaction in progress: run the end-of-data checks,
+    /// spool the message with its trace headers, and start the fast-path
+    /// delivery. The transaction is taken out of the session first, so it
+    /// ends (and the message is counted) whatever the outcome.
     ///
     /// Returns the reply: `250` once the message is durably queued, or the
     /// refusal of the first check that fails (`550`, or `451` for DNS
-    /// trouble and a failed spool write).
+    /// trouble and a failed spool write); `503` without a transaction.
     pub(super) async fn end_of_data(&mut self) -> smtp::Control {
-        // The raw message as received: the accumulated DATA lines, with
-        // line endings exactly as the client sent them.
-        let raw = self.data.clone();
+        let Some(txn) = self.txn.take() else {
+            return smtp::Control::reject(NO_RECIPIENTS);
+        };
+        self.message_count += 1;
+        let Transaction {
+            mail_from,
+            spf_result,
+            rcpt_to,
+            data: raw,
+            ..
+        } = txn;
+        // `raw` is the message as received: the DATA lines, with line
+        // endings exactly as the client sent them.
 
         // A CR not followed by LF is never valid in an RFC 5322 header
         // block, and readers disagree on it. This
@@ -31,8 +41,6 @@ impl UserSession<'_> {
         // the message before any other work. The body is not checked.
         if header_has_bare_cr(&raw) {
             warn!("message refused: bare CR in the header block");
-            self.clear_envelope();
-            self.message_count += 1;
             return smtp::Control::reject(BARE_CR_IN_HEADER);
         }
 
@@ -42,28 +50,34 @@ impl UserSession<'_> {
         // instead would fail DMARC and permanently reject legitimate mail.
         let Ok(dns_permit) = self.dns_limit.acquire(self.peer.ip()).await else {
             log_dns_busy("end_of_data");
-            self.clear_envelope();
-            self.message_count += 1;
             return smtp::Control::tempfail(DNS_BUSY);
         };
         // One deadline covers all of this message's DNS work: the DKIM key
         // lookups here and the DMARC policy fetch below.
         let dns_deadline = Instant::now() + self.eod_dns_deadline;
-        let results = match timeout_at(dns_deadline, dkim::verify_dkim(&raw, &self.dns)).await {
-            Ok(results) => results,
+        let keys = match timeout_at(dns_deadline, dkim::fetch_keys(&raw, &self.dns)).await {
+            Ok(keys) => keys,
             Err(_) => return self.eod_dns_timed_out("dkim"),
         };
-        let mut dkim_summaries: Vec<DkimSummary> = Vec::new();
+        // Verification is attacker-controlled CPU work (canonicalization
+        // and hashing of the whole message, a public-key operation per
+        // signature), so it runs on the blocking pool, not on an async
+        // worker. The message goes there and comes back, uncopied.
+        let verified = tokio::task::spawn_blocking(move || {
+            let now = jiff::Timestamp::now().as_second().max(0) as u64;
+            let summaries = dkim::verify_with_keys(&raw, &keys, now)
+                .iter()
+                .map(DkimSummary::from)
+                .collect::<Vec<_>>();
+            (raw, summaries)
+        })
+        .await;
+        let Ok((raw, dkim_summaries)) = verified else {
+            error!("DKIM verification task panicked; refusing with a temporary error");
+            return smtp::Control::tempfail(EOD_DNS_TIMEOUT);
+        };
 
-        for result in &results {
-            let summary = DkimSummary {
-                domain: result.signature.domain.to_string(),
-                selector: result.signature.selector.to_string(),
-                body_hash_ok: result.body_hash_ok,
-                signature_ok: result.signature_ok,
-                verified: result.body_hash_ok && result.signature_ok,
-                error: result.error.as_ref().map(|e| e.to_string()),
-            };
+        for summary in &dkim_summaries {
             info!(
                 domain = %summary.domain,
                 selector = %summary.selector,
@@ -73,7 +87,6 @@ impl UserSession<'_> {
                 dkim_error = ?summary.error,
                 "dkim verification"
             );
-            dkim_summaries.push(summary);
         }
         self.dkim.extend(dkim_summaries.iter().cloned());
 
@@ -99,8 +112,6 @@ impl UserSession<'_> {
                     problem = ?problem,
                     "message has no unambiguous From header; rejecting (RFC 7489 Section 6.6.1)"
                 );
-                self.clear_envelope();
-                self.message_count += 1;
                 return smtp::Control::reject(
                     b"550 5.7.1 Message rejected: missing or malformed From header\r\n",
                 );
@@ -128,8 +139,6 @@ impl UserSession<'_> {
                     from_authors = ?authors,
                     "authenticated message refused: From author not granted to this user"
                 );
-                self.clear_envelope();
-                self.message_count += 1;
                 return smtp::Control::reject(FROM_NOT_OWNED);
             }
         }
@@ -160,16 +169,14 @@ impl UserSession<'_> {
                         error = %e,
                         "dmarc policy lookup failed; temporary failure"
                     );
-                    self.clear_envelope();
-                    self.message_count += 1;
                     return smtp::Control::tempfail(DMARC_TEMPFAIL);
                 }
             };
 
             if let Some(found) = found {
                 let record = &found.record;
-                let spf_passed = matches!(self.spf_result, Some(SpfResult::Pass));
-                let spf_domain = self.mail_from.as_deref().and_then(path_domain);
+                let spf_passed = matches!(spf_result, Some(SpfResult::Pass));
+                let spf_domain = path_domain(&mail_from);
                 // DMARC consumes ONLY this message's DKIM results.
                 // `self.dkim` accumulates across the connection for the
                 // session log; using it here would let a replayed genuine
@@ -213,10 +220,7 @@ impl UserSession<'_> {
 
                 let exempt = self.authenticated.is_some();
                 if action == dmarc::Action::Reject && !exempt {
-                    // The transaction is over either way; the envelope is
-                    // cleared below. Rejected mail is not spooled.
-                    self.clear_envelope();
-                    self.message_count += 1;
+                    // Rejected mail is not spooled.
                     return smtp::Control::reject(
                         b"550 5.7.1 This message does not comply with the required DMARC policy\r\n",
                     );
@@ -232,6 +236,12 @@ impl UserSession<'_> {
         // storage later), so it runs on the blocking pool. A failed
         // spool is a temporary failure — the client is invited to
         // retry, nothing is lost.
+        // The disk may have filled since MAIL FROM; spooling now could
+        // take the space that delivering accepted mail needs.
+        if self.storage_is_low() {
+            return smtp::Control::tempfail(INSUFFICIENT_STORAGE);
+        }
+
         if let Some(spool) = self.spool.clone() {
             let meta = spool::SpoolMeta {
                 // Assigned now, because the Received: header names it.
@@ -241,9 +251,9 @@ impl UserSession<'_> {
                 received_at: jiff::Timestamp::now().to_string(),
                 peer: self.peer.to_string(),
                 helo: self.helo.clone(),
-                mail_from: self.mail_from.clone(),
-                rcpt_to: self.rcpt_to.clone(),
-                spf_result: self.spf_result.as_ref().map(|r| format!("{r:?}")),
+                mail_from: Some(mail_from),
+                rcpt_to: rcpt_to.clone(),
+                spf_result: spf_result.as_ref().map(|r| format!("{r:?}")),
                 spf_helo: self.spf_helo.as_ref().map(|r| format!("{r:?}")),
                 dkim: dkim_summaries,
                 dmarc: dmarc_summary,
@@ -264,21 +274,17 @@ impl UserSession<'_> {
             // every recipient gets, shared by the delivery tasks below.
             let stored: Arc<[u8]> = match write.await {
                 Ok(Ok(stored)) => {
-                    info!(queue_id = %queue_id, recipients = self.rcpt_to.len(), "message spooled");
+                    info!(queue_id = %queue_id, recipients = rcpt_to.len(), "message spooled");
                     stored.payload.into()
                 }
                 Ok(Err(e)) => {
                     error!(error = %e, "spool write failed; refusing with a temporary error");
-                    self.clear_envelope();
-                    self.message_count += 1;
                     return smtp::Control::tempfail(
                         b"451 4.3.0 Error: queueing failed, try again later\r\n",
                     );
                 }
                 Err(e) => {
                     error!(error = %e, "spool task panicked; refusing with a temporary error");
-                    self.clear_envelope();
-                    self.message_count += 1;
                     return smtp::Control::tempfail(
                         b"451 4.3.0 Error: queueing failed, try again later\r\n",
                     );
@@ -295,9 +301,8 @@ impl UserSession<'_> {
             if let Some(sink) = self.sink.clone() {
                 match Arc::clone(&self.fast_path).try_acquire_owned() {
                     Ok(slot) => {
-                        let recipients = self.rcpt_to.clone();
                         tokio::spawn(async move {
-                            fast_path_deliver(sink, spool, recipients, queue_id, stored).await;
+                            fast_path_deliver(sink, spool, rcpt_to, queue_id, stored).await;
                             drop(slot);
                         });
                     }
@@ -308,12 +313,6 @@ impl UserSession<'_> {
             }
         }
 
-        // The transaction is complete: clear the envelope so another
-        // message can be sent on the same connection. (This also keeps
-        // message bodies out of the session's structured log.)
-        self.clear_envelope();
-        self.message_count += 1;
-
         smtp::Control::accept(UserSession::OK)
     }
 
@@ -321,15 +320,13 @@ impl UserSession<'_> {
     /// end-of-data DNS work ran past [`UserSession::eod_dns_deadline`]
     /// (`stage`: dkim or dmarc). Logged at `warn`, like an SPF deadline.
     ///
-    /// Returns the `451` reply; the transaction is cleared and counted.
-    fn eod_dns_timed_out(&mut self, stage: &str) -> smtp::Control {
+    /// Returns the `451` reply.
+    fn eod_dns_timed_out(&self, stage: &str) -> smtp::Control {
         warn!(
             stage,
             limit_ms = u64::try_from(self.eod_dns_deadline.as_millis()).unwrap_or(u64::MAX),
             "end-of-data DNS checks exceeded their time limit; temporary failure"
         );
-        self.clear_envelope();
-        self.message_count += 1;
         smtp::Control::tempfail(EOD_DNS_TIMEOUT)
     }
 }

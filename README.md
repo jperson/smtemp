@@ -108,6 +108,8 @@ Settings come from three sources; the first one that sets a value wins:
 | Flag / config key | Default | Description |
 |---|---|---|
 | `--max-data-bytes` / `max-data-bytes` | `10485760` (10 MiB) | Message size limit. It is advertised as `SIZE`, and larger messages get `552`. A hosted domain can set a lower limit in the authority file. |
+| `--mailbox-quota-bytes` / `mailbox-quota-bytes` | `10485760` (10 MiB) | Default storage quota per mailbox (`0`: no default), for mailboxes whose authority entry and domain set no `quota-bytes` (see [Recipient authority](#recipient-authority)). A recipient whose mailbox is at its quota, or can't fit a declared `SIZE=`, gets `452 4.2.2 Mailbox full` at RCPT; the sender retries later, and the transaction's other recipients are unaffected. Soft: an undeclared message can take a mailbox one message over. |
+| `--min-free-disk-bytes` / `min-free-disk-bytes` | `1073741824` (1 GiB) | Free space the spool and maildir filesystems must keep (`0`: no check). Below it, MAIL FROM and end of data get `452 4.3.1 Insufficient system storage`, so mail already accepted can still be delivered. |
 | `--max-conn-duration-ms` / `max-conn-duration-ms` | `300000` (5 min) | Wall-clock cap per connection, including TLS and AUTH. |
 | `--max-read-duration-ms` / `max-read-duration-ms` | `15000` | Per-read timeout; a silent client is dropped. |
 | `--max-connections` / `max-connections` | `100` | Server-wide simultaneous connections. Over the limit: `421`. |
@@ -185,6 +187,8 @@ spool-dir = "/var/lib/mailserv/spool"
 maildir-dir = "/var/lib/mailserv/maildir"
 
 max-data-bytes = 10485760
+mailbox-quota-bytes = 10485760
+min-free-disk-bytes = 1073741824
 max-connections = 100
 max-conn-per-ip = 10
 max-conn-rate-per-ip = 60
@@ -214,7 +218,7 @@ the same directory, then `mv` it into place.
 {
   "version": 1,
   "domains": {
-    "example.org": { "mode": "reject" },
+    "example.org": { "mode": "reject", "quota-bytes": 1073741824 },
     "lists.example.org": { "mode": "catch-all", "catch-all-mailbox": "admin@example.org" },
     "legacy.example.net": { "mode": "grace", "grace-days": 7, "max-message-bytes": 5242880 }
   },
@@ -223,7 +227,8 @@ the same directory, then `mv` it into place.
       "user": "alice",
       "expires": null,
       "public-key": null,
-      "key-generation": 2
+      "key-generation": 2,
+      "quota-bytes": 5368709120
     }
   }
 }
@@ -239,6 +244,11 @@ the same directory, then `mv` it into place.
   server limit for that domain. Recipients with different limits can't share
   a transaction: the later one gets `452 4.5.3`, so its sender delivers it
   separately.
+- **`quota-bytes`** (optional, on a domain or a mailbox; `0` or at least
+  1024): the storage quota. A mailbox's own value wins, then its domain's,
+  then the server's `mailbox-quota-bytes`; `0` means no quota. Under
+  catch-all, the catch-all inbox's quota applies to everything routed to
+  it.
 - **`mailboxes.*.expires`:** an RFC 3339 timestamp, or `null` for a
   permanent address.
 - **`public-key` / `key-generation`:** reserved for per-user encryption at
@@ -294,7 +304,7 @@ RUST_LOG=info mailserv --config /etc/mailserv/mailserv.toml | jq   # or | bunyan
 ### Automated tests
 
 ```sh
-cargo test --workspace          # 284 tests, 1 ignored
+cargo test --workspace          # 297 tests, 1 ignored
 cargo test -p dkim -- --ignored # the ignored one: fetches a real DKIM key over DoT
 cargo test -p spf               # one crate: smtp, spf, dkim, dmarc, mailparse, dns, mailserv
 ```

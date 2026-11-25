@@ -28,6 +28,7 @@ mod hashpw;
 mod headers;
 mod limit;
 mod privdrop;
+mod quota;
 mod server;
 mod session;
 mod spool;

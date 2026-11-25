@@ -116,9 +116,38 @@ pub fn shared_bits(path: &Path) -> Option<u32> {
     }
 }
 
+/// Returns the bytes available to unprivileged users on the filesystem
+/// holding `path` (`statvfs`: available blocks × fragment size).
+///
+/// # Errors
+///
+/// `path` contains a NUL byte or `statvfs` fails (e.g. it doesn't exist).
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string and `stat` is a
+    // properly sized, writable `statvfs` the call fills in.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[allow(clippy::useless_conversion)] // the field types vary by platform
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The free space of an existing directory is reported; a missing
+    /// path is an error.
+    #[test]
+    fn free_bytes_reports_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_bytes(dir.path()).unwrap() > 0);
+        assert!(free_bytes(&dir.path().join("missing")).is_err());
+    }
 
     /// Created files and directories are private even under a permissive
     /// umask (the test process's umask is typically 022).

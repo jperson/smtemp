@@ -20,6 +20,19 @@ pub(crate) struct DkimSummary {
     pub(crate) error: Option<String>,
 }
 
+impl From<&dkim::DkimResult<'_>> for DkimSummary {
+    fn from(result: &dkim::DkimResult<'_>) -> Self {
+        DkimSummary {
+            domain: result.signature.domain.to_string(),
+            selector: result.signature.selector.to_string(),
+            body_hash_ok: result.body_hash_ok,
+            signature_ok: result.signature_ok,
+            verified: result.body_hash_ok && result.signature_ok,
+            error: result.error.as_ref().map(|e| e.to_string()),
+        }
+    }
+}
+
 /// One DMARC verification outcome, summarized for structured logging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct DmarcSummary {

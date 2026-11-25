@@ -7,6 +7,24 @@ use crate::testutil::*;
 use std::sync::Arc;
 use std::time::Duration;
 
+impl UserSession<'_> {
+    /// Start a transaction as if MAIL FROM `from` had been accepted (no
+    /// SPF evaluated), for tests that begin at RCPT or DATA.
+    fn begin(&mut self, from: &str) {
+        self.txn = Some(Transaction::new(
+            from.to_string(),
+            None,
+            None,
+            self.max_data,
+        ));
+    }
+
+    /// Returns the transaction in progress (panics without one).
+    fn t(&mut self) -> &mut Transaction {
+        self.txn.as_mut().expect("a transaction in progress")
+    }
+}
+
 #[test]
 fn mail_from_reply_maps_verdicts() {
     use smtp::Control;
@@ -62,6 +80,7 @@ async fn per_ip_dns_limit_tempfails_each_stage() {
         sink: None,
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(crate::quota::StorageLimits::unlimited()),
     };
     let peer: SocketAddr = "192.0.2.7:40000".parse().unwrap();
     let mut session = UserSession::new(peer, false, &cfg);
@@ -77,16 +96,15 @@ async fn per_ip_dns_limit_tempfails_each_stage() {
     // MAIL FROM: 451, nothing recorded, so it can be retried.
     let control = session.mail_from("<a@sender.example>").await;
     assert_eq!(control, smtp::Control::tempfail(DNS_BUSY));
-    assert_eq!(session.mail_from, None);
+    assert!(session.txn.is_none());
 
     // End-of-data: 451 rather than skipping DKIM/DMARC; the envelope
     // is cleared.
-    session.mail_from = Some("a@sender.example".to_string());
-    session.data = b"From: a@sender.example\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
+    session.begin("a@sender.example");
+    session.t().data = b"From: a@sender.example\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
     let control = session.end_data().await;
     assert_eq!(control, smtp::Control::tempfail(DNS_BUSY));
-    assert_eq!(session.mail_from, None);
-    assert!(session.data.is_empty());
+    assert!(session.txn.is_none());
     assert_eq!(dns_limit.stats().refusals, 3);
 
     // Once the share frees up, the check really runs: the unreachable
@@ -110,10 +128,10 @@ async fn domain_size_limit_applies_to_its_recipients() {
     let cfg = size_limit_session(dir.path());
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
     let mut state = smtp::SmtpState::Ready;
-    session.mail_from = Some("x@sender.example".into());
+    session.begin("x@sender.example");
 
     assert!(session.rcpt_to("<a@small.example>").await.is_accept());
-    assert_eq!(session.txn_limit, 2048);
+    assert_eq!(session.t().limit, 2048);
 
     // 3 KiB of data crosses the 2 KiB domain limit.
     let line = format!("{}\r\n", "y".repeat(1022));
@@ -134,18 +152,12 @@ async fn domain_size_limit_applies_to_its_recipients() {
     let (reply, next) = session.handler(&state, b".\r\n").await;
     assert!(reply.is_empty());
     assert_eq!(next, smtp::SmtpState::Ready);
-    assert_eq!(session.mail_from, None);
-    assert!(session.rcpt_to.is_empty());
-    assert!(session.data.is_empty());
-    assert_eq!(
-        session.txn_limit, cfg.max_data,
-        "limit back to the server's"
-    );
+    assert!(session.txn.is_none());
 
     // A domain without its own limit keeps the server limit.
-    session.mail_from = Some("x@sender.example".into());
+    session.begin("x@sender.example");
     assert!(session.rcpt_to("<c@big.example>").await.is_accept());
-    assert_eq!(session.txn_limit, cfg.max_data);
+    assert_eq!(session.t().limit, cfg.max_data);
 }
 
 /// Recipients with different limits never share a transaction: the
@@ -157,7 +169,7 @@ async fn recipients_with_different_limits_are_split() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = size_limit_session(dir.path());
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
-    session.mail_from = Some("x@sender.example".into());
+    session.begin("x@sender.example");
 
     assert!(session.rcpt_to("<a@small.example>").await.is_accept());
     assert!(session.rcpt_to("<b@small.example>").await.is_accept());
@@ -168,18 +180,18 @@ async fn recipients_with_different_limits_are_split() {
                 .to_vec()
         )
     );
-    assert_eq!(session.rcpt_to.len(), 2);
-    assert_eq!(session.txn_limit, 2048);
+    assert_eq!(session.t().rcpt_to.len(), 2);
+    assert_eq!(session.t().limit, 2048);
 
     // The other order: the big domain first, then the small one.
     session.clear_envelope();
-    session.mail_from = Some("x@sender.example".into());
+    session.begin("x@sender.example");
     assert!(session.rcpt_to("<c@big.example>").await.is_accept());
     assert!(matches!(
         session.rcpt_to("<a@small.example>").await,
         smtp::Control::Tempfail(_)
     ));
-    assert_eq!(session.txn_limit, cfg.max_data);
+    assert_eq!(session.t().limit, cfg.max_data);
 }
 
 /// A SIZE declared at MAIL FROM is checked per recipient (RFC 1870
@@ -198,13 +210,13 @@ async fn declared_size_is_checked_per_recipient() {
     );
 
     // Under the server limit but over small.example's.
-    session.mail_from = Some("x@sender.example".into());
-    session.declared_size = Some(4096);
+    session.begin("x@sender.example");
+    session.t().declared_size = Some(4096);
     assert_eq!(
         session.rcpt_to("<a@small.example>").await,
         smtp::Control::reject(b"552 5.3.4 Message size exceeds the recipient's limit\r\n".to_vec())
     );
-    assert!(session.rcpt_to.is_empty());
+    assert!(session.t().rcpt_to.is_empty());
     // The same message is fine for the domain without a limit.
     assert!(session.rcpt_to("<c@big.example>").await.is_accept());
 }
@@ -234,12 +246,13 @@ async fn end_of_data_dns_deadline_tempfails() {
         sink: None,
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(crate::quota::StorageLimits::unlimited()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
 
     // DKIM stage: the key lookup for the signature never answers.
-    session.mail_from = Some("a@example.org".to_string());
-    session.data =
+    session.begin("a@example.org");
+    session.t().data =
         b"DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=sel; h=From; bh=AAAA; b=AAAA\r\n\
 From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
             .to_vec();
@@ -251,8 +264,7 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
         "{:?}",
         started.elapsed()
     );
-    assert_eq!(session.mail_from, None, "the transaction is over");
-    assert!(session.data.is_empty());
+    assert!(session.txn.is_none(), "the transaction is over");
     assert_eq!(session.message_count, 1);
     // It was the DKIM stage: one query (the key) was sent, and DKIM
     // never produced a result (a finished verification records one).
@@ -260,8 +272,8 @@ From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n"
     assert!(session.dkim.is_empty());
 
     // DMARC stage: no signature, so the policy fetch is what hangs.
-    session.mail_from = Some("a@example.org".to_string());
-    session.data = b"From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
+    session.begin("a@example.org");
+    session.t().data = b"From: a@example.org\r\nSubject: t\r\n\r\nbody\r\n".to_vec();
     let started = std::time::Instant::now();
     let control = session.end_data().await;
     assert_eq!(control, smtp::Control::tempfail(EOD_DNS_TIMEOUT));
@@ -305,6 +317,7 @@ async fn dkim_verdicts_do_not_leak_across_messages() {
         sink: None,
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(crate::quota::StorageLimits::unlimited()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
 
@@ -320,7 +333,8 @@ async fn dkim_verdicts_do_not_leak_across_messages() {
     });
 
     // Message 2: an unsigned spoof of the same domain.
-    session.data = b"From: someone@facebook.com\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
+    session.begin("x@attacker.example");
+    session.t().data = b"From: someone@facebook.com\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
     let control = session.end_data().await;
 
     assert!(
@@ -357,13 +371,14 @@ async fn dmarc_lookup_failure_defers_instead_of_delivering() {
         sink: None,
         deadline: None,
         fast_path: Arc::new(tokio::sync::Semaphore::new(16)),
+        storage: Arc::new(crate::quota::StorageLimits::unlimited()),
     };
     let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
-    session.mail_from = Some("x@attacker.example".into());
-    session.data = b"From: ceo@victim.example\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
+    session.begin("x@attacker.example");
+    session.t().data = b"From: ceo@victim.example\r\nSubject: spoof\r\n\r\nbody\r\n".to_vec();
     let control = session.end_data().await;
     assert_eq!(control, smtp::Control::tempfail(DMARC_TEMPFAIL));
-    assert_eq!(session.mail_from, None, "the transaction is over");
+    assert!(session.txn.is_none(), "the transaction is over");
     assert_eq!(session.message_count, 1);
 }
 
@@ -498,7 +513,7 @@ async fn auth_is_a_submission_feature() {
         sub.mail_from("<alice@example.org>").await.into_reply(),
         AUTH_REQUIRED
     );
-    assert!(sub.mail_from.is_none());
+    assert!(sub.txn.is_none());
     assert!(sub
         .auth("PLAIN", Some(right.as_bytes()))
         .await
@@ -528,7 +543,7 @@ async fn authenticated_mail_from_must_be_granted() {
             SENDER_NOT_OWNED,
             "{refused}"
         );
-        assert_eq!(s.mail_from, None);
+        assert!(s.txn.is_none());
     }
     assert!(s.mail_from("<ALICE@example.org>").await.is_accept());
     s.clear_envelope();
@@ -577,8 +592,7 @@ async fn authenticated_from_authors_must_be_granted() {
         }
         let reply = s.end_data().await.into_reply();
         assert_eq!(reply, expected, "{from}");
-        assert_eq!(s.mail_from, None, "transaction cleared");
-        assert!(s.rcpt_to.is_empty());
+        assert!(s.txn.is_none(), "transaction cleared");
     }
 }
 
@@ -589,15 +603,187 @@ async fn bare_cr_message_is_refused_before_dns() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = tests::size_limit_session(dir.path());
     let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
-    s.mail_from = Some("a@evil.example".into());
-    s.data = b"Subject: x\rFrom: CEO <ceo@victim.example>\r\nFrom: a@evil.example\r\n\r\nbody\r\n"
-        .to_vec();
+    s.begin("a@evil.example");
+    s.t().data =
+        b"Subject: x\rFrom: CEO <ceo@victim.example>\r\nFrom: a@evil.example\r\n\r\nbody\r\n"
+            .to_vec();
     assert_eq!(s.end_data().await.into_reply(), BARE_CR_IN_HEADER);
-    assert_eq!(s.mail_from, None);
-    assert!(s.data.is_empty());
+    assert!(s.txn.is_none());
     assert_eq!(
         cfg.dns.stats().queries,
         0,
         "no DNS work for a refused message"
+    );
+}
+
+/// An accepted HELO/EHLO ends the transaction in progress, like RSET
+/// (RFC 5321 §4.1.4): the next RCPT needs a new MAIL FROM.
+#[tokio::test]
+async fn ehlo_resets_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = size_limit_session(dir.path());
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@sender.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+
+    assert!(session.helo(true, "client.test").await.is_accept());
+    assert!(session.txn.is_none());
+    assert_eq!(
+        session.rcpt_to("<c@big.example>").await,
+        smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n".to_vec())
+    );
+}
+
+/// End of data takes the transaction: whatever the outcome it is gone
+/// afterwards, and without one there is nothing to accept.
+#[tokio::test]
+async fn end_of_data_consumes_the_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = size_limit_session(dir.path());
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    assert_eq!(
+        session.end_data().await,
+        smtp::Control::reject(NO_RECIPIENTS)
+    );
+    assert_eq!(session.message_count, 0, "no message without a transaction");
+
+    // A message refused at the first check still ends its transaction.
+    session.begin("x@sender.example");
+    session.t().data = b"Subject: x\rFrom: a@b.example\r\n\r\nbody\r\n".to_vec();
+    assert_eq!(
+        session.end_data().await,
+        smtp::Control::reject(BARE_CR_IN_HEADER)
+    );
+    assert!(session.txn.is_none());
+    assert_eq!(session.message_count, 1);
+}
+
+/// The mailbox quota is applied per recipient at RCPT: a full mailbox
+/// gets `452 4.2.2` while other recipients of the same transaction are
+/// accepted, and a size declared at MAIL FROM counts toward the quota.
+#[tokio::test]
+async fn mailbox_quota_defers_only_the_full_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = delivery::MaildirSink::open(dir.path().join("maildir")).unwrap();
+    let rcpt = |a: &str| spool::SpoolRcpt {
+        address: a.into(),
+        mailbox: a.into(),
+        user: None,
+        public_key: None,
+        key_generation: None,
+    };
+    use delivery::DeliverySink as _;
+    sink.deliver(&rcpt("a@small.example"), "q-1", &[b'x'; 100])
+        .unwrap();
+    sink.deliver(&rcpt("b@small.example"), "q-1", &[b'x'; 50])
+        .unwrap();
+    let cfg = SessionConfig {
+        sink: Some(Arc::new(sink)),
+        storage: Arc::new(crate::quota::StorageLimits {
+            mailbox_quota: Some(100),
+            ..crate::quota::StorageLimits::unlimited()
+        }),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+    session.begin("x@sender.example");
+    assert_eq!(
+        session.rcpt_to("<a@small.example>").await,
+        smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
+    );
+    assert!(session.rcpt_to("<b@small.example>").await.is_accept());
+    assert_eq!(session.t().rcpt_to.len(), 1, "only b was accepted");
+
+    // 50 stored + 60 declared is over 100.
+    session.clear_envelope();
+    session.begin("x@sender.example");
+    session.t().declared_size = Some(60);
+    assert_eq!(
+        session.rcpt_to("<b@small.example>").await,
+        smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
+    );
+}
+
+/// Below the free-disk floor, MAIL FROM is deferred (no transaction
+/// starts), and so is a message that reaches end of data.
+#[tokio::test]
+async fn low_disk_defers_new_mail() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        storage: Arc::new(crate::quota::StorageLimits {
+            min_free_disk: Some(u64::MAX),
+            watched: vec![dir.path().to_path_buf()],
+            ..crate::quota::StorageLimits::unlimited()
+        }),
+        // No DMARC policy anywhere, so end of data reaches the storage check.
+        dns: spawn_nxdomain_resolver().await,
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    assert_eq!(
+        session.mail_from("<x@sender.example>").await,
+        smtp::Control::tempfail(crate::quota::INSUFFICIENT_STORAGE)
+    );
+    assert!(session.txn.is_none());
+
+    // The disk filled up mid-transaction: the message isn't spooled.
+    session.begin("x@sender.example");
+    session.t().data = b"From: x@sender.example\r\n\r\nbody\r\n".to_vec();
+    assert_eq!(
+        session.end_data().await,
+        smtp::Control::tempfail(crate::quota::INSUFFICIENT_STORAGE)
+    );
+    assert!(session.txn.is_none());
+}
+
+/// The authority's quota beats the server default both ways: a larger
+/// per-mailbox quota and an explicit "no quota" accept a mailbox the
+/// default would defer, while one without its own value gets the default.
+#[tokio::test]
+async fn authority_quota_overrides_the_server_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quota-authority.json"); // size_limit_session writes authority.json
+    std::fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "domains": { "q.example": { "mode": "reject" } },
+            "mailboxes": {
+                "roomy@q.example": { "user": "r", "expires": null, "quota-bytes": 5000 },
+                "open@q.example": { "user": "o", "expires": null, "quota-bytes": 0 },
+                "std@q.example": { "user": "s", "expires": null }
+            }
+        }"#,
+    )
+    .unwrap();
+    let sink = delivery::MaildirSink::open(dir.path().join("maildir")).unwrap();
+    use delivery::DeliverySink as _;
+    for a in ["roomy@q.example", "open@q.example", "std@q.example"] {
+        let rcpt = spool::SpoolRcpt {
+            address: a.into(),
+            mailbox: a.into(),
+            user: None,
+            public_key: None,
+            key_generation: None,
+        };
+        sink.deliver(&rcpt, "q-1", &[b'x'; 2000]).unwrap();
+    }
+    let cfg = SessionConfig {
+        authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
+        sink: Some(Arc::new(sink)),
+        storage: Arc::new(crate::quota::StorageLimits {
+            mailbox_quota: Some(1000),
+            ..crate::quota::StorageLimits::unlimited()
+        }),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@sender.example");
+    assert!(session.rcpt_to("<roomy@q.example>").await.is_accept());
+    assert!(session.rcpt_to("<open@q.example>").await.is_accept());
+    assert_eq!(
+        session.rcpt_to("<std@q.example>").await,
+        smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
     );
 }

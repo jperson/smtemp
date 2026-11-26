@@ -145,13 +145,17 @@ impl UserSession<'_> {
         // A display name naming another organization's address is tagged
         // (a warning header and the spool metadata), never refused: list
         // software does it legitimately.
-        let display_name_claims = match (&from_value, &authors) {
-            (Some(value), Some(authors)) => display_name_claims(value, authors),
-            _ => Vec::new(),
+        let crate::headers::Claims {
+            shown: display_name_claims,
+            truncated: display_name_claims_truncated,
+        } = match (&from_value, &authors) {
+            (Some(value), Some(authors)) => display_name_claims_counted(value, authors),
+            _ => Default::default(),
         };
         if !display_name_claims.is_empty() {
             info!(
                 claims = ?display_name_claims,
+                claims_truncated = ?display_name_claims_truncated,
                 from_authors = ?authors,
                 "From display name names another domain; message tagged"
             );
@@ -318,6 +322,7 @@ impl UserSession<'_> {
                 message_size: raw.len(),
                 encryption: None, // set by the backend's encryptor, if any
                 display_name_claims,
+                display_name_claims_truncated,
             };
             // The trace headers go in now, once, before the write: the
             // stored payload is the final message for every recipient, so

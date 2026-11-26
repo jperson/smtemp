@@ -373,17 +373,44 @@ fn auth_results_id(value: &[u8]) -> Option<String> {
 /// names or comments but that belong to none of its `authors` (from
 /// [`from_authors`]), compared by organizational domain: what a reader
 /// could take for the sender when it isn't, as in `"ceo@victim.example"
-/// <x@attacker.example>`. Sorted and deduplicated. At most [`MAX_CLAIMS`]
-/// are returned, each cut to a DNS name's 253 octets (marked with `...`):
-/// the claims are copied into a header, the spool metadata and the log.
-/// An over-long claim is kept, cut, rather than dropped: no domain is that
-/// long, but a reader shown `ceo@paypal.com.aaaa…` still sees `paypal.com`.
+/// <x@attacker.example>`. See [`display_name_claims_counted`], which also
+/// says whether the list was cut; this is its list.
+pub fn display_name_claims(from_value: &[u8], authors: &[(String, String)]) -> Vec<String> {
+    display_name_claims_counted(from_value, authors).shown
+}
+
+/// The display-name claims of one From value (see
+/// [`display_name_claims_counted`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Claims {
+    /// The claimed domains reported: sorted, deduplicated, at most
+    /// [`MAX_CLAIMS`], each cut to a DNS name's 253 octets (marked `...`).
+    pub shown: Vec<String>,
+    /// `Some(n)` when more claimed domains were found than `shown` holds:
+    /// `n` is the number of addresses at another organization's domain
+    /// in the whole value (repeats included). `None` when nothing was
+    /// left out.
+    pub truncated: Option<usize>,
+}
+
+/// The claims of [`display_name_claims`], and whether any were left out.
+///
+/// The claims are copied into a header, the spool metadata and the log,
+/// so at most [`MAX_CLAIMS`] are kept. An over-long claim is kept, cut,
+/// rather than dropped: no domain is that long, but a reader shown
+/// `ceo@paypal.com.aaaa…` still sees `paypal.com`. Which ones are kept
+/// when there are more is in [`claimed_domains`]; no choice of a fixed
+/// number from a list the sender writes can be relied on to keep the one
+/// that matters, so a cut list says so ([`Claims::truncated`]). Real mail
+/// names one or two other domains at most; a cut list is a verdict of its
+/// own, and a filter should act on it (and on the warning itself) rather
+/// than on which domains it names.
 ///
 /// RFC 2047 encoded-words (`=?utf-8?B?...?=`) are decoded first, since
 /// mail clients display them decoded. An address in a different
 /// organization is common in legitimate list mail too (`"alice@example.com
 /// via Team" <team@lists.example>`), so this is a warning, not a refusal.
-pub fn display_name_claims(from_value: &[u8], authors: &[(String, String)]) -> Vec<String> {
+pub fn display_name_claims_counted(from_value: &[u8], authors: &[(String, String)]) -> Claims {
     let org = |d: &str| dmarc::psl::organizational_domain(d).unwrap_or_else(|| d.to_string());
     // A set: the authors can number up to `MAX_AUTHORS`, and the
     // candidates in the thousands.
@@ -404,7 +431,7 @@ const MAX_CLAIM_LEN: usize = 253;
 
 /// Returns at most [`MAX_CLAIMS`] of the domains [`for_each_address_domain`]
 /// finds in `text` that `keep` accepts, deduplicated and sorted, each cut
-/// to [`MAX_CLAIM_LEN`] (marked with `...`).
+/// to [`MAX_CLAIM_LEN`] (marked with `...`), and whether any were left out.
 ///
 /// Memory is bounded by the result, not by `text`: the candidates are
 /// kept in a set of at most `MAX_CLAIMS + 1` while the text is scanned.
@@ -412,14 +439,17 @@ const MAX_CLAIM_LEN: usize = 253;
 /// the public suffix list (`paypal.com`) are kept before those under an
 /// unlisted one (`a0.example`, `x.invalid`), then alphabetically: no real
 /// organization sits under an unlisted suffix, so filler addresses there
-/// can't push a claim about a real one out of the warning.
-fn claimed_domains(text: &[u8], mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+/// can't push a claim about a real one out of the warning. (Fillers under
+/// a listed suffix can; then [`Claims::truncated`] says so.)
+fn claimed_domains(text: &[u8], mut keep: impl FnMut(&str) -> bool) -> Claims {
     // Ordered by (unlisted, domain): the last entry is the first to drop.
     let mut best: std::collections::BTreeSet<(bool, String)> = Default::default();
+    let (mut addresses, mut dropped) = (0usize, false);
     for_each_address_domain(text, |mut domain| {
         if !keep(&domain) {
             return;
         }
+        addresses = addresses.saturating_add(1);
         // Domain characters are ASCII, so any byte is a boundary. A cut
         // name is longer than any DNS name, so it is never listed.
         if domain.len() > MAX_CLAIM_LEN {
@@ -435,18 +465,22 @@ fn claimed_domains(text: &[u8], mut keep: impl FnMut(&str) -> bool) -> Vec<Strin
         best.insert((unlisted, domain));
         if best.len() > MAX_CLAIMS {
             best.pop_last();
+            dropped = true;
         }
     });
-    let mut claims: Vec<String> = best.into_iter().map(|(_, d)| d).collect();
-    claims.sort();
-    claims
+    let mut shown: Vec<String> = best.into_iter().map(|(_, d)| d).collect();
+    shown.sort();
+    Claims {
+        shown,
+        truncated: dropped.then_some(addresses),
+    }
 }
 
 /// [`claimed_domains`] with nothing filtered out: the bounded selection
 /// of every `local@domain` in `text`.
 #[cfg(test)]
 fn address_domains(text: &[u8]) -> Vec<String> {
-    claimed_domains(text, |_| true)
+    claimed_domains(text, |_| true).shown
 }
 
 /// Calls `found` with the domain of every `local@domain` in `text`
@@ -1067,5 +1101,34 @@ Authentication-Results: mx.example.org; dmarc=pass\r\nSubject: s\r\n\r\nbody\r\n
         );
         let claims = display_name_claims(value.as_bytes(), &authors);
         assert!(claims.len() <= MAX_CLAIMS);
+    }
+
+    /// A cut claim list says so, with how many addresses were found, so a
+    /// filter can act on the overflow when the domain that matters was
+    /// left out (fillers under a listed suffix, which no fixed-size
+    /// selection can rule out). A list that fits, repeats included, is
+    /// not marked.
+    #[test]
+    fn cut_claims_are_marked() {
+        let authors = vec![("x".to_string(), "attacker.example".to_string())];
+        let counted = |names: &str| {
+            display_name_claims_counted(
+                format!("\"{names}\" <x@attacker.example>").as_bytes(),
+                &authors,
+            )
+        };
+        let pad: String = (0..MAX_CLAIMS).map(|i| format!("p@a{i}.com ")).collect();
+        let claims = counted(&format!("{pad}ceo@paypal.com"));
+        assert_eq!(claims.shown.len(), MAX_CLAIMS);
+        assert!(
+            !claims.shown.iter().any(|c| c == "paypal.com"),
+            "{claims:?}"
+        );
+        assert_eq!(claims.truncated, Some(MAX_CLAIMS + 1));
+
+        let fits = counted(&"ceo@paypal.com ".repeat(50));
+        assert_eq!(fits.shown, ["paypal.com"]);
+        assert_eq!(fits.truncated, None);
+        assert_eq!(counted("Bob").truncated, None);
     }
 }

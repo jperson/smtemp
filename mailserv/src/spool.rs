@@ -259,6 +259,12 @@ pub struct SpoolMeta {
     /// in spool files from before this field existed.
     #[serde(default)]
     pub display_name_claims: Vec<String>,
+    /// `Some(n)` when `display_name_claims` was cut to its bound: `n`
+    /// addresses at other organizations' domains were found in all (see
+    /// [`crate::headers::Claims::truncated`]). `None` when nothing was
+    /// left out, and in spool files from before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name_claims_truncated: Option<usize>,
 }
 
 /// One committed message in the queue, as returned by
@@ -729,6 +735,7 @@ mod tests {
             message_size: 0,
             encryption: None,
             display_name_claims: Vec::new(),
+            display_name_claims_truncated: None,
         }
     }
 

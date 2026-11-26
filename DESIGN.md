@@ -286,7 +286,11 @@ How the ordering is constrained:
   the declared `SIZE=`, or at the transaction's size limit when none was
   declared. So a sender that declares no size gets one copy per
   transaction into a nearly full mailbox, and the rest are deferred with
-  `452` to later transactions.
+  `452` to later transactions. The declared size isn't trusted blindly:
+  a message larger than its `SIZE=` is checked against each mailbox's
+  quota again at end of data, at its real size and to the same
+  one-message bound, and gets `452 4.2.2` if its copies don't fit. An
+  honest estimate (at most the declared size) is never re-checked.
   Deferring a full mailbox's recipient with `452` does reveal that the
   address exists, unlike the uniform `550` for refused addresses; quotas
   should rarely be reached.
@@ -512,7 +516,28 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
     this legitimately. The claims are also in the spool metadata
     (`display_name_claims`) and the log. At most 10 are kept, each cut
     at 253 bytes (an over-long one is cut, not dropped, so it still
-    warns).
+    warns). When there are more, domains under a listed public suffix
+    are kept before those under an unlisted one (`.example`, made-up
+    TLDs), then alphabetically, and the list is marked as cut: the
+    header ends `(truncated: 10 of the N addresses at other domains
+    shown)` and the metadata has `display_name_claims_truncated: N`.
+    No fixed-size selection from a list the sender writes can promise
+    to keep the domain that matters (ten fillers under `.com` that sort
+    first push out `paypal.com`), so **the header's presence, and the
+    truncation marker, are the verdict; the domains it names are a
+    hint**. A filter or UI should act on those, not match on a
+    particular domain in the list. Real mail names one or two other
+    domains at most, so a cut list is itself a strong spoofing signal.
+    This follows common practice: SpamAssassin's `FromNameSpoof` and
+    Rspamd's display-name rules emit a verdict or score, not a list.
+    A guarantee for specific names needs an operator-configured list
+    of protected domains reported outside the cap (the approach of
+    commercial gateways' impersonation protection); see §13.
+  - The `From:` value itself is bounded before any of this: a domain
+    over a DNS name's limits (253 octets, 63 per label) or a local-part
+    over 256 octets makes the `From:` unparseable (`550`), and more than
+    100 distinct authors in one field are refused, not cut, since every
+    author must pass the sender-grant check.
   - Before these are added, the message's own `Authentication-Results:`
     claiming our authserv-id, and any `X-Display-Name-Warning:`, are
     removed (RFC 8601 §5), so a sender can't plant a "pass".
@@ -767,6 +792,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 |---|---|---|
 | Only display names containing an address are checked; lookalike characters (`＠`, Cyrillic letters) and brand names aren't | `From: "PayPal Support" <x@attacker>` gets no warning | §2.4.4 |
 | The display-name warning is a header; mail clients don't show it | Protection depends on a UI (the console) surfacing it | §2.4.4 |
+| The display-name claim list is capped at 10 and has no protected-domain list | Fillers under listed suffixes can push a specific domain out of the list; the warning and its truncation marker still appear (§8), so only rules that match a named domain miss it. Accepted for V1 | — |
 
 ### Storage and encryption seams
 

@@ -479,9 +479,18 @@ pub fn with_trace_headers(meta: &SpoolMeta, raw: &[u8]) -> Vec<u8> {
             .iter()
             .map(|d| header_token(d))
             .collect();
+        // A cut list says so: the domains left out may include the one
+        // that matters, and that many claims is itself the signal.
+        let truncated = match meta.display_name_claims_truncated {
+            Some(addresses) => format!(
+                " (truncated: {} of the {addresses} addresses at other domains shown)",
+                claims.len()
+            ),
+            None => String::new(),
+        };
         out.extend_from_slice(
             format!(
-                "X-Display-Name-Warning: the From display name names {}, which is not the sender\r\n",
+                "X-Display-Name-Warning: the From display name names {}, which is not the sender{truncated}\r\n",
                 claims.join(", ")
             )
             .as_bytes(),
@@ -817,6 +826,7 @@ mod tests {
             message_size: 0,
             encryption: None,
             display_name_claims: Vec::new(),
+            display_name_claims_truncated: None,
         }
     }
 
@@ -962,6 +972,22 @@ mod tests {
             String::from_utf8(with_trace_headers(&meta, b"Subject: x\r\n\r\nbody\r\n")).unwrap();
         assert!(text.contains(
             "X-Display-Name-Warning: the From display name names victim.example, which is not the sender\r\nSubject: x"
+        ), "{text}");
+    }
+
+    /// A cut claim list is marked in the warning, with how many of the
+    /// addresses found at other domains are shown.
+    #[test]
+    fn trace_headers_mark_a_cut_claim_list() {
+        let meta = SpoolMeta {
+            display_name_claims: vec!["a0.com".into(), "a1.com".into()],
+            display_name_claims_truncated: Some(2400),
+            ..sample_meta()
+        };
+        let text =
+            String::from_utf8(with_trace_headers(&meta, b"Subject: x\r\n\r\nbody\r\n")).unwrap();
+        assert!(text.contains(
+            "X-Display-Name-Warning: the From display name names a0.com, a1.com, which is not the sender (truncated: 2 of the 2400 addresses at other domains shown)\r\nSubject: x"
         ), "{text}");
     }
 

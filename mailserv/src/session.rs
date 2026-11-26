@@ -17,8 +17,9 @@ use uuid::Uuid;
 use crate::address::{clean_path, path_domain, size_param, unsafe_local_part, valid_helo};
 use crate::authority::{self, Resolution};
 use crate::headers::{
-    display_name_claims, from_authors, from_header_domain, header_has_bare_cr, single_from_value,
-    strip_forged_verdicts, too_many_header_fields, FromHeader, MAX_HEADER_FIELDS,
+    display_name_claims_counted, from_authors, from_header_domain, header_has_bare_cr,
+    single_from_value, strip_forged_verdicts, too_many_header_fields, FromHeader,
+    MAX_HEADER_FIELDS,
 };
 use crate::quota::{StorageLimits, INSUFFICIENT_STORAGE, MAILBOX_FULL};
 use crate::verdict::{DkimSummary, DmarcSummary};

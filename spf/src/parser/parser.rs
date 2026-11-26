@@ -193,11 +193,13 @@ impl SpfMacroSubs {
 }
 
 /// Whether the TXT string `txt` is an SPF record: it begins with `v=spf1`
-/// (ASCII case-insensitive), followed by a space or the end of the string
-/// (RFC 7208 §4.5). `v=spf10` is not one.
+/// (ASCII case-insensitive), followed by LWSP (space or tab) or the end of
+/// the string (RFC 7208 §4.5). `v=spf10` and `v=spf1-all` are not.
 pub fn is_spf_record(txt: &str) -> bool {
     let txt = txt.as_bytes();
-    txt.len() >= 6 && txt[..6].eq_ignore_ascii_case(b"v=spf1") && (txt.len() == 6 || txt[6] == b' ')
+    txt.len() >= 6
+        && txt[..6].eq_ignore_ascii_case(b"v=spf1")
+        && (txt.len() == 6 || matches!(txt[6], b' ' | b'\t'))
 }
 
 /// Parse the full SPF record `s` (`v=spf1` plus terms) into its AST,

@@ -15,9 +15,14 @@
 //! consume capacity.
 //!
 //! The fixed-window counter trades precision for simplicity and O(1)
-//! state per IP; memory is bounded by the sweep on each release, which
-//! drops IPs with no active connections once their window has rolled
-//! over.
+//! state per IP. Past [`CONNECTION_SWEEP_AT`] tracked IPs, a new IP
+//! first sweeps IPs with no active connections whose window has rolled
+//! over (at most once per window, capped at [`CONNECTION_SWEEP_EVERY`],
+//! so churn cannot make every admission a full scan). Memory is
+//! hard-capped at [`CONNECTION_MAX_TRACKED`] IPs: with the table full of
+//! live entries a new IP is admitted untracked — subject only to the
+//! server-wide connection cap — rather than growing the table with
+//! attacker-chosen addresses.
 //!
 //! The [`DnsLimiter`] bounds a second resource per source IP: concurrent
 //! **DNS-backed evaluations** (SPF for HELO and MAIL FROM, DKIM + DMARC
@@ -73,9 +78,20 @@ struct Entry {
 }
 
 /// Past this many tracked IPs, admitting a new one first drops the IPs
-/// with no connections whose window has expired, so the map stays
-/// bounded however many addresses connect.
+/// with no connections whose window has expired.
 const CONNECTION_SWEEP_AT: usize = 4096;
+
+/// The most IPs a [`ConnectionLimiter`] tracks at once. If the table is
+/// still this full after a sweep, a new IP is admitted without per-IP
+/// tracking (the server-wide cap still bounds it), so the map stays
+/// bounded however many addresses connect.
+const CONNECTION_MAX_TRACKED: usize = 4096;
+
+/// Longest interval between sweeps of a table past its sweep threshold
+/// (the interval is the rate window when that is shorter). A sweep is
+/// O(tracked IPs); without a floor, churn from distinct addresses
+/// against a table full of live entries would rescan it on every admit.
+const CONNECTION_SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 /// Per-source-IP concurrency and rate limits, shared across the accept
 /// loop. All state sits behind one mutex, never held across an await; the
@@ -91,8 +107,32 @@ pub struct ConnectionLimiter {
     /// Tracked IPs at which a new one triggers a sweep
     /// ([`CONNECTION_SWEEP_AT`]).
     sweep_at: usize,
+    /// Hard cap on tracked IPs ([`CONNECTION_MAX_TRACKED`]).
+    max_tracked: usize,
     /// Per-IP state.
-    entries: std::sync::Mutex<HashMap<IpAddr, Entry>>,
+    entries: std::sync::Mutex<Tracked>,
+}
+
+/// The [`ConnectionLimiter`]'s mutex-protected state.
+#[derive(Debug)]
+struct Tracked {
+    /// Per-IP state, at most `max_tracked` entries.
+    map: HashMap<IpAddr, Entry>,
+    /// Earliest time a full table may be swept again.
+    next_sweep: Instant,
+}
+
+impl std::ops::Deref for Tracked {
+    type Target = HashMap<IpAddr, Entry>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for Tracked {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
 }
 
 /// An admitted connection's place in its IP's concurrent count, released
@@ -105,11 +145,16 @@ pub struct ConnectionSlot {
     limiter: Arc<ConnectionLimiter>,
     /// The connection's source IP.
     ip: IpAddr,
+    /// Whether the connection was counted in `ip`'s entry. False when
+    /// the table was full at admission; such a slot releases nothing.
+    tracked: bool,
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.limiter.release(self.ip);
+        if self.tracked {
+            self.limiter.release(self.ip);
+        }
     }
 }
 
@@ -122,13 +167,17 @@ impl ConnectionLimiter {
             max_per_window,
             window,
             sweep_at: CONNECTION_SWEEP_AT,
-            entries: std::sync::Mutex::new(HashMap::new()),
+            max_tracked: CONNECTION_MAX_TRACKED,
+            entries: std::sync::Mutex::new(Tracked {
+                map: HashMap::new(),
+                next_sweep: Instant::now(),
+            }),
         }
     }
 
     /// Lock the map, recovering it if a holder panicked (every update is a
     /// few field changes or one insert/remove, so it is always valid).
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tracked> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -141,12 +190,27 @@ impl ConnectionLimiter {
     /// active and window counts are then incremented). Returns
     /// `Err(reason)`, counting nothing, when the IP is over its concurrent
     /// cap or its window budget.
+    ///
+    /// When the table is full of live entries, a new IP is admitted
+    /// untracked: its per-IP limits are not enforced (the server-wide cap
+    /// still is), which keeps memory and per-admit cost bounded under
+    /// churn from many addresses without refusing every newcomer.
     pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<ConnectionSlot, LimitReason> {
         let mut entries = self.lock();
         let now = Instant::now();
-        if !entries.contains_key(&ip) && entries.len() >= self.sweep_at {
-            let window = self.window;
-            entries.retain(|_, e| e.active > 0 || now.duration_since(e.window_start) < window);
+        if !entries.contains_key(&ip) {
+            if entries.len() >= self.sweep_at && now >= entries.next_sweep {
+                let window = self.window;
+                entries.retain(|_, e| e.active > 0 || now.duration_since(e.window_start) < window);
+                entries.next_sweep = now + window.min(CONNECTION_SWEEP_EVERY);
+            }
+            if entries.len() >= self.max_tracked {
+                return Ok(ConnectionSlot {
+                    limiter: Arc::clone(self),
+                    ip,
+                    tracked: false,
+                });
+            }
         }
         let entry = entries.entry(ip).or_insert_with(|| Entry {
             active: 0,
@@ -172,6 +236,7 @@ impl ConnectionLimiter {
         Ok(ConnectionSlot {
             limiter: Arc::clone(self),
             ip,
+            tracked: true,
         })
     }
 
@@ -658,6 +723,42 @@ mod tests {
         assert!(task.await.unwrap_err().is_panic());
         assert_eq!(limiter.active(ip), 0, "the panic released the slot");
         let _next = limiter.admit(ip).unwrap();
+    }
+
+    /// AUDIT_20261126B F2 (Medium). The tracked-IP map has no hard cap:
+    /// the sweep at `sweep_at` entries drops only IPs whose window has
+    /// *expired*, so under churn from many distinct addresses — one
+    /// short-lived connection per IP, the shape of a distributed probe
+    /// — the map grows with the number of addresses seen in the window,
+    /// and every new IP rescans the whole map (the sweep is O(entries)
+    /// per admit: the same churn costs quadratic CPU on top of linear
+    /// memory). [`FailureLimiter`] bounds its own table at
+    /// [`FAILURE_MAX_TRACKED`] and refuses to track new IPs past it;
+    /// `ConnectionLimiter` must bound its state the same way (or stop
+    /// counting under pressure), so connection flood from unique
+    /// addresses cannot grow the accept path's footprint without
+    /// limit. Admitting 5000 one-connection IPs with a 60 s window
+    /// here leaves all 5000 entries live.
+    #[tokio::test]
+    async fn tracked_ips_are_bounded_under_churn() {
+        let mut lim = ConnectionLimiter::new(5, 5, Duration::from_secs(60));
+        lim.sweep_at = 64;
+        let limiter = Arc::new(lim);
+        for i in 0..5000u32 {
+            let ip: IpAddr = format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap();
+            // One connection per IP, released at once: nothing keeps
+            // the entry alive except the rate window itself.
+            drop(limiter.admit(ip).unwrap());
+        }
+        let tracked = limiter.lock().len();
+        assert!(
+            tracked <= 4096,
+            "{tracked} IPs are tracked after 5000 distinct one-connection \
+             addresses: the per-IP state must be bounded under churn (a hard \
+             cap like FailureLimiter's {FAILURE_MAX}), not grow with the \
+             addresses the attacker chooses",
+            FAILURE_MAX = FAILURE_MAX_TRACKED,
+        );
     }
 
     /// The 421 reply texts are retryable temporary failures.

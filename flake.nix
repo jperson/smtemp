@@ -17,9 +17,12 @@
           buildInputs = [
             pkgs.rust-bin.stable.latest.default
             pkgs.rust-analyzer
+            pkgs.cargo-fuzz
             pkgs.jq
             pkgs.pi-coding-agent
             pkgs.claude-code
+            pkgs.python3
+            pkgs.openssl
           ];
         };
       });

@@ -208,9 +208,11 @@ pub(crate) enum Command {
 
 /// The TOML config file schema ([`Args::config`]). Every field except
 /// `auth_users` mirrors the [`Args`] flag of the same name (kebab-case in
-/// the file) and is optional; unknown keys are ignored.
+/// the file) and is optional. Unknown keys are a parse error: a typo'd
+/// key (say `authorith`) must not silently leave a security control at
+/// its default (for `authority`, the accept-every-local-part fallback).
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) struct FileConfig {
     pub(crate) host: Option<String>,
     pub(crate) port: Option<u16>,
@@ -246,6 +248,18 @@ pub(crate) struct FileConfig {
     pub(crate) user: Option<String>,
     pub(crate) group: Option<String>,
     pub(crate) shutdown_grace_ms: Option<u64>,
+}
+
+/// Check the server's `domain`, which goes verbatim into the banner, EHLO
+/// replies, `Received: by` and the `Authentication-Results:` authserv-id:
+/// it must be a syntactic domain name (RFC 5321 rules, as for HELO; no
+/// address literal), so it can't be empty, carry whitespace or CR/LF into
+/// the wire, or defeat the forged-verdict stripper's authserv-id match.
+fn validate_domain(domain: String) -> Result<String> {
+    if domain.starts_with('[') || !crate::address::valid_helo(&domain) {
+        anyhow::bail!("--domain {domain:?} is not a valid domain name");
+    }
+    Ok(domain)
 }
 
 /// Fully resolved server configuration (CLI > file > built-in defaults).
@@ -437,7 +451,8 @@ pub(crate) fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
         domain: cli
             .domain
             .or(file.domain)
-            .ok_or_else(|| anyhow::anyhow!("a domain is required (--domain or the config file)"))?,
+            .ok_or_else(|| anyhow::anyhow!("a domain is required (--domain or the config file)"))
+            .and_then(validate_domain)?,
         max_data_bytes: cli
             .max_data_bytes
             .or(file.max_data_bytes)
@@ -847,7 +862,8 @@ mod tests {
     }
 
     /// `user`, `group` and `shutdown-grace-ms` resolve CLI > file;
-    /// `group` without `user` is a configuration error.
+    /// `user`, `group` and `shutdown-grace-ms` resolve CLI > file; `group`
+    /// without `user` is a configuration error.
     #[test]
     fn user_group_and_grace_resolution() {
         use clap::Parser as _;
@@ -874,5 +890,59 @@ mod tests {
 
         let err = resolve_config(args(&["--group", "mail"]), FileConfig::default()).unwrap_err();
         assert!(err.to_string().contains("--group requires --user"), "{err}");
+    }
+
+    /// AUDIT_20261126B F3 (Medium). `FileConfig` ignores unknown keys, so
+    /// a typo in the TOML file silently removes a security control. The
+    /// worst case is `authority`: a misspelled key parses "successfully",
+    /// the authority path stays unset, and the server comes up on the
+    /// **static fallback that accepts every local-part at every hosted
+    /// domain** (README: "never run an internet-facing server without
+    /// --authority"), on the real MX port, with only an INFO line
+    /// distinguishing it in the startup log. The same applies to
+    /// `min-free-disk-bytes`, `mailbox-quota-bytes`, the listener gates
+    /// (`submission-port`), and everything else: the operator believes a
+    /// control is in force while the default silently applies. The
+    /// config file is a security-relevant input (the authority file's own
+    /// schema is strict for exactly this reason: unknown fields there are
+    /// rejected); unknown keys here must be a startup error too.
+    #[test]
+    fn unknown_config_keys_are_a_startup_error() {
+        for bad in [
+            // a typo'd authority key must not silently fall back to the
+            // static accept-everything authority
+            "domain = \"d.example\"\nauthorith = \"/etc/mailserv/authority.json\"\n",
+            // a typo'd quota key must not silently remove the quota
+            "domain = \"d.example\"\nmailbox-quota-bytez = 10485760\n",
+            // a misspelled limit key must not silently keep the default
+            "domain = \"d.example\"\nmaxconnection = 40\n",
+        ] {
+            assert!(
+                toml::from_str::<FileConfig>(bad).is_err(),
+                "unknown key silently ignored: {bad:?}"
+            );
+        }
+    }
+
+    /// AUDIT_20261126B F5 (Low). `domain` — the only required setting —
+    /// is used unvalidated as the `220` banner, the EHLO reply, the
+    /// `Received: by`, and the `Authentication-Results:` authserv-id.
+    /// An empty/whitespace value silently breaks forged-verdict
+    /// stripping (a sender-chosen authserv-id can never equal the
+    /// server's empty one), and a value containing CR/LF injects header
+    /// lines into the banner and into every delivered message. Every
+    /// other startup input is validated; `--domain` must be non-empty,
+    /// free of whitespace and control characters (a syntactic domain or
+    /// nothing), or startup must fail.
+    #[test]
+    fn domain_is_validated_at_startup() {
+        use clap::Parser as _;
+        for bad in ["", "   ", "a b", "mx1.example.org\rX-Injected: 1"] {
+            let err = resolve_config(
+                Args::parse_from(["mailserv", "--domain", bad]),
+                FileConfig::default(),
+            );
+            assert!(err.is_err(), "--domain {bad:?} must be a startup error");
+        }
     }
 }

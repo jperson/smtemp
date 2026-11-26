@@ -601,6 +601,54 @@ async fn authenticated_from_authors_must_be_granted() {
     }
 }
 
+/// AUDIT_20261126C G1 (Medium, submission only). The grant check covers
+/// the envelope sender and every `From:` author — but not the other
+/// headers that name a sender. An authenticated login granted only
+/// `alice@example.org` can submit a message carrying `Sender:`,
+/// `Resent-From:` or `Resent-Sender:` naming any address at all, and it
+/// is delivered under our `Authentication-Results:` `auth=pass` verdict
+/// (verified against the live server). `Sender:` is the identity some
+/// auto-responders, bounces and filters treat as the real sender, and
+/// `Resent-From:` reads as a second, DMARC-unevaluated `From:` — so a
+/// grant holder can claim an identity the operator never granted. The
+/// envelope-sender check refuses these the same way (`550 5.7.1`); the
+/// header sender checks must too. (`Reply-To:` stays free: redirecting
+/// replies is ordinary mail practice.)
+#[tokio::test]
+async fn authenticated_sender_headers_must_be_granted() {
+    let dir = tempfile::tempdir().unwrap();
+    // NXDOMAIN for everything, so no DMARC policy exists and the
+    // accepted-and-delivered path (today) answers 250, not 451.
+    let mut cfg = session_cfg(dir.path());
+    cfg.dns = spawn_nxdomain_resolver().await;
+    for header in [
+        "Sender: ceo@victim.example",
+        "Resent-From: ceo@victim.example",
+        "Resent-Sender: ceo@victim.example",
+        // Not even the granted address itself disguised in the header is
+        // the point of the check: an *ungranted* identity must refuse.
+        "Sender: anyone@alice.example",
+    ] {
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.authenticated = Some("alice".into());
+        assert!(s.mail_from("<alice@example.org>").await.is_accept());
+        assert!(s.rcpt_to("<a@small.example>").await.is_accept());
+        for line in [
+            format!("From: alice@example.org\r\n{header}\r\n"),
+            "\r\n".into(),
+            "body\r\n".into(),
+        ] {
+            assert!(matches!(
+                s.recv_data(line.as_bytes()).await,
+                smtp::DataControl::Continue
+            ));
+        }
+        let reply = s.end_data().await.into_reply();
+        assert_eq!(reply, FROM_NOT_OWNED, "message with {header:?}");
+        assert!(s.txn.is_none(), "transaction cleared");
+    }
+}
+
 /// The message is refused at end-of-data with 550 before any DNS
 /// work, and the transaction is cleared.
 #[tokio::test]

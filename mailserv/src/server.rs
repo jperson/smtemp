@@ -704,6 +704,9 @@ pub(crate) async fn refuse_async(
     }
 }
 
+/// Size of the throwaway buffer [`refuse`] drains a refused peer into.
+const REFUSE_DRAIN_BUF: usize = 8 * 1024;
+
 /// Answer the refused connection `stream` with the SMTP error `reply`
 /// and close it. The whole exchange is capped at 2 s: the write is capped so a client that never reads cannot stall; afterwards
 /// the socket is drained briefly so the client can read the reply before
@@ -711,6 +714,8 @@ pub(crate) async fn refuse_async(
 /// RST, which discards the client's pending receive buffer (it would
 /// never see the 421). Failures are ignored — the connection is being
 /// dropped anyway. Runs only in spawned tasks (see [`refuse_async`]).
+/// The drain discards into a fixed [`REFUSE_DRAIN_BUF`] buffer, so a
+/// refusal's memory is O(1) however much the peer sends.
 pub(crate) async fn refuse(stream: TcpStream, reply: &[u8]) {
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         let mut stream = stream;
@@ -722,10 +727,17 @@ pub(crate) async fn refuse(stream: TcpStream, reply: &[u8]) {
         }
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
         // Read until EOF (or the cap) so no inbound data triggers RST.
-        let mut sink = Vec::new();
+        // The bytes are discarded into one fixed buffer: this path runs
+        // when the server is at capacity, so buffering what a flooding
+        // peer sends would turn a refusal into an unbounded allocation.
+        let mut sink = [0u8; REFUSE_DRAIN_BUF];
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             use tokio::io::AsyncReadExt as _;
-            let _ = stream.read_to_end(&mut sink).await;
+            while let Ok(n) = stream.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
         })
         .await;
     })

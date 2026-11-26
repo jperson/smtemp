@@ -1076,3 +1076,94 @@ async fn grace_accepts_recently_expired_only() {
     );
     client.write_all(b"QUIT\r\n").await.unwrap();
 }
+
+/// AUDIT_20261126B F1 (High). A refused connection is answered by
+/// [`refuse`], whose courtesy drain does `read_to_end` — it buffers
+/// every byte the peer sends until its 500 ms window ends. That path
+/// runs exactly when the server is at capacity, from a pool of 32
+/// concurrent tasks: one probe measured a single refused connection
+/// pushing ~1 GB of loopback flood into the process's heap before the
+/// timeout fires, and 32 of them can run at once. An attacker with a
+/// modest bandwidth budget therefore turns a *refusal* (the cheapest
+/// possible server action) into an unbounded memory allocation — an
+/// OOM kill of the whole MX under load, losing every in-progress
+/// session and (under systemd `Restart=always`) cycling the service.
+/// The drain exists only so the client can read the 421 before close;
+/// it must discard what it reads, never accumulate it. Property pinned
+/// here: answering one flooded refused connection grows the process's
+/// resident memory by at most a few MiB.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn refused_connections_do_not_buffer_the_peer_flood() {
+    use tokio::io::AsyncWriteExt as _;
+
+    /// This process's resident set, in bytes (/proc/self/statm field 2,
+    /// which counts pages).
+    fn resident_bytes() -> u64 {
+        // SAFETY: sysconf has no preconditions; _SC_PAGESIZE is always valid.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        statm
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * page
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let refused = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        refuse(
+            stream,
+            b"421 4.7.0 Service not available, try again later\r\n",
+        )
+        .await;
+    });
+
+    let mut client = TestTcpStream::connect(addr).await.unwrap();
+
+    // Sample RSS while the refusal runs; peak minus the starting value
+    // is what the drain retained.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let sampler = std::thread::spawn(move || {
+        let base = resident_bytes();
+        let mut peak = base;
+        while stop_rx.try_recv().is_err() {
+            peak = peak.max(resident_bytes());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        peak - base
+    });
+
+    // Flood for longer than the 500 ms the refusal spends reading.
+    let chunk = vec![b'x'; 1 << 20];
+    let mut sent = 0u64;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(900) {
+        if client.write_all(&chunk).await.is_err() {
+            break; // the refusal closed early: the drain was bounded
+        }
+        sent += chunk.len() as u64;
+    }
+    // Hold the connection open past the drain window, then leave.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(client);
+    let _ = refused.await;
+    let _ = stop_tx.send(());
+    let growth = sampler.join().unwrap();
+
+    // With the flood unbounded (today), even a fraction of a second on
+    // loopback is hundreds of MB. The bound must be small no matter how
+    // much the peer managed to push.
+    assert!(
+        growth < 16 << 20,
+        "answering one refused connection grew this process by {} MB while \
+         the peer pushed {} MB: the refusal must discard the flood, not \
+         buffer it",
+        growth >> 20,
+        sent >> 20,
+    );
+}

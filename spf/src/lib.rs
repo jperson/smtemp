@@ -1760,4 +1760,43 @@ mod record_edge_case_tests {
             assert!(!is_spf_record(no), "{no}");
         }
     }
+
+    /// AUDIT_20261126B F4 (Low). RFC 7208 §4.5: the separator after
+    /// `v=spf1` is `sep = LWSP` — a space, a tab, or foldable
+    /// whitespace — so `v=spf1\t-all` is a well-formed record that
+    /// authorizes nothing and must produce **Fail** for an unlisted
+    /// sender. `is_spf_record` accepts only a literal space (or the end
+    /// of the string) after the version token, so a tab-separated
+    /// record is not recognized as a record at all: the domain looks
+    /// like it publishes no SPF policy, `check_host` is `None`, and the
+    /// envelope is accepted. The `-all` the domain published is never
+    /// evaluated — a silent fail-open of exactly the kind §4.6.1 warns
+    /// about (an unparseable record must be a PermError, never "no
+    /// record"). Rare in practice (a victim-side misconfiguration, not
+    /// an attacker-chosen field), but the whole point of the SPF gate
+    /// is that a published hard fail can never read as "no opinion".
+    #[test]
+    fn tab_separated_records_are_records() {
+        assert!(
+            is_spf_record("v=spf1\t-all"),
+            "RFC 7208 §4.5: sep is LWSP, which includes HTAB"
+        );
+        assert!(is_spf_record("v=spf1\t"));
+    }
+
+    /// The same record end to end: with the tab as separator, an
+    /// unlisted IP must get Fail (550 at MAIL FROM), and a listed one
+    /// Pass — never `None` (accepted, no assertion).
+    #[tokio::test]
+    async fn tab_separated_records_are_evaluated() {
+        assert_eq!(
+            eval("v=spf1\tip4:192.0.2.1 -all", "198.51.100.9").await,
+            SpfResult::Fail,
+            "a tab-separated -all must still produce Fail"
+        );
+        assert_eq!(
+            eval("v=spf1\tip4:192.0.2.1 -all", "192.0.2.1").await,
+            SpfResult::Pass
+        );
+    }
 }

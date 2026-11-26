@@ -74,6 +74,32 @@ pub fn header_has_bare_cr(raw: &[u8]) -> bool {
         .any(|(i, &b)| b == b'\r' && block.get(i + 1) != Some(&b'\n'))
 }
 
+/// The most header fields a message may have. Real mail has tens (a long
+/// relay chain a few hundred lines, most of them continuations, which
+/// don't count). The bound is for memory: every header scan
+/// ([`mailparse::extract_raw_headers`]) holds an entry per field, and
+/// at two bytes per field a 10 MiB message could otherwise be millions.
+pub const MAX_HEADER_FIELDS: usize = 1000;
+
+/// Whether the header block of `raw` has more than `max` fields, counting
+/// every line that doesn't continue a field (malformed lines included).
+/// Allocates nothing.
+pub fn too_many_header_fields(raw: &[u8], max: usize) -> bool {
+    let block = &raw[..header_block_end(raw)];
+    let starts_field = |line_start: usize| {
+        block
+            .get(line_start)
+            .is_some_and(|&b| b != b' ' && b != b'\t')
+    };
+    let fields = usize::from(starts_field(0))
+        + block
+            .iter()
+            .enumerate()
+            .filter(|&(i, &b)| b == b'\n' && starts_field(i + 1))
+            .count();
+    fields > max
+}
+
 /// Returns the length of the header block of the raw message `raw`: up to
 /// the first empty line (the shared [`mailparse::find_separator`]), or all
 /// of `raw` when there is none.
@@ -308,7 +334,11 @@ fn auth_results_id(value: &[u8]) -> Option<String> {
 /// names or comments but that belong to none of its `authors` (from
 /// [`from_authors`]), compared by organizational domain: what a reader
 /// could take for the sender when it isn't, as in `"ceo@victim.example"
-/// <x@attacker.example>`. Sorted and deduplicated.
+/// <x@attacker.example>`. Sorted and deduplicated. At most [`MAX_CLAIMS`]
+/// are returned, each cut to a DNS name's 253 octets (marked with `...`):
+/// the claims are copied into a header, the spool metadata and the log.
+/// An over-long claim is kept, cut, rather than dropped: no domain is that
+/// long, but a reader shown `ceo@paypal.com.aaaa…` still sees `paypal.com`.
 ///
 /// RFC 2047 encoded-words (`=?utf-8?B?...?=`) are decoded first, since
 /// mail clients display them decoded. An address in a different
@@ -316,15 +346,34 @@ fn auth_results_id(value: &[u8]) -> Option<String> {
 /// via Team" <team@lists.example>`), so this is a warning, not a refusal.
 pub fn display_name_claims(from_value: &[u8], authors: &[(String, String)]) -> Vec<String> {
     let org = |d: &str| dmarc::psl::organizational_domain(d).unwrap_or_else(|| d.to_string());
-    let author_orgs: Vec<String> = authors.iter().map(|(_, d)| org(d)).collect();
+    // A set: both the authors and the claims can number in the thousands.
+    let author_orgs: std::collections::HashSet<String> =
+        authors.iter().map(|(_, d)| org(d)).collect();
     let mut claims: Vec<String> = address_domains(&decode_encoded_words(from_value))
         .into_iter()
         .filter(|d| !author_orgs.contains(&org(d)))
+        .map(|mut d| {
+            // Domain characters are ASCII, so any byte is a boundary.
+            if d.len() > MAX_CLAIM_LEN {
+                d.truncate(MAX_CLAIM_LEN);
+                d.push_str("...");
+            }
+            d
+        })
         .collect();
     claims.sort();
     claims.dedup();
+    claims.truncate(MAX_CLAIMS);
     claims
 }
+
+/// The most display-name claims [`display_name_claims`] reports. One is
+/// enough to warn; a few more help whoever reads the header.
+pub const MAX_CLAIMS: usize = 10;
+
+/// The longest claimed domain [`display_name_claims`] reports in full: a
+/// DNS name's 253 octets.
+const MAX_CLAIM_LEN: usize = 253;
 
 /// Returns the domain of every `local@domain` in `text` (lowercased, a
 /// trailing dot removed): an `@` with a non-space character before it and
@@ -352,14 +401,24 @@ fn address_domains(text: &[u8]) -> Vec<String> {
 /// to their raw bytes, whatever the charset (only ASCII is looked at
 /// afterwards, and every common charset is an ASCII superset). Anything
 /// that isn't a well-formed encoded-word is kept as it is.
+///
+/// Linear in `value`, which is attacker-chosen and can be megabytes (a
+/// folded `From:`): a candidate that turns out not to be an encoded-word
+/// never makes the scan go back over the rest of the value. The end of
+/// each candidate's text (the next `?=`) comes from [`NextCloser`], which
+/// only moves forward; a `B` text is checked for base64 characters
+/// before it is decoded (that check stops at the next candidate's `?`);
+/// a `Q` text stops decoding at the next candidate's `=?`, an invalid
+/// escape.
 fn decode_encoded_words(value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len());
+    let mut closer = NextCloser::new(value);
     let mut i = 0;
     while i < value.len() {
         if value[i..].starts_with(b"=?") {
-            if let Some((decoded, used)) = decode_one_word(&value[i..]) {
+            if let Some((decoded, end)) = decode_one_word(value, i, &mut closer) {
                 out.extend_from_slice(&decoded);
-                i += used;
+                i = end;
                 continue;
             }
         }
@@ -369,31 +428,87 @@ fn decode_encoded_words(value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode the encoded-word at the start of `word`.
+/// Finds the next `?=` in a value, for searches that start further and
+/// further on: the last answer is kept and reused while it is still
+/// ahead of the search, so every byte is scanned about once in all.
+struct NextCloser<'v> {
+    /// The value searched.
+    value: &'v [u8],
+    /// Where the last search started.
+    from: usize,
+    /// Its answer: the offset of the first `?=` at or after `from`, or
+    /// `None` when there is none.
+    found: Option<usize>,
+}
+
+impl<'v> NextCloser<'v> {
+    fn new(value: &'v [u8]) -> Self {
+        let mut closer = NextCloser {
+            value,
+            from: 0,
+            found: None,
+        };
+        closer.found = closer.scan(0);
+        closer
+    }
+
+    /// The offset of the first `?=` at or after `start`.
+    fn at_or_after(&mut self, start: usize) -> Option<usize> {
+        // The last answer holds for any later start up to it, and "none
+        // after `from`" holds for any later start.
+        let still_valid = start >= self.from && self.found.is_none_or(|p| p >= start);
+        if !still_valid {
+            self.from = start;
+            self.found = self.scan(start);
+        }
+        self.found
+    }
+
+    fn scan(&self, start: usize) -> Option<usize> {
+        self.value
+            .get(start..)?
+            .windows(2)
+            .position(|w| w == b"?=")
+            .map(|p| start + p)
+    }
+}
+
+/// Decode the encoded-word that starts at `value[start..]` (with `=?`),
+/// using `closer` to find where its text ends.
 ///
-/// Returns the decoded bytes and the length of the encoded-word, or
-/// `None` when it isn't one.
-fn decode_one_word(word: &[u8]) -> Option<(Vec<u8>, usize)> {
+/// Returns the decoded bytes and the offset just past the encoded-word,
+/// or `None` when it isn't one.
+fn decode_one_word(
+    value: &[u8],
+    start: usize,
+    closer: &mut NextCloser<'_>,
+) -> Option<(Vec<u8>, usize)> {
     // =?charset?enc?text?=
-    let rest = &word[2..];
+    let rest = &value[start + 2..];
+    // Stops at the latest at the `?` of the next `=?`.
     let q1 = rest.iter().position(|&b| b == b'?')?;
     let enc = *rest.get(q1 + 1)?;
     if rest.get(q1 + 2) != Some(&b'?') {
         return None;
     }
-    let text_start = q1 + 3;
-    let text_len = rest[text_start..].windows(2).position(|w| w == b"?=")?;
-    let text = &rest[text_start..text_start + text_len];
-    let used = 2 + text_start + text_len + 2;
+    let text_start = start + 2 + q1 + 3;
+    let text_end = closer.at_or_after(text_start)?;
+    let text = &value[text_start..text_end];
+    let end = text_end + 2;
     let decoded = match enc.to_ascii_uppercase() {
         b'B' => {
             use base64::Engine as _;
+            let base64_char =
+                |&b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+            if !text.iter().all(base64_char) {
+                return None;
+            }
             base64::engine::general_purpose::STANDARD
                 .decode(text)
                 .ok()?
         }
         b'Q' => {
-            let mut bytes = Vec::with_capacity(text.len());
+            let mut bytes = Vec::new();
             let mut j = 0;
             while j < text.len() {
                 match text[j] {
@@ -413,7 +528,7 @@ fn decode_one_word(word: &[u8]) -> Option<(Vec<u8>, usize)> {
         }
         _ => return None,
     };
-    Some((decoded, used))
+    Some((decoded, end))
 }
 
 #[cfg(test)]
@@ -643,5 +758,94 @@ Authentication-Results: mx.example.org; dmarc=pass\r\nSubject: s\r\n\r\nbody\r\n
             strip_forged_verdicts(raw, "mx.example.org").as_ref(),
             &b"From: a@x.example\r\ngarbage\r\n ceo@victim.example\r\nSubject: s\r\n\r\nbody\r\n"[..]
         );
+    }
+
+    /// Encoded-words next to and inside each other decode as before: an
+    /// unterminated candidate, a candidate inside another's text, a `B`
+    /// text with a non-base64 byte, and a `Q` text with a `?` in it.
+    #[test]
+    fn encoded_word_edge_cases() {
+        let decode = |v: &str| String::from_utf8(decode_encoded_words(v.as_bytes())).unwrap();
+        assert_eq!(decode("=?a?B?YWI=?= =?a?Q?c_d?="), "ab c d");
+        assert_eq!(decode("=?a?B?YWI=?=?="), "ab?=");
+        assert_eq!(decode("=?a?b?Z =?a?B?YWI=?="), "=?a?b?Z ab");
+        assert_eq!(decode("=?a?B?Y?WI=?="), "=?a?B?Y?WI=?=");
+        assert_eq!(decode("=?a?Q?x?y?="), "x?y");
+        assert_eq!(decode("=?a?Q?x=?a?Q?y?="), "=?a?Q?xy");
+        assert_eq!(decode("=?a?Q?x=4"), "=?a?Q?x=4");
+        assert_eq!(decode("=?"), "=?");
+        assert_eq!(decode("=?a?"), "=?a?");
+        assert_eq!(decode("=?a?B?"), "=?a?B?");
+    }
+
+    /// Pathological From values cost time linear in their size: an
+    /// unterminated encoded-word prefix repeated (each one rescanned the
+    /// rest of the value: 896 KB took 14.5 s in a release build), a `B`
+    /// text that never decodes, and thousands of claims and authors.
+    #[test]
+    fn display_name_claims_are_linear() {
+        use std::time::{Duration, Instant};
+        let authors = vec![("x".to_string(), "example.invalid".to_string())];
+        let unterminated = "=?a?b?Z".repeat(300_000) + " x@example.invalid";
+        let bad_base64 = "=?a?B?!".repeat(300_000) + "?= x@example.invalid";
+        let long_domains = format!("{} <x@example.invalid>", "a@ab.".repeat(200_000) + "cd");
+        let started = Instant::now();
+        for value in [&unterminated, &bad_base64, &long_domains] {
+            display_name_claims(value.as_bytes(), &authors);
+        }
+        let many_authors: Vec<(String, String)> = (0..20_000)
+            .map(|i| (format!("u{i}"), "example.invalid".to_string()))
+            .collect();
+        let many_claims =
+            "\"".to_string() + &"c@a.example ".repeat(20_000) + "\" <x@example.invalid>";
+        assert_eq!(
+            display_name_claims(many_claims.as_bytes(), &many_authors),
+            ["a.example"]
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Header fields are counted without parsing: continuation lines
+    /// don't count, malformed lines do, and the body isn't looked at.
+    #[test]
+    fn header_fields_are_counted() {
+        let count_over = |raw: &[u8], max| too_many_header_fields(raw, max);
+        let raw = b"A: 1\r\n folded\r\n\tagain\r\nB: 2\r\nmalformed\r\n\r\nC: body\r\nD: body\r\n";
+        assert!(!count_over(raw, 3));
+        assert!(count_over(raw, 2));
+        assert!(!count_over(b"", 0));
+        assert!(!count_over(b"\r\nbody\r\n", 0));
+        let mut many = "a:b\r\n".repeat(MAX_HEADER_FIELDS);
+        assert!(!count_over(many.as_bytes(), MAX_HEADER_FIELDS));
+        many.push_str("a:b\r\n\r\n");
+        assert!(count_over(many.as_bytes(), MAX_HEADER_FIELDS));
+    }
+
+    /// The claims are bounded in number and length: they are copied into
+    /// a header, the spool metadata and the log.
+    #[test]
+    fn display_name_claims_are_bounded() {
+        let authors = vec![("x".to_string(), "attacker.example".to_string())];
+        let many: String = (0..50).map(|i| format!("c@v{i:02}.example ")).collect();
+        let claims = display_name_claims(
+            format!("\"{many}\" <x@attacker.example>").as_bytes(),
+            &authors,
+        );
+        assert_eq!(claims.len(), MAX_CLAIMS);
+        assert_eq!(claims[0], "v00.example");
+
+        let long = format!("paypal.com.{}", "a".repeat(60_000));
+        let claims = display_name_claims(
+            format!("\"ceo@{long}\" <x@attacker.example>").as_bytes(),
+            &authors,
+        );
+        assert_eq!(claims.len(), 1, "kept, not dropped");
+        assert!(claims[0].starts_with("paypal.com.aaa"));
+        assert_eq!(claims[0].len(), MAX_CLAIM_LEN + 3);
+        assert!(claims[0].ends_with("..."));
     }
 }

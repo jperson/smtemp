@@ -1,6 +1,6 @@
 # PLAN.md — Remaining work
 
-**As of 2026-11-24:** 328 tests pass (1 ignored) with no network beyond
+**As of 2026-11-25:** 347 tests pass (1 ignored) with no network beyond
 loopback; clippy, fmt, rustdoc and `cargo audit` are clean on Rust 1.100.0.
 
 This file lists only what is **left to do**. How things work is in
@@ -22,10 +22,11 @@ optional. Send-side work is post-V1 (§6).
 |---|---|
 | SMTP core, STARTTLS, framing and smuggling defences | ✅ Done |
 | SPF, DKIM, DMARC verification (fail-closed) | ✅ Done: RFC 7208 lookup limits, PSL-based relaxed alignment, bounce alignment; our `Authentication-Results:` and display-name warnings on delivered mail |
-| Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits) | ✅ Done. A console-backed authority is not started (§5) |
+| Recipient authority (file-backed, hot-reloaded, `reject`/`catch-all`/`grace`, per-domain size limits, per-mailbox and per-domain quotas) | ✅ Done. A console-backed authority is not started (§5) |
 | Durable spool, maildir delivery, retry with backoff for 5 days, crash-debris sweep | ✅ Done, maildir directories fsynced and their `tmp/` swept |
 | Connection, per-IP and DNS limits; privilege drop; graceful shutdown | ✅ Done, with per-mailbox quotas (authority file, server default) and a free-disk floor. Recipient probing limited per connection and per IP |
 | Submission (587 STARTTLS, 465 implicit TLS) with AUTH and sender grants | ✅ Done: AUTH only on submission listeners and required there; argon2id-hashed credentials file reloaded on SIGHUP, attempt limits |
+| Assurance | ✅ Fuzz targets, run in CI. ⏳ Independent security review not done (§2.4.6) |
 | Pilot deployment | ⏳ Code ready. The DEPLOYMENT.md checklist is not done (§2.1) |
 | S3 storage, per-user encryption, multiple MX hosts | 📐 Designed, not started (§5) |
 
@@ -46,7 +47,7 @@ optional. Send-side work is post-V1 (§6).
 Done: the drain works through the `SpoolQueue` trait (not `DiskSpool`),
 and trace headers are written once into the stored payload at acceptance,
 naming no recipient, so a sealed payload is delivered verbatim (DESIGN
-§10). Nothing is left in this section.
+§8). Nothing is left in this section.
 
 ### 2.3 Submission
 
@@ -64,7 +65,8 @@ credentials file, so a login is revoked by removing it and reloading.
 
 ### 2.4 Before general availability
 
-Fix these after the pilot starts and before GA, in this order:
+Every code item here is done; what remains in each is marked **Open**.
+The one GA blocker left is the independent security review (item 6).
 
 1. **Storage quotas.** Done: per-mailbox quotas from the authority file
    (`quota-bytes` on a mailbox or its domain, falling back to the server's
@@ -111,7 +113,10 @@ One line per open item; DESIGN.md §13 has the impact of each.
 | Gap | DESIGN §13 area | Planned in |
 |---|---|---|
 | Quotas are soft and don't count queued mail; no per-domain total | Abuse resistance | §2.4.1 |
+| A large provider's shared outbound IP can exhaust the per-IP refusal budget with legitimate refusals (mail deferred, not lost) | Abuse resistance | §2.4.2 |
+| The Public Suffix List is a snapshot (a missing second-level registry zone weakens relaxed alignment) | Abuse resistance | §2.4.3 (refresh, DEPLOYMENT.md H7) |
 | Display names without an address, and lookalike characters, aren't checked | What users are shown | §2.4.4 |
+| The display-name warning is a header that mail clients don't show | What users are shown | §2.4.4 (a console UI) |
 | Sender grants read only at startup | Submission and AUTH | §6 |
 | SPF `a`/`mx` don't query AAAA; per-IP limits not aggregated per IPv6 /64 | Correctness; Abuse resistance | §6 (IPv6 readiness) |
 | `quarantine` delivered as normal mail | Correctness and delivery | Out of V1 scope (decided) |
@@ -127,6 +132,8 @@ From the design and code assessment in
   `session/message.rs` for end of data), `address`, `headers`, `tls` and
   `verdict` (DESIGN §2); per-message state is one `Transaction` value;
   DKIM verification runs on the blocking pool; the tests are hermetic.
+  `address` and `headers` are a small library target (`mailserv/src/lib.rs`)
+  so they can be fuzzed.
 - One raw header scanner (`mailparse::extract_raw_headers` and
   `find_separator`) for DKIM, the From scan, the bare-CR check and
   verdict stripping; one mailbox-safe character set
@@ -152,12 +159,12 @@ addresses exist lives in the external console. Order: recipient authority
 
 | Feature | Status | Next step / blockers |
 |---|---|---|
-| **Console-backed authority** | Not started; the `RecipientResolver` seam is ready | HTTP/gRPC implementation behind the same trait, plus a shared TTL cache beyond the per-session one |
+| **Console-backed authority** | Not started; the `RecipientResolver` seam is ready | HTTP/gRPC (or database) implementation behind the same trait, returning the same `Recipient` fields: routing mailbox, owner, keys, size limit and quota (per user, from the admin console); plus a shared TTL cache beyond the per-session one |
 | **Refusal and admin event stream** | Server side done (structured refusal and delivery logs) | The console aggregates them; possibly a server-side ingest queue if refusal volume demands it |
-| **S3 final storage** (`DeliverySink`) | Not started; the seam is ready | An S3 sink keyed by (mailbox, queue ID), idempotent by construction |
+| **S3 final storage** (`DeliverySink`) | Not started; the seam is ready | An S3 sink implementing `deliver` (one object per (envelope address, queue ID), idempotent by construction), `usage` (a mailbox's stored bytes, for quotas) and `sweep_debris` (abandoned multipart uploads) |
 | **S3 spool backend** | Not started; the `SpoolWriter`/`SpoolQueue` seams are ready | Staged sync (below) |
 | **Per-user encryption at rest** | Designed (decision below), not started | `PayloadEncryptor::encrypt` takes the recipient key set (keys are already carried in `SpoolRcpt`); the stored payload is already the final message, delivered verbatim |
-| **Multiple MX hosts** (mx1, mx2 for the same domains) | Not started | Needs the shared S3 sink, the duplicate-on-timeout fix (§2.4.3), `Message-ID` + recipient deduplication in the shared store, and authority distribution (console resolver, or atomic publish to every host). Per-host limits are acceptable at first |
+| **Multiple MX hosts** (mx1, mx2 for the same domains) | Not started | Needs the shared S3 sink (which also gives every host the same mailbox usage for quotas), `Message-ID` + recipient deduplication in the shared store (two hosts can each accept a copy a sender retried), and authority distribution (console resolver, or atomic publish to every host). Per-host connection, probing and AUTH limits are acceptable at first |
 | **Per-domain MX identities** (white-label) | Optional | The banner and EHLO come before RCPT, so identity must come from the listening address (needs a listener per address; `--host` is one) or from SNI, which chooses the certificate (rustls `ResolvesServerCert`). `Received: by` can be per-domain. Most services use one shared MX hostname and don't need this |
 | **Verdict policy profiles** | Not started | Per-domain choice of reject versus accept-and-tag, instead of hard-coded MSA-style behaviour |
 
@@ -256,7 +263,7 @@ addresses exist lives in the external console. Order: recipient authority
 - ARC (needed before any forwarding role).
 - CHUNKING/BDAT, a Milter interface.
 - mailparse: RFC 2047 decoding, `Content-Disposition` (for user-facing
-  tools).
+  tools; the server's display-name check decodes encoded-words itself).
 
 **Tools:**
 - `smtp-client` sends bare-LF line endings and doesn't read the greeting

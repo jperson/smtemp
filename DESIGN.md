@@ -231,6 +231,7 @@ message.
 
 ```
 1. bare CR in the header block?      → 550 5.6.0   (no DNS work spent)
+   more than 1000 header fields?     → 552 5.3.4   (before any header parse)
 2. take a per-IP DNS permit          → 451 4.7.0 if none frees within 10 s
    ── one 20 s deadline (END_OF_DATA_DNS_DEADLINE) covers 3 and 6 ──
 3. DKIM: fetch the keys (async), then verify on the blocking pool
@@ -263,6 +264,14 @@ How the ordering is constrained:
   hashing the whole message, a public-key operation per signature), so only
   the key lookups run on the async workers (`dkim::fetch_keys`); the checks
   run on the blocking pool (`dkim::verify_with_keys`).
+- **Work is linear in the message.** Synchronous code can't be cut short
+  by the connection deadline (a tokio timeout fires only at an `await`),
+  so every end-of-data step over attacker bytes is linear in time and
+  holds no per-line or per-field state beyond the field cap: the
+  encoded-word decoder never rescans, DKIM tag lists use a set for the
+  duplicate check, body canonicalization streams into the hash, and the
+  PSL walk is bounded by DNS name limits. Each has a regression test
+  pinning it on a pathological input.
 - Refused recipients count against two budgets: the connection's (on the
   session, not the transaction, so RSET doesn't reset it) and the source
   IP's (a `FailureLimiter`, the same fixed window the AUTH failures use).
@@ -272,6 +281,12 @@ How the ordering is constrained:
   rest later.
 - The quota is soft: it is checked at RCPT, before the data, so a mailbox
   can exceed it by at most one message (whose size wasn't declared).
+  Copies of one message routed to one mailbox (catch-all addresses,
+  aliases) count before anything is stored: each copy after the first at
+  the declared `SIZE=`, or at the transaction's size limit when none was
+  declared. So a sender that declares no size gets one copy per
+  transaction into a nearly full mailbox, and the rest are deferred with
+  `452` to later transactions.
   Deferring a full mailbox's recipient with `452` does reveal that the
   address exists, unlike the uniform `550` for refused addresses; quotas
   should rarely be reached.
@@ -316,8 +331,13 @@ How the ordering is constrained:
   (`mailparse::parse_raw_message`), so untrusted bytes never reach the pest
   grammar (§11). Non-UTF-8 headers still verify.
 - **Limits.**
-  - At most 5 signatures (the topmost) are evaluated per message.
+  - At most 5 signatures (the topmost) are evaluated per message; the
+    headers after them are never parsed.
   - A signature may list at most 256 `h=` entries.
+  - Parsing a tag list is linear in its length, whatever the number of
+    tags (the duplicate-tag check uses a set).
+  - The canonical body is streamed into the hash, never held, so its
+    line structure costs nothing per line.
   - Header selection indexes headers by name once, so it is linear
     (RFC 6376 §5.4.2 bottom-up, each instance used once).
 - **A signature counts only if all of these hold:**
@@ -366,7 +386,18 @@ How the ordering is constrained:
   `mail.example.com` aligns with `news.example.com` while
   `alice.github.io` and `bob.github.io` don't. It is parsed at startup
   (the log records its version); Unicode rules are converted to `xn--`
-  form.
+  form. A name longer than DNS allows (over 253 octets, or a label over
+  63) has no organizational domain and aligns only with itself, which
+  also bounds the lookup on an attacker-chosen name.
+- **Unknown suffixes fail safe.** When no rule of the list matches (a TLD
+  newer than the snapshot), a name of more than two labels has no
+  organizational domain, so only an exact match aligns. The implicit `*`
+  rule would make the last two labels the organization, and under a
+  registry zone the snapshot doesn't know, `attacker.zone.newtld` would
+  pass `victim.zone.newtld`'s `p=reject`. The price is that a subdomain
+  there doesn't align with its parent. A missing entry *below* a listed
+  TLD (a second-level registry zone added after the snapshot) can't be
+  detected this way; that needs the refresh (DEPLOYMENT.md H7).
 - **The SPF identity.** The MAIL FROM domain, or for the null sender (a
   bounce) the HELO name, which is what SPF evaluated (RFC 7208 §2.4), so
   an unsigned bounce from a `p=reject` domain aligns when its HELO host
@@ -450,9 +481,15 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
   `tmp/` older than an hour are swept at startup and hourly
   (`DeliverySink::sweep_debris`).
 - **Idempotent** per (envelope address, queue ID): the file name is
-  `{queue ID}.{address}.eml`, so the fast path and the drain can race
-  safely, and several catch-all addresses routed to one inbox get one copy
-  each. The sink receives the envelope address as metadata.
+  `{queue ID}.{tag}.eml`, so several catch-all addresses routed to one
+  inbox get one copy each. The tag is injective: letters, digits, `.` and
+  `-` are kept, the `@` becomes `_`, and any other byte becomes `%XX`
+  (`user@example.org` → `user_example.org`, `a+b@x` → `a%2bb_x`); a tag
+  over 160 bytes is cut and ends in `~` plus a SHA-256 prefix of the
+  address. The sink receives the envelope address as metadata.
+- **Races.** Each attempt stages under its own `tmp/` name, so the fast
+  path and the drain delivering the same copy at once both succeed: both
+  write the same bytes, and the second rename replaces the first's file.
 - **Trace headers** (`with_trace_headers`), written once at acceptance:
   `Return-Path:` and a `Received:` (HELO, peer, `by` host, queue ID, and
   `ESMTP`/`ESMTPS`/`ESMTPA`/`ESMTPSA` per RFC 3848). There is **no `for`
@@ -464,13 +501,18 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
     for a submission, `spf` with `smtp.mailfrom` (or `smtp.helo` for a
     bounce), one `dkim` per signature, `dmarc` with `header.from` (or
     `none`). Sender-chosen values (selectors, names) are reduced to
-    `[A-Za-z0-9.-_+@]`.
+    `[A-Za-z0-9.-_+@]` and cut at 320 bytes (marked `...`). DKIM `d=` and
+    `s=` over 253 octets (and `i=` over 318) make the signature invalid,
+    and a summary keeps at most 256 bytes of error text, so the trace
+    headers, the spool metadata and the log stay small.
   - `X-Display-Name-Warning:` when the From display name or a comment
     contains an address whose organizational domain is none of the
     authors' (encoded-words decoded first). A warning, not a refusal:
     list software (Google Groups' "alice@example.com via Team") does
     this legitimately. The claims are also in the spool metadata
-    (`display_name_claims`) and the log.
+    (`display_name_claims`) and the log. At most 10 are kept, each cut
+    at 253 bytes (an over-long one is cut, not dropped, so it still
+    warns).
   - Before these are added, the message's own `Authentication-Results:`
     claiming our authserv-id, and any `X-Display-Name-Warning:`, are
     removed (RFC 8601 §5), so a sender can't plant a "pass".
@@ -671,7 +713,7 @@ the field before it, so a continuation after it belongs to no field.
   `info`). Bodies are never logged, and the per-line `recv_data` span is at
   `trace`. The accept loop survives transient errors (log and back off), and
   every connection task's outcome is logged.
-- **Testing.** 328 tests in four layers:
+- **Testing.** 347 tests in four layers:
   1. **unit**, per crate;
   2. **protocol**, driving the state machine through `handler`;
   3. **framing**, running `run()` over in-memory duplexes;
@@ -708,6 +750,7 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 | Gap | Impact | Plan |
 |---|---|---|
 | The mailbox quota is soft (one message over) and doesn't count mail still queued for the mailbox | A mailbox can exceed its quota by one message plus its queue backlog | §2.4.1 |
+| The Public Suffix List is a snapshot | A second-level registry zone added after it was taken, under a listed TLD, is one organization to relaxed alignment, so its registrants pass each other's DMARC (an unknown TLD fails safe: §6.3) | §2.4.3 (refresh) |
 | The refused-recipient budget is per IP address (no IPv6 /64 aggregation), and a large provider's shared outbound IP can exhaust it with legitimate refusals | An IPv6 prober can rotate addresses; mail from a busy shared IP can be deferred for up to 15 minutes | §2.4.2, §6 |
 | Per-IP limits are per address (no IPv6 /64 aggregation) | An IPv6 sender escapes them; relevant only with an IPv6 listener | §6 |
 
@@ -715,7 +758,6 @@ The Plan column is the section of [PLAN.md](PLAN.md) that tracks the fix.
 
 | Gap | Impact | Plan |
 |---|---|---|
-| The Public Suffix List is a snapshot | A suffix added after it was taken isn't known; alignment there falls back to the last-two-labels rule | §2.4.3 (refresh) |
 | SPF `a`/`mx` don't query AAAA | IPv6 senders authorised only that way fail SPF | §6 |
 | `quarantine` is delivered as normal mail | Out of V1 scope by decision | — |
 

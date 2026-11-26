@@ -18,7 +18,7 @@ use crate::address::{clean_path, path_domain, size_param, unsafe_local_part, val
 use crate::authority::{self, Resolution};
 use crate::headers::{
     display_name_claims, from_authors, from_header_domain, header_has_bare_cr, single_from_value,
-    strip_forged_verdicts, FromHeader,
+    strip_forged_verdicts, too_many_header_fields, FromHeader, MAX_HEADER_FIELDS,
 };
 use crate::quota::{StorageLimits, INSUFFICIENT_STORAGE, MAILBOX_FULL};
 use crate::verdict::{DkimSummary, DmarcSummary};
@@ -92,6 +92,12 @@ pub(crate) const DNS_BUSY: &[u8] =
 /// The header block has a bare CR (RFC 5322 §2.2: CR only occurs in
 /// CRLF). Refused because parsers disagree on where such a line ends.
 pub(crate) const BARE_CR_IN_HEADER: &[u8] = b"550 5.6.0 Message header contains a bare CR\r\n";
+
+/// The header block has more than [`MAX_HEADER_FIELDS`] fields. Refused
+/// before any header is parsed, since the parsers hold an entry per
+/// field.
+pub(crate) const TOO_MANY_HEADER_FIELDS: &[u8] =
+    b"552 5.3.4 Message header has too many fields\r\n";
 
 /// The DMARC policy lookup failed (SERVFAIL, query timeout): deferred,
 /// never treated as "no policy".
@@ -474,6 +480,15 @@ impl<'session> UserSession<'session> {
     /// ([`delivery::DeliverySink::usage`], on the blocking pool) plus any
     /// size declared at MAIL FROM must fit.
     ///
+    /// The copies this transaction has already accepted for the same
+    /// mailbox (catch-all addresses, aliases) count too, though nothing is
+    /// stored yet: each at the declared size, or at the transaction's size
+    /// limit `limit` when none was declared. Otherwise every recipient of
+    /// one message would be checked against the same reading, and one
+    /// message to 100 addresses could put 100 copies into a full mailbox.
+    /// The first copy is still checked at its declared size (0 if none),
+    /// so a mailbox ends up at most one message over its quota.
+    ///
     /// Returns `None` when the recipient may be accepted (or there is no
     /// quota or sink), `452 4.2.2` when the mailbox is full, and `451` when
     /// its usage can't be measured (fail closed: the sender retries).
@@ -482,22 +497,37 @@ impl<'session> UserSession<'session> {
         address: &str,
         mailbox: &str,
         authority_quota: Option<u64>,
+        limit: usize,
     ) -> Option<smtp::Control> {
         let (Some(quota), Some(sink)) =
             (self.storage.quota_for(authority_quota), self.sink.clone())
         else {
             return None;
         };
-        let incoming = self.txn.as_ref().and_then(|t| t.declared_size).unwrap_or(0);
+        let declared = self.txn.as_ref().and_then(|t| t.declared_size);
+        let incoming = declared.unwrap_or(0);
+        let pending_copies = self.txn.as_ref().map_or(0, |t| {
+            t.rcpt_to
+                .iter()
+                .filter(|r| r.mailbox.eq_ignore_ascii_case(mailbox))
+                .count()
+        }) as u64;
+        let pending = pending_copies.saturating_mul(declared.unwrap_or(limit as u64));
         let lookup = mailbox.to_string();
         let usage = tokio::task::spawn_blocking(move || sink.usage(&lookup)).await;
         match usage {
-            Ok(Ok(usage)) if crate::quota::has_room(quota, usage, incoming) => None,
+            Ok(Ok(usage))
+                if crate::quota::has_room(quota, usage.saturating_add(pending), incoming) =>
+            {
+                None
+            }
             Ok(Ok(usage)) => {
                 info!(
                     rcpt = %address,
                     mailbox = %mailbox,
                     usage_bytes = usage,
+                    pending_copies,
+                    pending_bytes = pending,
                     declared_bytes = incoming,
                     quota_bytes = quota,
                     "recipient deferred: mailbox over quota"
@@ -1011,7 +1041,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                     );
                 }
                 if let Some(reply) = self
-                    .check_mailbox_quota(&addr, &recipient.mailbox, recipient.quota_bytes)
+                    .check_mailbox_quota(&addr, &recipient.mailbox, recipient.quota_bytes, limit)
                     .await
                 {
                     return reply;

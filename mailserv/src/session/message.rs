@@ -43,6 +43,16 @@ impl UserSession<'_> {
             warn!("message refused: bare CR in the header block");
             return smtp::Control::reject(BARE_CR_IN_HEADER);
         }
+        // Every header scan below (DKIM, the From checks, verdict
+        // stripping) holds an entry per field, so their number is bounded
+        // before any of them runs.
+        if too_many_header_fields(&raw, MAX_HEADER_FIELDS) {
+            warn!(
+                max = MAX_HEADER_FIELDS,
+                "message refused: too many header fields"
+            );
+            return smtp::Control::reject(TOO_MANY_HEADER_FIELDS);
+        }
 
         // DKIM key lookups and the DMARC policy fetch hold one of this
         // source IP's DNS permits (DESIGN §9). If none frees up in

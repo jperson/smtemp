@@ -472,6 +472,17 @@ mod tests {
         // Across a public suffix they don't, however the names look.
         assert!(!aligned_relaxed("victim.co.uk", "attacker.co.uk"));
         assert!(!aligned_relaxed("alice.github.io", "bob.github.io"));
+        // Under a TLD the list doesn't know, a name of more than two
+        // labels has no organizational domain, so only an exact match
+        // aligns: two registrants under one (possibly public) zone don't,
+        // and neither, as the price of that, does a subdomain with its
+        // parent.
+        assert!(!aligned_relaxed(
+            "attacker.zone.newtld",
+            "victim.zone.newtld"
+        ));
+        assert!(aligned_relaxed("victim.zone.newtld", "Victim.Zone.Newtld."));
+        assert!(!aligned_relaxed("mail.brand.newtld", "brand.newtld"));
         assert!(!aligned_relaxed("co.uk", "victim.co.uk"));
         assert!(aligned_relaxed("Example.ORG.", "example.org"));
 

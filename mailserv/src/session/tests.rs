@@ -621,6 +621,28 @@ async fn bare_cr_message_is_refused_before_dns() {
     );
 }
 
+/// A header block of more than MAX_HEADER_FIELDS fields (two bytes
+/// each, millions in a 10 MiB message, an entry apiece in every header
+/// scan) is refused at end of data before DNS work or any header parse.
+#[tokio::test]
+async fn too_many_header_fields_are_refused_before_dns() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = tests::size_limit_session(dir.path());
+    let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    s.begin("a@evil.example");
+    let mut data = b"From: a@evil.example\r\n".to_vec();
+    data.extend_from_slice(&b"a:b\r\n".repeat(MAX_HEADER_FIELDS));
+    data.extend_from_slice(b"\r\nbody\r\n");
+    s.t().data = data;
+    assert_eq!(s.end_data().await.into_reply(), TOO_MANY_HEADER_FIELDS);
+    assert!(s.txn.is_none());
+    assert_eq!(
+        cfg.dns.stats().queries,
+        0,
+        "no DNS work for a refused message"
+    );
+}
+
 /// An accepted HELO/EHLO ends the transaction in progress, like RSET
 /// (RFC 5321 §4.1.4): the next RCPT needs a new MAIL FROM.
 #[tokio::test]
@@ -708,6 +730,65 @@ async fn mailbox_quota_defers_only_the_full_recipient() {
         session.rcpt_to("<b@small.example>").await,
         smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
     );
+}
+
+/// Copies of one message routed to one mailbox count against its quota
+/// before anything is stored: each copy after the first at its declared
+/// size, or at the transaction's size limit when none was declared. (All
+/// were checked against the same reading: 100 recipients put 20 MB into
+/// a 10 MiB mailbox.)
+#[tokio::test]
+async fn catch_all_copies_share_one_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catch-authority.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "domains": { "catch.example": { "mode": "catch-all",
+                "catch-all-mailbox": "inbox@catch.example", "max-message-bytes": 2000 } },
+            "mailboxes": {}
+        }"#,
+    )
+    .unwrap();
+    let sink = delivery::MaildirSink::open(dir.path().join("maildir")).unwrap();
+    let cfg = SessionConfig {
+        authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
+        sink: Some(Arc::new(sink)),
+        storage: Arc::new(crate::quota::StorageLimits {
+            mailbox_quota: Some(5000),
+            ..crate::quota::StorageLimits::unlimited()
+        }),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+
+    // Declared 1500: 0, 1500 and 3000 pending fit; 4500 + 1500 doesn't.
+    session.begin("x@sender.example");
+    session.t().declared_size = Some(1500);
+    for a in ["a", "b", "c"] {
+        let reply = session.rcpt_to(&format!("<{a}@catch.example>")).await;
+        assert!(reply.is_accept(), "{a}: {reply:?}");
+    }
+    assert_eq!(
+        session.rcpt_to("<d@catch.example>").await,
+        smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
+    );
+
+    // Undeclared: the first copy is the one allowed overshoot, and each
+    // further one is counted at the 2000-byte limit: 0, 2000 and 4000
+    // pending fit (under 5000), 6000 doesn't.
+    session.clear_envelope();
+    session.begin("x@sender.example");
+    for a in ["a", "b", "c"] {
+        let reply = session.rcpt_to(&format!("<{a}@catch.example>")).await;
+        assert!(reply.is_accept(), "{a}: {reply:?}");
+    }
+    assert_eq!(
+        session.rcpt_to("<d@catch.example>").await,
+        smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
+    );
+    assert_eq!(session.t().rcpt_to.len(), 3);
 }
 
 /// Below the free-disk floor, MAIL FROM is deferred (no transaction
@@ -869,7 +950,7 @@ async fn bounces_align_through_the_helo_identity() {
     let dns = spawn_mock_resolver(
         |name, qtype| match (name, qtype) {
             (n, 16) if n.starts_with("_dmarc.") => MockAnswer::Txt("v=DMARC1; p=reject"),
-            ("mta.bounce.example" | "mta.other.example", 16) => {
+            ("mta.bounce-example.org" | "mta.other-example.org", 16) => {
                 MockAnswer::Txt("v=spf1 ip4:127.0.0.1 -all")
             }
             _ => MockAnswer::Rcode(3),
@@ -882,9 +963,12 @@ async fn bounces_align_through_the_helo_identity() {
         dns,
         ..size_limit_session(dir.path())
     };
-    let bounce = b"From: MAILER-DAEMON@bounce.example\r\nSubject: Undelivered\r\n\r\nbody\r\n";
+    let bounce = b"From: MAILER-DAEMON@bounce-example.org\r\nSubject: Undelivered\r\n\r\nbody\r\n";
 
-    for (helo, accepted) in [("mta.bounce.example", true), ("mta.other.example", false)] {
+    for (helo, accepted) in [
+        ("mta.bounce-example.org", true),
+        ("mta.other-example.org", false),
+    ] {
         let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
         assert!(session.helo(true, helo).await.is_accept());
         assert!(

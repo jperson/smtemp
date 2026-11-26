@@ -832,6 +832,7 @@ dependencies = [
  "mailparse",
  "serde",
  "serde_json",
+ "sha2",
  "smtp",
  "spf",
  "thiserror",

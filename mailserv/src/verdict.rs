@@ -33,7 +33,12 @@ impl From<&dkim::DkimResult<'_>> for DkimSummary {
             body_hash_ok: result.body_hash_ok,
             signature_ok: result.signature_ok,
             verified: result.body_hash_ok && result.signature_ok,
-            error: result.error.as_ref().map(|e| e.to_string()),
+            // An error can name sender-chosen text (a key query name), so
+            // the stored and logged copy is bounded.
+            error: result
+                .error
+                .as_ref()
+                .map(|e| truncated(&e.to_string(), MAX_ERROR_LEN)),
             temporary: result
                 .error
                 .as_ref()
@@ -57,4 +62,50 @@ pub(crate) struct DmarcSummary {
     pub(crate) pass: bool,
     /// What we did: "pass", "quarantine", or "reject".
     pub(crate) action: dmarc::Action,
+}
+
+/// The longest DKIM error text kept in a summary (the spool metadata and
+/// the log).
+pub(crate) const MAX_ERROR_LEN: usize = 256;
+
+/// Returns `text`, or when it is longer than `max` bytes its first `max`
+/// bytes (cut at a character boundary) followed by `...`, which marks
+/// the cut (no DNS name has an empty label, so `...` can't be mistaken
+/// for part of one).
+pub(crate) fn truncated(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Short text is kept; long text is cut at a character boundary and
+    /// marked.
+    #[test]
+    fn truncation() {
+        assert_eq!(truncated("abc", 3), "abc");
+        assert_eq!(truncated("abcd", 3), "abc...");
+        assert_eq!(truncated("aé", 2), "a...");
+        assert_eq!(truncated("", 0), "");
+    }
+
+    /// A DKIM error naming a huge key query name is stored bounded.
+    #[test]
+    fn dkim_error_is_bounded() {
+        let raw = b"DKIM-Signature: v=1; a=rsa-sha256; d=x.example; s=s; h=From; bh=x; b=x\r\nFrom: a@x.example\r\n\r\nbody\r\n";
+        let keys = vec![Err(dkim::DkimError::NoKeyRecord("q".repeat(100_000)))];
+        let results = dkim::verify_with_keys(raw, &keys, 0);
+        let summary = DkimSummary::from(&results[0]);
+        let error = summary.error.unwrap();
+        assert!(error.len() <= MAX_ERROR_LEN + 3, "{}", error.len());
+        assert!(error.ends_with("..."));
+    }
 }

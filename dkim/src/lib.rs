@@ -44,7 +44,9 @@ pub enum DkimError {
 
     /// A present tag with an unusable value: `v=` other than 1, `l=`,
     /// `t=` or `x=` not a number, or an `h=` that is empty, lists more
-    /// than [`MAX_SIGNED_HEADERS`] names, or does not sign From.
+    /// than [`MAX_SIGNED_HEADERS`] names, or does not sign From; a `d=` or
+    /// `s=` longer than [`MAX_DNS_NAME_LEN`], or an `i=` longer than
+    /// [`MAX_IDENTITY_LEN`].
     #[error("invalid value for tag: {0}")]
     InvalidTag(&'static str),
 
@@ -130,17 +132,18 @@ impl DkimError {
 }
 
 /// Check the tag name `name` of a tag list against the names already in
-/// `seen`, recording it.
+/// `seen`, recording it. A set, not a list: the number of tags is
+/// attacker-chosen and unbounded (unknown tags are allowed), so a linear
+/// scan per tag would make parsing quadratic.
 ///
 /// # Errors
 ///
 /// [`DkimError::DuplicateTag`] when `name` was already seen (RFC 6376
 /// §3.2).
-fn note_tag<'t>(seen: &mut Vec<&'t str>, name: &'t str) -> Result<(), DkimError> {
-    if seen.contains(&name) {
+fn note_tag<'t>(seen: &mut HashSet<&'t str>, name: &'t str) -> Result<(), DkimError> {
+    if !seen.insert(name) {
         return Err(DkimError::DuplicateTag(name.to_string()));
     }
-    seen.push(name);
     Ok(())
 }
 
@@ -205,7 +208,7 @@ impl<'a> DkimSignature<'a> {
         let mut timestamp = None;
         let mut expiry = None;
 
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         for segment in raw.split(';') {
             let Some((name, value)) = segment.split_once('=') else {
                 continue;
@@ -286,6 +289,23 @@ impl<'a> DkimSignature<'a> {
             return Err(DkimError::InvalidTag("h"));
         }
 
+        // `d=` and `s=` name DNS names (the key lives at
+        // `s._domainkey.d`), so neither can be longer than one: RFC 6376
+        // §3.5 caps `d=` at 255 octets, and DNS caps any name at 253 in
+        // text form. Refused here, before either is used: both are copied
+        // into the delivered message, the spool metadata and the log.
+        let domain = domain.ok_or(DkimError::MissingTag("d"))?;
+        if domain.len() > MAX_DNS_NAME_LEN {
+            return Err(DkimError::InvalidTag("d"));
+        }
+        let selector = selector.ok_or(DkimError::MissingTag("s"))?;
+        if selector.len() > MAX_DNS_NAME_LEN {
+            return Err(DkimError::InvalidTag("s"));
+        }
+        if identity.is_some_and(|i| i.len() > MAX_IDENTITY_LEN) {
+            return Err(DkimError::InvalidTag("i"));
+        }
+
         Ok(DkimSignature {
             version,
             algorithm: algorithm.ok_or(DkimError::MissingTag("a"))?,
@@ -293,8 +313,8 @@ impl<'a> DkimSignature<'a> {
             body_hash: body_hash.ok_or(DkimError::MissingTag("bh"))?,
             header_canon,
             body_canon,
-            domain: domain.ok_or(DkimError::MissingTag("d"))?,
-            selector: selector.ok_or(DkimError::MissingTag("s"))?,
+            domain,
+            selector,
             signed_headers,
             identity,
             body_length,
@@ -353,6 +373,15 @@ pub struct ParsedSignature<'a, 'm> {
 /// Returns the parsed signatures in header order (topmost first).
 /// Signatures that are not valid UTF-8 or fail tag parsing are skipped.
 pub fn find_signatures<'a, 'm>(msg: &'a RawMessage<'m>) -> Vec<ParsedSignature<'a, 'm>> {
+    signatures(msg).collect()
+}
+
+/// The signatures of `msg`, as [`find_signatures`] finds them, parsed
+/// lazily: a verifier that evaluates only the topmost [`MAX_SIGNATURES`]
+/// takes them from here, so the headers after those are never parsed.
+fn signatures<'a, 'm>(
+    msg: &'a RawMessage<'m>,
+) -> impl Iterator<Item = ParsedSignature<'a, 'm>> + 'a {
     msg.headers
         .iter()
         .filter(|h| h.name_eq("dkim-signature"))
@@ -365,7 +394,6 @@ pub fn find_signatures<'a, 'm>(msg: &'a RawMessage<'m>) -> Vec<ParsedSignature<'
                     header: h,
                 })
         })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -399,15 +427,6 @@ fn trim_fws_bytes(s: &[u8]) -> &[u8] {
     let start = s.iter().position(|b| !is_fws(b)).unwrap_or(s.len());
     let end = s.iter().rposition(|b| !is_fws(b)).map_or(start, |i| i + 1);
     &s[start..end]
-}
-
-/// Split `body` into lines (without their endings), accepting CRLF or
-/// bare-LF endings. The trailing empty element of a terminated body is
-/// preserved as an empty line.
-fn split_lines(body: &[u8]) -> Vec<&[u8]> {
-    body.split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .collect()
 }
 
 /// "relaxed" header canonicalization (RFC 6376 Section 3.4.2) of the
@@ -472,63 +491,81 @@ pub fn canonicalize_header(alg: &str, name: &[u8], value: &[u8]) -> Vec<u8> {
 /// whitespace-only lines. A non-empty canonicalized body ends with exactly
 /// one CRLF; a completely empty body canonicalizes to a single CRLF.
 pub fn relaxed_body(body: &[u8]) -> Vec<u8> {
-    let mut lines: Vec<Vec<u8>> = split_lines(body)
-        .into_iter()
-        .map(|line| {
-            let mut out = Vec::with_capacity(line.len());
-            let mut pending_wsp = false;
-            for &b in line {
-                if is_wsp(b) {
-                    pending_wsp = true;
-                } else {
-                    if pending_wsp {
-                        out.push(b' ');
-                    }
-                    out.push(b);
-                    pending_wsp = false;
-                }
-            }
-            out
-        })
-        .collect();
-
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-
-    if lines.is_empty() {
-        return b"\r\n".to_vec();
-    }
-
-    let mut out = lines.join(&b"\r\n"[..]);
-    out.extend_from_slice(b"\r\n");
-    out
+    canonicalize_body("relaxed", body)
 }
 
 /// "simple" canonicalization of `body` (RFC 6376 Section 3.4.3): as-is,
 /// except trailing empty lines are ignored and a missing final CRLF is
 /// added. A completely empty body canonicalizes to a single CRLF.
 pub fn simple_body(body: &[u8]) -> Vec<u8> {
-    let mut lines = split_lines(body);
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-
-    if lines.is_empty() {
-        return b"\r\n".to_vec();
-    }
-
-    let mut out = lines.join(&b"\r\n"[..]);
-    out.extend_from_slice(b"\r\n");
-    out
+    canonicalize_body("simple", body)
 }
 
 /// Canonicalize `body` with the algorithm `alg` ("relaxed" or "simple";
 /// anything else falls back to "simple").
 pub fn canonicalize_body(alg: &str, body: &[u8]) -> Vec<u8> {
-    match alg {
-        "relaxed" => relaxed_body(body),
-        _ => simple_body(body),
+    let mut out = Vec::with_capacity(body.len() + 2);
+    canonical_body_into(alg, body, &mut |chunk| out.extend_from_slice(chunk));
+    out
+}
+
+/// Stream the canonical form of `body` under `alg` ("relaxed"; anything
+/// else is "simple") to `sink`, chunk by chunk, in one pass and without
+/// allocating. Lines may end in CRLF or a bare LF.
+///
+/// The line structure of a body is attacker-chosen (a 10 MiB body can be
+/// millions of one-byte lines), so nothing here is kept per line: trailing
+/// empty lines are dropped by counting the empty lines seen and writing
+/// them out only when a non-empty line follows.
+fn canonical_body_into(alg: &str, body: &[u8], sink: &mut dyn FnMut(&[u8])) {
+    let relaxed = alg == "relaxed";
+    let mut pending_empty = 0usize;
+    let mut wrote_any = false;
+    for line in body.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Under relaxed, a line of only WSP canonicalizes to empty.
+        let empty = if relaxed {
+            line.iter().all(|&b| is_wsp(b))
+        } else {
+            line.is_empty()
+        };
+        if empty {
+            pending_empty += 1;
+            continue;
+        }
+        for _ in 0..pending_empty {
+            sink(b"\r\n");
+        }
+        pending_empty = 0;
+        if relaxed {
+            // Each WSP run before text becomes one SP; trailing WSP is
+            // never written.
+            let mut pending_wsp = false;
+            let mut i = 0;
+            while i < line.len() {
+                if is_wsp(line[i]) {
+                    pending_wsp = true;
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < line.len() && !is_wsp(line[i]) {
+                    i += 1;
+                }
+                if pending_wsp {
+                    sink(b" ");
+                    pending_wsp = false;
+                }
+                sink(&line[start..i]);
+            }
+        } else {
+            sink(line);
+        }
+        sink(b"\r\n");
+        wrote_any = true;
+    }
+    if !wrote_any {
+        sink(b"\r\n");
     }
 }
 
@@ -571,15 +608,20 @@ fn dkim_sig_without_b(raw_value: &[u8]) -> Vec<u8> {
 ///
 /// [`DkimError::UnsupportedAlgorithm`] for a hash other than SHA-256.
 pub fn body_hash(msg: &RawMessage, sig: &DkimSignature) -> Result<String, DkimError> {
-    let mut canon = canonicalize_body(sig.body_canon, msg.body);
-    if let Some(l) = sig.body_length {
-        canon.truncate(l.min(canon.len()));
-    }
-
     match sig.hash_algorithm()? {
-        "sha256" => Ok(BASE64_STANDARD.encode(Sha256::digest(&canon))),
-        other => Err(DkimError::UnsupportedAlgorithm(other.to_string())),
+        "sha256" => {}
+        other => return Err(DkimError::UnsupportedAlgorithm(other.to_string())),
     }
+    // The canonical body is hashed as it is produced, never held: its
+    // size and line count are the sender's choice.
+    let mut hasher = Sha256::new();
+    let mut remaining = sig.body_length.unwrap_or(usize::MAX);
+    canonical_body_into(sig.body_canon, msg.body, &mut |chunk| {
+        let take = chunk.len().min(remaining);
+        hasher.update(&chunk[..take]);
+        remaining -= take;
+    });
+    Ok(BASE64_STANDARD.encode(hasher.finalize()))
 }
 
 /// Check the body hash computed over `msg` against the `bh=` tag of
@@ -1385,7 +1427,7 @@ impl DkimKeyRecord {
         let mut flags = Vec::new();
         let mut hashes = Vec::new();
 
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         for segment in raw.split(';') {
             let Some((name, value)) = segment.split_once('=') else {
                 continue;
@@ -1516,7 +1558,11 @@ pub const MIN_RSA_BITS: usize = 1024;
 fn covers_whole_body(msg: &RawMessage, sig: &DkimSignature) -> bool {
     match sig.body_length {
         None => true,
-        Some(l) => l == canonicalize_body(sig.body_canon, msg.body).len(),
+        Some(l) => {
+            let mut len = 0usize;
+            canonical_body_into(sig.body_canon, msg.body, &mut |chunk| len += chunk.len());
+            l == len
+        }
     }
 }
 
@@ -1725,6 +1771,14 @@ pub fn verify_with_key<'m>(
 /// are ignored — an ignored signature simply contributes no pass.
 pub const MAX_SIGNATURES: usize = 5;
 
+/// The longest `d=` or `s=` a signature may have: a DNS name's 253
+/// octets in text form (RFC 1035 §2.3.4).
+pub const MAX_DNS_NAME_LEN: usize = 253;
+
+/// The longest `i=` a signature may have: a 64-octet local-part, `@`,
+/// and a DNS name (RFC 5321 §4.5.3.1).
+pub const MAX_IDENTITY_LEN: usize = 64 + 1 + MAX_DNS_NAME_LEN;
+
 /// The most `h=` entries a signature may list. Real signatures name a few
 /// dozen headers even with heavy oversigning; a longer list is refused as
 /// an invalid `h=` tag, so the signature contributes no pass. Header
@@ -1769,7 +1823,7 @@ pub async fn fetch_keys(raw: &[u8], resolver: &DnsClient) -> KeyLookups {
         return Vec::new();
     };
     let mut keys = Vec::new();
-    for parsed in find_signatures(&msg).into_iter().take(MAX_SIGNATURES) {
+    for parsed in signatures(&msg).take(MAX_SIGNATURES) {
         keys.push(fetch_public_key(resolver, &parsed.signature).await);
     }
     keys
@@ -1792,8 +1846,7 @@ pub fn verify_with_keys<'m>(
     };
     // The same parse and the same selection as `fetch_keys`, so the
     // signatures pair up with their lookups.
-    find_signatures(&msg)
-        .into_iter()
+    signatures(&msg)
         .take(MAX_SIGNATURES)
         .zip(keys)
         .map(|(parsed, key)| match key {
@@ -1946,5 +1999,169 @@ mod verifier_policy_tests {
         let m = parse_raw_message(swapped).unwrap();
         assert!(find_signatures(&m).is_empty(), "the signature is ignored");
         assert!(DkimSignature::parse("v=1; a=rsa-sha256; d=d; s=s; bh=x; b=x; h=FROM:to").is_ok());
+    }
+}
+
+/// Bounded work over attacker-chosen structure: tag lists and body line
+/// structure cost time and memory linear in the bytes, never per pair of
+/// tags or per line allocated.
+#[cfg(test)]
+mod bounded_work_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The canonicalization before streaming: per-line vectors, joined.
+    /// Kept as an oracle for the streaming version.
+    fn reference_body(alg: &str, body: &[u8]) -> Vec<u8> {
+        let mut lines: Vec<Vec<u8>> = body
+            .split(|&b| b == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(|line| {
+                if alg != "relaxed" {
+                    return line.to_vec();
+                }
+                let mut out = Vec::new();
+                let mut pending_wsp = false;
+                for &b in line {
+                    if is_wsp(b) {
+                        pending_wsp = true;
+                    } else {
+                        if pending_wsp {
+                            out.push(b' ');
+                        }
+                        out.push(b);
+                        pending_wsp = false;
+                    }
+                }
+                out
+            })
+            .collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return b"\r\n".to_vec();
+        }
+        let mut out = lines.join(&b"\r\n"[..]);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    /// The streaming canonicalization produces exactly what the per-line
+    /// one did, for both algorithms, over every short combination of the
+    /// bytes that matter (text, WSP, CR, LF).
+    #[test]
+    fn streaming_body_canonicalization_matches_reference() {
+        let alphabet = *b"a \t\r\n";
+        // Every string of up to 7 symbols.
+        let mut bodies: Vec<Vec<u8>> = vec![Vec::new()];
+        let mut last: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..7 {
+            last = last
+                .iter()
+                .flat_map(|b| {
+                    alphabet.iter().map(move |&c| {
+                        let mut b = b.clone();
+                        b.push(c);
+                        b
+                    })
+                })
+                .collect();
+            bodies.extend(last.iter().cloned());
+        }
+        for body in &bodies {
+            for alg in ["relaxed", "simple"] {
+                assert_eq!(
+                    canonicalize_body(alg, body),
+                    reference_body(alg, body),
+                    "{alg} {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+    }
+
+    /// `l=` hashing is unchanged: the hash covers exactly the first `l`
+    /// canonical bytes.
+    #[test]
+    fn body_length_truncates_the_streamed_hash() {
+        let raw = b"From: a@example.org\r\n\r\nline one\r\n  line   two \r\n\r\n";
+        let msg = parse_raw_message(raw).unwrap();
+        let canon = relaxed_body(msg.body);
+        for l in [0, 1, 5, canon.len() - 1, canon.len(), canon.len() + 10] {
+            let tags =
+                format!("v=1; a=rsa-sha256; c=relaxed/relaxed; d=d; s=s; h=From; bh=x; b=x; l={l}");
+            let sig = DkimSignature::parse(&tags).unwrap();
+            let expected = BASE64_STANDARD.encode(Sha256::digest(&canon[..l.min(canon.len())]));
+            assert_eq!(body_hash(&msg, &sig).unwrap(), expected, "l={l}");
+        }
+    }
+
+    /// A signature with tens of thousands of distinct tags parses in
+    /// linear time (the duplicate-tag check was a list scan per tag:
+    /// 64,000 tags took 4.7 s in a release build).
+    #[test]
+    fn many_tags_parse_in_linear_time() {
+        let mut raw = String::from("v=1; a=rsa-sha256; d=d; s=s; h=From; bh=x; b=x");
+        for i in 0..200_000 {
+            raw.push_str(&format!("; t{i}=x"));
+        }
+        let started = Instant::now();
+        assert!(DkimSignature::parse(&raw).is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        // A duplicate anywhere is still found.
+        raw.push_str("; t7=y");
+        assert_eq!(
+            DkimSignature::parse(&raw),
+            Err(DkimError::DuplicateTag("t7".to_string()))
+        );
+    }
+
+    /// Millions of one-byte body lines under a relaxed signature cost one
+    /// pass, not one allocation per line.
+    #[test]
+    fn many_body_lines_hash_in_one_pass() {
+        let mut raw = b"From: a@example.org\r\n\r\n".to_vec();
+        for _ in 0..1_000_000 {
+            raw.extend_from_slice(b"x\r\n");
+        }
+        let msg = parse_raw_message(&raw).unwrap();
+        let sig = DkimSignature::parse(
+            "v=1; a=rsa-sha256; c=relaxed/relaxed; d=d; s=s; h=From; bh=x; b=x",
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(body_hash(&msg, &sig).is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `d=`, `s=` and `i=` longer than a DNS name (or an address) can be
+    /// make the signature invalid: they would only be copied, unbounded,
+    /// into headers, metadata and logs.
+    #[test]
+    fn name_tags_are_bounded() {
+        let sig = |d: &str, s: &str, i: &str| {
+            DkimSignature::parse(&format!(
+                "v=1; a=rsa-sha256; d={d}; s={s}; i={i}; h=From; bh=x; b=x"
+            ))
+            .map(|_| ())
+        };
+        let longest = format!("{}.example", "a".repeat(MAX_DNS_NAME_LEN - 8));
+        assert_eq!(longest.len(), MAX_DNS_NAME_LEN);
+        let at = |d: &str| format!("u@{d}");
+        assert_eq!(sig(&longest, &longest, &at(&longest)), Ok(()));
+        let over = format!("a{longest}");
+        assert_eq!(sig(&over, "s", &at("x")), Err(DkimError::InvalidTag("d")));
+        assert_eq!(sig("x", &over, &at("x")), Err(DkimError::InvalidTag("s")));
+        let long_i = format!("{}@{longest}", "u".repeat(65));
+        assert_eq!(sig("x", "s", &long_i), Err(DkimError::InvalidTag("i")));
     }
 }

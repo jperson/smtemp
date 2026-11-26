@@ -89,7 +89,7 @@ const USAGE_CACHE_ENTRIES: usize = 10_000;
 /// Maildir delivery: one maildir per routing mailbox, under
 /// `{root}/{domain}/{local}/` (both lowercased). Each copy is written to
 /// `tmp/`, fsynced, and renamed into `new/` as
-/// `{queue_id}.{sanitized-envelope-address}.eml`, so the file name
+/// `{queue_id}.{envelope-address tag}.eml` (see [`address_tag`]), so the file name
 /// records which address the copy was for; the sink creates `tmp/` and
 /// `new/` on first delivery.
 #[derive(Debug, Clone)]
@@ -167,10 +167,11 @@ impl DeliverySink for MaildirSink {
         // Idempotency is per (envelope address, queue_id), case-insensitive
         // like recipient lookup, so the tag is the lowercased envelope
         // address. Under catch-all that differs from the mailbox, and each
-        // address gets its own copy.
+        // address gets its own copy: the tag is injective, so two
+        // addresses never share a file name.
         let filename = format!(
             "{queue_id}.{}.eml",
-            sanitize(&rcpt.address.to_ascii_lowercase())
+            address_tag(&rcpt.address.to_ascii_lowercase())
         );
         let target = new.join(&filename);
 
@@ -181,10 +182,21 @@ impl DeliverySink for MaildirSink {
             return Ok(());
         }
 
-        let staged = tmp.join(&filename);
-        write_durable(&staged, message)?;
-        std::fs::rename(&staged, &target)
-            .with_context(|| format!("cannot commit delivery to {}", target.display()))?;
+        // A staging name of this attempt's own, so two attempts racing
+        // past the check above never write the same `tmp/` file. Both
+        // write identical bytes, and the second rename atomically
+        // replaces the first's file with the same content, so either
+        // order delivers one copy and both succeed.
+        let staged = tmp.join(format!("{filename}.{}", uuid::Uuid::new_v4().simple()));
+        if let Err(e) = write_durable(&staged, message) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&staged, &target) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e)
+                .with_context(|| format!("cannot commit delivery to {}", target.display()));
+        }
         // Make the rename itself durable: without this a power cut can
         // lose the new directory entry after the message was dequeued. A
         // failure is a failed delivery: the message stays queued, and the
@@ -306,20 +318,55 @@ fn split_recipient(recipient: &str) -> Result<(String, String)> {
     Ok((local, domain))
 }
 
-/// Returns a filesystem-safe tag for `recipient` in maildir filenames:
-/// ASCII alphanumerics, `.`, `_` and `-` are kept, everything else
-/// becomes `_`.
-fn sanitize(recipient: &str) -> String {
-    recipient
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
+/// The longest [`address_tag`] before it falls back to a hash, so that
+/// `{queue id}.{tag}.eml` stays well under a file name's 255 bytes.
+const MAX_TAG_LEN: usize = 160;
+
+/// Returns a filesystem-safe tag for the (lowercased) envelope address
+/// `recipient` in maildir file names. It is injective: distinct addresses
+/// always get distinct tags, or two copies of a message would share one
+/// file and all but one would be lost.
+///
+/// ASCII letters, digits, `.` and `-` are kept, the `@` becomes `_`, and
+/// every other byte (`_` and `%` included) becomes `%XX`. So
+/// `user@example.org` is `user_example.org`, as it always was, while
+/// `a+b@x` (`a%2bb_x`) and `a_b@x` (`a%5fb_x`) no longer collide. A tag
+/// that would be longer than [`MAX_TAG_LEN`] is cut and ends in `~` and
+/// a SHA-256 prefix of the whole address instead (`~` is always escaped
+/// otherwise, so the two forms can't meet).
+fn address_tag(recipient: &str) -> String {
+    use std::fmt::Write as _;
+    let (local, domain) = recipient.rsplit_once('@').unwrap_or((recipient, ""));
+    let mut tag = String::with_capacity(recipient.len());
+    let escape = |part: &str, tag: &mut String| {
+        for b in part.bytes() {
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'-' {
+                tag.push(b as char);
             } else {
-                '_'
+                let _ = write!(tag, "%{b:02x}");
             }
-        })
-        .collect()
+        }
+    };
+    escape(local, &mut tag);
+    if recipient.contains('@') {
+        tag.push('_');
+        escape(domain, &mut tag);
+    }
+    if tag.len() <= MAX_TAG_LEN {
+        return tag;
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(recipient.as_bytes());
+    let mut cut = MAX_TAG_LEN - 33;
+    while !tag.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    tag.truncate(cut);
+    tag.push('~');
+    for b in &digest[..16] {
+        let _ = write!(tag, "{b:02x}");
+    }
+    tag
 }
 
 /// Write `bytes` to a new private file at `path` (truncating any
@@ -492,11 +539,18 @@ pub fn authentication_results(meta: &SpoolMeta) -> String {
     )
 }
 
+/// The longest value [`header_token`] writes: a full DNS name, or an
+/// address with its local-part.
+const MAX_HEADER_TOKEN_LEN: usize = 320;
+
 /// Returns `value` with every character outside letters, digits and
 /// `.-_+@` replaced by `_`, so a sender-chosen value (a DKIM selector, a
-/// HELO name) can't break or extend a header.
+/// HELO name) can't break or extend a header, cut to
+/// [`MAX_HEADER_TOKEN_LEN`] bytes (plus a `...` marking the cut).
 fn header_token(value: &str) -> String {
-    value
+    // Bounded too: an over-long value (a `From:` domain has no length
+    // limit of its own) is cut and marked with `...`.
+    crate::verdict::truncated(value, MAX_HEADER_TOKEN_LEN)
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '@') {
@@ -791,6 +845,27 @@ mod tests {
         }
     }
 
+    /// Sender-chosen values in our headers are bounded in length, and the
+    /// cut is marked.
+    #[test]
+    fn header_tokens_are_bounded() {
+        assert_eq!(header_token("a.example"), "a.example");
+        let long = header_token(&"d.".repeat(50_000));
+        assert_eq!(long.len(), MAX_HEADER_TOKEN_LEN + 3);
+        assert!(long.ends_with("..."));
+        // The trace headers stay small whatever the From domain.
+        let mut meta = sample_meta();
+        meta.dmarc = Some(crate::verdict::DmarcSummary {
+            from_domain: "x".repeat(100_000),
+            policy: dmarc::DmarcPolicy::None,
+            spf_aligned: false,
+            dkim_aligned: false,
+            pass: false,
+            action: dmarc::Action::Pass,
+        });
+        assert!(authentication_results(&meta).len() < 1024);
+    }
+
     /// Authentication-Results names our authserv-id and each method's
     /// result: SPF with the MAIL FROM domain (the HELO name for a bounce),
     /// every DKIM signature, DMARC with the From domain, AUTH for a
@@ -991,6 +1066,88 @@ mod tests {
 
         let empty = MaildirSink::open(dir.path().join("nothing-yet")).unwrap();
         assert!(empty.sweep_debris(now, DEBRIS_MIN_AGE).unwrap().is_empty());
+    }
+
+    /// Envelope addresses that differ only in punctuation get their own
+    /// copies in one catch-all inbox (a lossy tag mapped `a+b`, `a_b`,
+    /// `a*b`, `a=b` and `a~b` to one file, and four copies were lost).
+    #[test]
+    fn punctuation_variants_get_separate_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        let addresses = [
+            "a+b@catch.example",
+            "a_b@catch.example",
+            "a*b@catch.example",
+            "a=b@catch.example",
+            "a~b@catch.example",
+            "a%5fb@catch.example",
+            "a%b@catch.example",
+        ];
+        for address in addresses {
+            sink.deliver(
+                &rcpt(address, "inbox@catch.example"),
+                "q-1",
+                address.as_bytes(),
+            )
+            .unwrap();
+        }
+        let new = dir.path().join("catch.example/inbox/new");
+        let names: Vec<_> = std::fs::read_dir(&new).unwrap().collect();
+        assert_eq!(names.len(), addresses.len());
+        for address in addresses {
+            let file = new.join(format!("q-1.{}.eml", address_tag(address)));
+            assert_eq!(std::fs::read(file).unwrap(), address.as_bytes());
+        }
+    }
+
+    /// The tag keeps plain addresses as they always were, escapes the
+    /// rest injectively, and stays short for the longest addresses.
+    #[test]
+    fn address_tags() {
+        assert_eq!(address_tag("user@example.org"), "user_example.org");
+        assert_eq!(address_tag("a+b@x"), "a%2bb_x");
+        assert_eq!(address_tag("a_b@x"), "a%5fb_x");
+        assert_eq!(address_tag("a%5fb@x"), "a%255fb_x");
+        assert_eq!(address_tag("a~b@x"), "a%7eb_x");
+        let long_a = format!("{}@{}.example", "a".repeat(64), "d".repeat(200));
+        let long_b = format!("{}@{}.example", "a".repeat(64), "d".repeat(201));
+        let (ta, tb) = (address_tag(&long_a), address_tag(&long_b));
+        assert!(ta.len() <= MAX_TAG_LEN && tb.len() <= MAX_TAG_LEN);
+        assert_ne!(ta, tb);
+        assert!(ta.contains('~'));
+        // The escaped form is at its longest for a 64-octet local-part of
+        // escaped bytes; it still fits a file name with the queue ID.
+        let escaped = format!("{}@x.example", "+".repeat(64));
+        assert!(address_tag(&escaped).len() <= MAX_TAG_LEN);
+    }
+
+    /// The fast path and the drain delivering the same copy at once both
+    /// succeed and leave exactly one file, with nothing left in `tmp/`.
+    #[test]
+    fn racing_deliveries_of_one_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        let message = vec![b'm'; 256 * 1024];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        sink.deliver(&rcpt("u@example.org", "u@example.org"), "q-1", &message)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let mailbox = dir.path().join("example.org/u");
+        assert_eq!(std::fs::read_dir(mailbox.join("new")).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(mailbox.join("tmp")).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(mailbox.join("new/q-1.u_example.org.eml")).unwrap(),
+            message
+        );
     }
 
     async fn catch_all_copies() {

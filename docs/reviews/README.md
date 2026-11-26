@@ -14,6 +14,8 @@ description, without finding IDs), and the current design and its gaps in
 | [SECURITY-AUDIT.md](SECURITY-AUDIT.md) | 2026-11-22 | `640b60e` + working tree | F1–F10, and its own L1–L9 |
 | [AUDIT.md](AUDIT.md) | 2026-11-22 | `640b60e` + working tree | Re-checks of REPORT's and SECURITY.md's IDs |
 | [FINDINGS.md](FINDINGS.md) | 2026-11-22 | `8e3a643` | Design and code quality (D-W, C-W); carried into PLAN.md §4 |
+| [AUDIT_20261125.md](AUDIT_20261125.md) | 2026-11-25 | `8a25bd9` | A1–A8 |
+| [AUDIT_20261125_QWEN.md](AUDIT_20261125_QWEN.md) | 2026-11-25 | `8a25bd9` | Q1–Q12 (and re-checks of A1–A8) |
 
 The deployment review's D1–D7 lived in DEPLOYMENT.md until it was rewritten
 as a pure checklist; read them with `git show b6bfaf9:DEPLOYMENT.md`.
@@ -133,3 +135,22 @@ the section given.
 | D5 | Peak memory per session | Fewer copies (2026-11-24: about 3× at peak, from about 5×); sizing in DEPLOYMENT.md B2 |
 | D6 | Postmaster must be routable | Configuration (DEPLOYMENT.md C2) |
 | D7 | Documentation status gaps | Fixed |
+
+### AUDIT_20261125.md and AUDIT_20261125_QWEN.md (2026-11-25)
+
+The high- and medium-severity findings are fixed; the low and
+informational ones are still open as the reports describe them.
+
+| ID | Finding | Status |
+|---|---|---|
+| A1 | Quadratic encoded-word decoding in the display-name check | Fixed (2026-11-25): one forward pass over the `From:` value; tests pin linear time |
+| A2 | Quadratic DKIM duplicate-tag check | Fixed (2026-11-25): a set, for signatures and key records |
+| A8 | Every `DKIM-Signature` parsed before the 5-signature cap | Fixed (2026-11-25): signatures are parsed lazily, up to the cap |
+| Q1 | End-of-data memory amplification (per-line body allocation, per-field header entries) | Fixed (2026-11-25): body canonicalization streams into the hash; more than 1000 header fields gets `552 5.3.4` before any header parse. Measured: +9 MB peak for a 9.5 MiB message of either shape (was +237 MB / +101 MB) |
+| Q2 | Quadratic Public Suffix List walk over a long domain | Fixed (2026-11-25): names over DNS limits (253 octets, 63 per label) have no organizational domain; the walk builds no strings |
+| A3 | Maildir file-name collision lost catch-all copies | Fixed (2026-11-25): an injective tag (`%XX` escapes, a hash past 160 bytes); plain addresses keep their file names |
+| A4 | Fast path and drain shared one `tmp/` staging name | Fixed (2026-11-25): a staging name per attempt |
+| Q3 | Quota overshoot of one message per recipient | Fixed (2026-11-25): a transaction's copies to one mailbox count at RCPT (each extra one at the declared size, or the size limit) |
+| Q4 | Sender strings copied unbounded into the message, metadata and log | Fixed (2026-11-25): DKIM `d=`/`s=`/`i=` length bounds, error text and header tokens cut, at most 10 display-name claims |
+| Q5 | PSL snapshot gap allows cross-registrant DMARC passes | Mitigated (2026-11-25): under an unknown TLD, names of more than two labels align only exactly; a missing zone under a listed TLD still needs the refresh (DEPLOYMENT.md H7). Reclassified under abuse resistance in DESIGN §13 |
+| A5–A7, Q6–Q12 | Low and informational findings | Open, as reported |

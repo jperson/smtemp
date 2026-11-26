@@ -88,46 +88,92 @@ fn parse(text: &str) -> Rules {
 /// matches. `None` for an empty domain.
 pub fn public_suffix(domain: &str) -> Option<String> {
     let domain = normalize(domain)?;
-    let labels: Vec<&str> = domain.split('.').collect();
+    Some(suffix_of(&domain).0.to_string())
+}
+
+/// The public suffix of the normalized `domain`, as a slice of it, and
+/// whether a rule of the list matched (`false`: the implicit `*` rule).
+///
+/// The candidates are suffixes of `domain` starting at a label boundary,
+/// looked up as slices (no string is built per label). [`normalize`]
+/// bounds `domain` to a DNS name's length, so the walk is short.
+fn suffix_of(domain: &str) -> (&str, bool) {
     let rules = rules();
+    // Where each label starts, leftmost first.
+    let starts = std::iter::once(0).chain(domain.match_indices('.').map(|(i, _)| i + 1));
+    let mut starts = starts.peekable();
     // Longest candidate first, so the first match is the prevailing rule.
-    for i in 0..labels.len() {
-        let candidate = labels[i..].join(".");
-        if rules.exception.contains(&candidate) {
-            return Some(labels[i + 1..].join("."));
+    while let Some(start) = starts.next() {
+        let candidate = &domain[start..];
+        let parent = starts.peek().map(|&next| &domain[next..]);
+        if rules.exception.contains(candidate) {
+            // An exception rule's parent is the suffix; an exception is
+            // never a single label, so the parent exists.
+            return (parent.unwrap_or(candidate), true);
         }
-        let parent_is_wildcard =
-            i + 1 < labels.len() && rules.wildcard.contains(&labels[i + 1..].join("."));
-        if rules.exact.contains(&candidate) || parent_is_wildcard {
-            return Some(candidate);
+        let parent_is_wildcard = parent.is_some_and(|p| rules.wildcard.contains(p));
+        if rules.exact.contains(candidate) || parent_is_wildcard {
+            return (candidate, true);
         }
     }
-    labels.last().map(|l| l.to_string())
+    // The implicit `*` rule: the last label.
+    (domain.rsplit('.').next().unwrap_or(domain), false)
 }
 
 /// Returns `domain`'s organizational domain (RFC 7489 §3.2): its public
 /// suffix plus one more label, or `None` when `domain` is itself a public
 /// suffix (or empty).
+///
+/// Also `None` when no rule of the list matches and `domain` has more
+/// than two labels. The implicit `*` rule would make the last two labels
+/// the organization, but under a suffix the snapshot doesn't know (a TLD
+/// delegated after it was taken, and any registry zone below one) that
+/// joins unrelated registrants: `attacker.zone.newtld` would align with
+/// `victim.zone.newtld` and pass its `p=reject`. Without an
+/// organizational domain, alignment falls back to an exact match, which
+/// fails safe. A two-label name under an unknown TLD is still its own
+/// organization.
 pub fn organizational_domain(domain: &str) -> Option<String> {
     let domain = normalize(domain)?;
-    let suffix = public_suffix(&domain)?;
-    if domain == suffix {
+    let (suffix, listed) = suffix_of(&domain);
+    if domain.len() == suffix.len() {
         return None;
     }
-    let prefix = domain.strip_suffix(&format!(".{suffix}"))?;
+    if !listed && domain.bytes().filter(|&b| b == b'.').count() > 1 {
+        return None;
+    }
+    // `domain` is `<prefix>.<suffix>`; the label just before the suffix.
+    let prefix = &domain[..domain.len() - suffix.len() - 1];
     let label = prefix.rsplit('.').next()?;
     Some(format!("{label}.{suffix}"))
 }
 
+/// The longest name [`normalize`] accepts: a DNS name's 253 octets in
+/// text form (RFC 1035 §2.3.4, without the trailing dot).
+const MAX_NAME_LEN: usize = 253;
+
+/// The longest label [`normalize`] accepts (RFC 1035 §2.3.4).
+const MAX_LABEL_LEN: usize = 63;
+
 /// Trim `domain`, drop a trailing dot and lowercase it; `None` if nothing
-/// is left, a label is empty, or it has a character no DNS hostname label
+/// is left, a label is empty, it has a character no DNS hostname label
 /// has (only letters, digits, `-` and `_` are kept; IDNs arrive in their
-/// `xn--` form). A name like that (an attacker-chosen DKIM `d=`, say) has
-/// no organizational domain, so it can only align with itself.
+/// `xn--` form), or it is longer than a DNS name or label can be. A name
+/// like that (an attacker-chosen DKIM `d=` or `From:` domain, say) has
+/// no organizational domain, so it can only align with itself. The length
+/// bound also bounds the lookup: the names reaching it are
+/// attacker-chosen, and a walk over thousands of labels cost seconds.
 fn normalize(domain: &str) -> Option<String> {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty() || domain.len() > MAX_NAME_LEN {
+        return None;
+    }
+    let domain = domain.to_ascii_lowercase();
     let label_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
-    if domain.is_empty() || domain.split('.').any(str::is_empty) || !domain.bytes().all(label_char)
+    if domain
+        .split('.')
+        .any(|l| l.is_empty() || l.len() > MAX_LABEL_LEN)
+        || !domain.bytes().all(label_char)
     {
         return None;
     }
@@ -268,9 +314,15 @@ mod tests {
         assert_eq!(org("b.test.ck"), Some("b.test.ck".into()));
         assert_eq!(org("www.ck"), Some("www.ck".into()));
         assert_eq!(org("www.www.ck"), Some("www.ck".into()));
-        // An unlisted TLD falls back to the implicit `*` rule.
+        // An unlisted TLD: a two-label name is its own organization, but
+        // a deeper one has none (it aligns only exactly), since the
+        // snapshot can't tell whether `example.example` is a registry.
         assert_eq!(org("example.example"), Some("example.example".into()));
-        assert_eq!(org("b.example.example"), Some("example.example".into()));
+        assert_eq!(org("b.example.example"), None);
+        assert_eq!(
+            public_suffix("b.example.example").as_deref(),
+            Some("example")
+        );
         // Private section: each github.io site is its own organization.
         assert_eq!(org("alice.github.io"), Some("alice.github.io".into()));
         assert_eq!(org("www.alice.github.io"), Some("alice.github.io".into()));
@@ -290,5 +342,45 @@ mod tests {
         // the result unstable): no organizational domain.
         assert_eq!(org("\x0c\x0cx.p["), None);
         assert_eq!(org("a b.example.com"), None);
+    }
+
+    /// Names longer than DNS allows have no organizational domain (they
+    /// align only with themselves), and the longest valid names still
+    /// work.
+    #[test]
+    fn dns_length_limits() {
+        let label63 = "a".repeat(63);
+        // 3 × (63 + 1) + 55 + ".co.uk" = 253.
+        let longest = format!("{label63}.{label63}.{label63}.{}.co.uk", "b".repeat(55));
+        assert_eq!(longest.len(), 253);
+        assert_eq!(
+            organizational_domain(&longest),
+            Some(format!("{}.co.uk", "b".repeat(55)))
+        );
+        assert_eq!(organizational_domain(&format!("a{longest}")), None);
+        assert!(organizational_domain(&format!("{longest}.")).is_some());
+        assert_eq!(
+            organizational_domain(&format!("{}.example.com", "a".repeat(64))),
+            None
+        );
+        assert_eq!(public_suffix(&format!("a{longest}")), None);
+    }
+
+    /// An attacker-chosen name of thousands of labels is refused at once
+    /// (the walk joined a string per label: 32,000 labels took 4.4 s in a
+    /// release build).
+    #[test]
+    fn many_labels_are_cheap() {
+        let started = std::time::Instant::now();
+        for n in [2_500, 20_000, 200_000] {
+            let name = "ab.".repeat(n) + "cd";
+            assert_eq!(organizational_domain(&name), None);
+            assert_eq!(public_suffix(&name), None);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

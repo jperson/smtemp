@@ -148,6 +148,18 @@ pub fn organizational_domain(domain: &str) -> Option<String> {
     Some(format!("{label}.{suffix}"))
 }
 
+/// Whether `domain`'s public suffix comes from a rule of the list, not
+/// from the implicit `*` rule: the name sits under a suffix the snapshot
+/// knows (`com`, `co.uk`), so it can belong to a real registrant. `false`
+/// for an unlisted TLD (`example`, `invalid`, a made-up one) and for a
+/// name [`normalize`] refuses.
+pub fn has_listed_suffix(domain: &str) -> bool {
+    normalize(domain).is_some_and(|domain| {
+        let (suffix, listed) = suffix_of(&domain);
+        listed && suffix.len() < domain.len()
+    })
+}
+
 /// The longest name [`normalize`] accepts: a DNS name's 253 octets in
 /// text form (RFC 1035 §2.3.4, without the trailing dot).
 const MAX_NAME_LEN: usize = 253;
@@ -323,6 +335,13 @@ mod tests {
             public_suffix("b.example.example").as_deref(),
             Some("example")
         );
+        // Whether a listed rule (not the implicit `*`) gave the suffix.
+        assert!(has_listed_suffix("paypal.com"));
+        assert!(has_listed_suffix("mail.example.co.uk"));
+        assert!(!has_listed_suffix("com"), "a suffix alone isn't under one");
+        assert!(!has_listed_suffix("a0.example"));
+        assert!(!has_listed_suffix("b.example.invalid"));
+        assert!(!has_listed_suffix(&format!("{}.com", "a".repeat(64))));
         // Private section: each github.io site is its own organization.
         assert_eq!(org("alice.github.io"), Some("alice.github.io".into()));
         assert_eq!(org("www.alice.github.io"), Some("alice.github.io".into()));

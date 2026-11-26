@@ -791,6 +791,168 @@ async fn catch_all_copies_share_one_quota() {
     assert_eq!(session.t().rcpt_to.len(), 3);
 }
 
+/// A `SIZE` the sender lies about is never caught, and Q3's accounting
+/// believes it: the quota is checked against the *declared* bytes only,
+/// nothing compares them with the message, and the mailbox quota is not
+/// asked again at end of data — so one transaction still puts
+/// `MAX_RCPT` copies of the real message into one mailbox, the overshoot
+/// the fix set out to remove (100 × 1.8 KB = 180 KB into a 5 KB mailbox
+/// here; at the defaults, 100 × 10 MiB into a 10 MiB one).
+///
+/// Without `SIZE=` the fix works (each extra copy is then counted at the
+/// transaction's size limit). Either a message over its declared size is
+/// refused at end of data (RFC 1870 §6 lets the receiver do exactly that)
+/// or the quota is re-checked with the received length before the copies
+/// are committed.
+#[tokio::test]
+async fn a_lied_declared_size_still_defeats_one_mailbox_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catch-authority.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "domains": { "catch.example": { "mode": "catch-all",
+                "catch-all-mailbox": "inbox@catch.example", "max-message-bytes": 2000 } },
+            "mailboxes": {}
+        }"#,
+    )
+    .unwrap();
+    let maildir = dir.path().join("maildir");
+    let sink = delivery::MaildirSink::open(&maildir).unwrap();
+    let quota = 5_000;
+    let cfg = SessionConfig {
+        authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
+        sink: Some(Arc::new(sink)),
+        spool: Some(Arc::new(
+            spool::DiskSpool::open(dir.path().join("spool"), None).unwrap(),
+        )),
+        // No policy anywhere, so an accepted message is delivered.
+        dns: spawn_nxdomain_resolver().await,
+        storage: Arc::new(crate::quota::StorageLimits {
+            mailbox_quota: Some(quota),
+            ..crate::quota::StorageLimits::unlimited()
+        }),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    // A real MAIL FROM, so `SIZE=10` arrives the way a sender sends it.
+    assert!(
+        session
+            .mail_from("<x@sender.example> SIZE=10")
+            .await
+            .is_accept(),
+        "SPF finds nothing to check, the transaction starts"
+    );
+    // Each copy is accounted at the declared 10 bytes, so all 100 fit.
+    let mut accepted = 0;
+    for i in 0..100 {
+        if session
+            .rcpt_to(&format!("<r{i}@catch.example>"))
+            .await
+            .is_accept()
+        {
+            accepted += 1;
+        }
+    }
+    let message = [
+        b"From: a@sender.example\r\n\r\n".as_slice(),
+        &[b'x'; 1_800],
+        b"\r\n".as_slice(),
+    ]
+    .concat();
+    assert!(message.len() <= 2_000, "under the recipient's limit");
+    session.t().data = message;
+    let reply = session.end_data().await;
+
+    // The fast path delivers in a spawned task; wait for its copies to
+    // stop arriving.
+    let new = maildir.join("catch.example/inbox/new");
+    let mut stored = 0u64;
+    let mut copies = 0usize;
+    let mut stable = 0;
+    for _ in 0..250 {
+        let entries: Vec<_> = std::fs::read_dir(&new)
+            .map(|d| d.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        stable = usize::from(entries.len() == copies).saturating_add(stable);
+        copies = entries.len();
+        stored = entries
+            .iter()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        if copies >= 100 || stable >= 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        stored <= quota + 2_000,
+        "{stored} bytes stored in a {quota}-byte mailbox: {accepted} of 100 \
+         recipients accepted, end_data {reply:?}, {copies} copies delivered. \
+         The bound (DESIGN §5, the fix's own doc comment) is the quota plus one message."
+    );
+}
+
+/// An over-long `From:` domain is stored whole in the spool metadata and
+/// printed in the DMARC log record, because `mailbox_address` bounds its
+/// characters but not its length (see `from_domain_length_is_bounded` in
+/// `headers.rs`). Q4 bound the DKIM tags, the error text, the claims and
+/// `header_token`, so the delivered message stays small — but the sidecar
+/// beside it grows with the header: a 60 KB domain here makes a 60 KB
+/// metadata file (measured), so one 10 MiB message costs 20 MiB on disk,
+/// and `min-free-disk-bytes` is measured once before that.
+#[tokio::test]
+async fn spool_metadata_does_not_grow_with_the_from_domain() {
+    let dns = spawn_mock_resolver(
+        |name, qtype| match (name, qtype) {
+            // The policy walk's last candidate is the domain's two-label
+            // suffix, which the sender chooses, so a record is found and
+            // `from_domain` is kept.
+            ("_dmarc.attacker.example", 16) => MockAnswer::Txt("v=DMARC1; p=none"),
+            _ => MockAnswer::Rcode(3),
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let cfg = SessionConfig {
+        dns,
+        spool: Some(Arc::new(spool::DiskSpool::open(&spool_dir, None).unwrap())),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@sender.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    let junk = "ab.".repeat(20_000);
+    session.t().data =
+        format!("From: \"ceo@victim.example\" <a@{junk}attacker.example>\r\n\r\nbody\r\n")
+            .into_bytes();
+    let reply = session.end_data().await;
+    // Refusing such a message (it has no DNS wire form, so DMARC is
+    // skipped today) is an acceptable answer too.
+    if !reply.is_accept() {
+        return;
+    }
+    let new = spool_dir.join("new");
+    let json = std::fs::read_dir(&new)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().ends_with(".json"))
+        .expect("an accepted message is spooled");
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+    let from_domain = meta["dmarc"]["from_domain"].as_str().unwrap_or("");
+    let size = std::fs::metadata(&json).unwrap().len();
+    assert!(
+        size <= 4 * 1024,
+        "the {}-byte metadata file keeps a {}-octet from_domain: {from_domain:.80}...",
+        size,
+        from_domain.len()
+    );
+}
+
 /// Below the free-disk floor, MAIL FROM is deferred (no transaction
 /// starts), and so is a message that reaches end of data.
 #[tokio::test]

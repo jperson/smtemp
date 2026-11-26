@@ -189,15 +189,32 @@ pub fn from_authors(value: &[u8]) -> Option<Vec<(String, String)>> {
     }
 
     // Pass 2: split into mailboxes at top-level commas (commas inside
-    // `<...>` belong to an obsolete route).
-    let mut mailboxes: Vec<&[u8]> = Vec::new();
+    // `<...>` belong to an obsolete route), and read each one as it ends.
+    let mut authors: Vec<(String, String)> = Vec::new();
+    let mut add = |mailbox: &[u8]| -> Option<()> {
+        let mailbox = trim_header_fws(mailbox);
+        if mailbox.is_empty() {
+            return Some(()); // obs-mbox-list permits empty elements
+        }
+        let author = mailbox_address(mailbox)?;
+        // The same author twice is one author (the grant check and the
+        // log need it once); more distinct ones than any real message
+        // has is refused, not cut: every author must be checked.
+        if !authors.contains(&author) {
+            if authors.len() == MAX_AUTHORS {
+                return None;
+            }
+            authors.push(author);
+        }
+        Some(())
+    };
     let (mut angle, mut start) = (0usize, 0usize);
     for (i, &b) in clean.iter().enumerate() {
         match b {
             b'<' => angle += 1,
             b'>' => angle = angle.saturating_sub(1),
             b',' if angle == 0 => {
-                mailboxes.push(&clean[start..i]);
+                add(&clean[start..i])?;
                 start = i + 1;
             }
             // From is a mailbox-list: group syntax is not allowed.
@@ -205,23 +222,35 @@ pub fn from_authors(value: &[u8]) -> Option<Vec<(String, String)>> {
             _ => {}
         }
     }
-    mailboxes.push(&clean[start..]);
-
-    let mut authors = Vec::new();
-    for mailbox in mailboxes {
-        let mailbox = trim_header_fws(mailbox);
-        if mailbox.is_empty() {
-            continue; // obs-mbox-list permits empty elements
-        }
-        authors.push(mailbox_address(mailbox)?);
-    }
+    add(&clean[start..])?;
     (!authors.is_empty()).then_some(authors)
 }
+
+/// The most distinct authors [`from_authors`] reads from one `From:`
+/// field. A real one has a handful; without a bound, continuation lines
+/// (which [`MAX_HEADER_FIELDS`] doesn't count) let one field hold
+/// hundreds of thousands, each kept, checked and logged.
+pub const MAX_AUTHORS: usize = 100;
+
+/// The longest `From:` domain [`mailbox_address`] accepts: a DNS name's
+/// 253 octets in text form (RFC 1035 §2.3.4), as `dmarc::psl` and DKIM
+/// bound theirs.
+const MAX_DOMAIN_LEN: usize = 253;
+
+/// The longest label of a `From:` domain (RFC 1035 §2.3.4).
+const MAX_LABEL_LEN: usize = 63;
+
+/// The longest `From:` local-part [`mailbox_address`] accepts. RFC 5321
+/// §4.5.3.1.1 sets 64 octets for the envelope; this is looser, since a
+/// header address is only displayed, but bounded, since every author is
+/// logged and checked against the sender grants.
+const MAX_LOCAL_PART_LEN: usize = 256;
 
 /// The `(local-part, domain)` of one cleaned mailbox (comments removed,
 /// quoted strings blanked): the addr-spec inside `<...>` when present,
 /// otherwise the whole mailbox. Returns `None` unless the local-part is
-/// non-empty and the domain is plausible. The domain is lowercased.
+/// non-empty and at most [`MAX_LOCAL_PART_LEN`] octets, and the domain is
+/// plausible and within a DNS name's length. The domain is lowercased.
 pub fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     let addr = match mailbox.iter().position(|&b| b == b'<') {
         Some(open) => {
@@ -245,10 +274,20 @@ pub fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     if local.is_empty() {
         return None; // empty local-part
     }
+    if local.len() > MAX_LOCAL_PART_LEN {
+        return None;
+    }
     let domain = trim_header_fws(&addr[at + 1..]);
     // Strip a trailing dot (fully-qualified form).
     let domain = domain.strip_suffix(b".").unwrap_or(domain);
+    // A DNS name's length bounds (RFC 1035 §2.3.4): a longer name has no
+    // wire form, so no DMARC lookup could ever be made for it (and it
+    // would be carried whole into the log and the spool metadata).
     if domain.is_empty()
+        || domain.len() > MAX_DOMAIN_LEN
+        || domain
+            .split(|&b| b == b'.')
+            .any(|l| l.len() > MAX_LABEL_LEN)
         || !domain
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
@@ -346,25 +385,13 @@ fn auth_results_id(value: &[u8]) -> Option<String> {
 /// via Team" <team@lists.example>`), so this is a warning, not a refusal.
 pub fn display_name_claims(from_value: &[u8], authors: &[(String, String)]) -> Vec<String> {
     let org = |d: &str| dmarc::psl::organizational_domain(d).unwrap_or_else(|| d.to_string());
-    // A set: both the authors and the claims can number in the thousands.
+    // A set: the authors can number up to `MAX_AUTHORS`, and the
+    // candidates in the thousands.
     let author_orgs: std::collections::HashSet<String> =
         authors.iter().map(|(_, d)| org(d)).collect();
-    let mut claims: Vec<String> = address_domains(&decode_encoded_words(from_value))
-        .into_iter()
-        .filter(|d| !author_orgs.contains(&org(d)))
-        .map(|mut d| {
-            // Domain characters are ASCII, so any byte is a boundary.
-            if d.len() > MAX_CLAIM_LEN {
-                d.truncate(MAX_CLAIM_LEN);
-                d.push_str("...");
-            }
-            d
-        })
-        .collect();
-    claims.sort();
-    claims.dedup();
-    claims.truncate(MAX_CLAIMS);
-    claims
+    claimed_domains(&decode_encoded_words(from_value), |d| {
+        !author_orgs.contains(&org(d))
+    })
 }
 
 /// The most display-name claims [`display_name_claims`] reports. One is
@@ -375,26 +402,76 @@ pub const MAX_CLAIMS: usize = 10;
 /// DNS name's 253 octets.
 const MAX_CLAIM_LEN: usize = 253;
 
-/// Returns the domain of every `local@domain` in `text` (lowercased, a
-/// trailing dot removed): an `@` with a non-space character before it and
-/// a domain of letters, digits, `-` and `.` (with at least one dot) after.
+/// Returns at most [`MAX_CLAIMS`] of the domains [`for_each_address_domain`]
+/// finds in `text` that `keep` accepts, deduplicated and sorted, each cut
+/// to [`MAX_CLAIM_LEN`] (marked with `...`).
+///
+/// Memory is bounded by the result, not by `text`: the candidates are
+/// kept in a set of at most `MAX_CLAIMS + 1` while the text is scanned.
+/// When there are more than `MAX_CLAIMS`, the domains under a suffix of
+/// the public suffix list (`paypal.com`) are kept before those under an
+/// unlisted one (`a0.example`, `x.invalid`), then alphabetically: no real
+/// organization sits under an unlisted suffix, so filler addresses there
+/// can't push a claim about a real one out of the warning.
+fn claimed_domains(text: &[u8], mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+    // Ordered by (unlisted, domain): the last entry is the first to drop.
+    let mut best: std::collections::BTreeSet<(bool, String)> = Default::default();
+    for_each_address_domain(text, |mut domain| {
+        if !keep(&domain) {
+            return;
+        }
+        // Domain characters are ASCII, so any byte is a boundary. A cut
+        // name is longer than any DNS name, so it is never listed.
+        if domain.len() > MAX_CLAIM_LEN {
+            domain.truncate(MAX_CLAIM_LEN);
+            domain.push_str("...");
+        }
+        // Repeats are free to send: a comparison against the few kept,
+        // and no list lookup.
+        if best.iter().any(|(_, kept)| *kept == domain) {
+            return;
+        }
+        let unlisted = !dmarc::psl::has_listed_suffix(&domain);
+        best.insert((unlisted, domain));
+        if best.len() > MAX_CLAIMS {
+            best.pop_last();
+        }
+    });
+    let mut claims: Vec<String> = best.into_iter().map(|(_, d)| d).collect();
+    claims.sort();
+    claims
+}
+
+/// [`claimed_domains`] with nothing filtered out: the bounded selection
+/// of every `local@domain` in `text`.
+#[cfg(test)]
 fn address_domains(text: &[u8]) -> Vec<String> {
-    let mut domains = Vec::new();
+    claimed_domains(text, |_| true)
+}
+
+/// Calls `found` with the domain of every `local@domain` in `text`
+/// (lowercased, a trailing dot removed), in order: an `@` with a non-space
+/// character before it and a domain of letters, digits, `-` and `.` (with
+/// at least one dot) after.
+fn for_each_address_domain(text: &[u8], mut found: impl FnMut(String)) {
     for (at, _) in text.iter().enumerate().filter(|(_, &b)| b == b'@') {
         let before_ok = at > 0 && !text[at - 1].is_ascii_whitespace() && text[at - 1] != b'<';
-        let domain: Vec<u8> = text[at + 1..]
+        if !before_ok {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let len = rest
             .iter()
-            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
-            .copied()
-            .collect();
-        let domain = String::from_utf8_lossy(&domain)
+            .position(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.')))
+            .unwrap_or(rest.len());
+        // Only ASCII bytes were taken, so this is valid UTF-8.
+        let domain = String::from_utf8_lossy(&rest[..len])
             .trim_matches('.')
             .to_ascii_lowercase();
-        if before_ok && domain.contains('.') {
-            domains.push(domain);
+        if domain.contains('.') {
+            found(domain);
         }
     }
-    domains
 }
 
 /// Decode the RFC 2047 encoded-words in `value` (`=?charset?B|Q?text?=`)
@@ -847,5 +924,148 @@ Authentication-Results: mx.example.org; dmarc=pass\r\nSubject: s\r\n\r\nbody\r\n
         assert!(claims[0].starts_with("paypal.com.aaa"));
         assert_eq!(claims[0].len(), MAX_CLAIM_LEN + 3);
         assert!(claims[0].ends_with("..."));
+    }
+
+    /// Filler claims push the claim that matters out of the warning.
+    ///
+    /// Q4 capped the claims at `MAX_CLAIMS` to bound the header, the
+    /// metadata and the log, but it keeps the *alphabetically first* ten
+    /// and drops the rest, so a sender who wants no warning about
+    /// `ceo@paypal.com` writes ten throwaway addresses at domains that
+    /// sort before it. The rest of the list is what the reader is shown;
+    /// the spoof is silent. (The length cap right above keeps an
+    /// over-long claim precisely because dropping one loses the warning;
+    /// the count cap must not do the same thing.)
+    #[test]
+    fn filler_claims_cannot_suppress_the_warning() {
+        let authors = vec![("x".to_string(), "attacker.example".to_string())];
+        let pad: String = (0..MAX_CLAIMS)
+            .map(|i| format!("p{i}@a{i}.example "))
+            .collect();
+        let claims = display_name_claims(
+            format!("\"{pad}ceo@paypal.com\" <x@attacker.example>").as_bytes(),
+            &authors,
+        );
+        assert_eq!(claims.len(), MAX_CLAIMS, "{claims:?}");
+        assert!(
+            claims.iter().any(|c| c == "paypal.com"),
+            "{} filler claims sort first and push the real one out: {claims:?}",
+            MAX_CLAIMS
+        );
+    }
+
+    /// The bound a `From:` domain must have, same as
+    /// [`dmarc::psl::organizational_domain`]'s `normalize` and
+    /// `dkim::MAX_DNS_NAME_LEN`: a DNS name's 253 octets, 63 per label
+    /// (RFC 1035 §2.3.4, RFC 6376 §3.5).
+    const EXPECTED_MAX_DOMAIN_LEN: usize = 253;
+
+    /// A `From:` domain longer than a DNS name is accepted, because
+    /// `mailbox_address` bounds the characters but not the length (the
+    /// data-line cap doesn't help: unfolded continuation lines join into
+    /// one domain).
+    ///
+    /// Q4 bound DKIM's `d=`/`s=`/`i=`, the DKIM error text, the claims and
+    /// `header_token`, and Q2's bound landed in `dmarc::psl::normalize`
+    /// only — but this string is what `from_domain` is made of, and
+    /// `from_domain` is logged (`info!(from_domain = ...)`,
+    /// `warn!(from_domain = ...)` on `MultipleRecords`) and stored whole
+    /// in the spool metadata (`DmarcSummary.from_domain`) whenever one of
+    /// the ancestor names the sender chose has a record, so one message
+    /// can carry megabytes into the log line and into the metadata file
+    /// beside it. The same name has no DNS wire form, so the DMARC walk
+    /// finds nothing and the message is delivered unchecked (AUDIT Q10);
+    /// refusing it here closes both.
+    #[test]
+    fn from_domain_length_is_bounded() {
+        // A label longer than DNS allows is already not a domain.
+        assert!(
+            mailbox_address(format!("a@x.{}.com", "a".repeat(64)).as_bytes()).is_none(),
+            "a 64-octet label has no DNS wire form"
+        );
+        // And a name longer than a DNS name: 200 KB here, well over the
+        // 253-octet bound, in one unfolded field (2 header fields, so
+        // MAX_HEADER_FIELDS doesn't bite).
+        let long = format!("x.example.{}cd", "ab.".repeat(100_000));
+        assert!(long.len() > 10 * EXPECTED_MAX_DOMAIN_LEN);
+        let raw = format!("From: a@{long}\r\nSubject: s\r\n\r\nbody\r\n");
+        assert!(!too_many_header_fields(raw.as_bytes(), MAX_HEADER_FIELDS));
+        assert_eq!(
+            from_header_domain(raw.as_bytes()),
+            FromHeader::Unparseable,
+            "a {}-octet From domain must be refused, not carried",
+            long.len()
+        );
+    }
+
+    /// The most authors one `From:` field may yield. A real one has a
+    /// handful; this is the bound Q1's "no per-item state beyond the
+    /// field cap" needs, and there is none in the code today.
+    const EXPECTED_MAX_AUTHORS: usize = 100;
+
+    /// The number of authors in one `From:` field is unbounded, so a
+    /// message holds its reader's memory per author, not per field.
+    ///
+    /// Q1 capped the header *fields*, but continuation lines are free and
+    /// `from_authors` (and `address_domains` inside
+    /// `display_name_claims`) keeps an entry and two `String`s per
+    /// mailbox. Measured in release, straight through
+    /// [`single_from_value`] + [`from_authors`] as `end_of_data` calls
+    /// them: one 9 MiB folded `From:` — two header fields, far under
+    /// `MAX_HEADER_FIELDS` — yields 629,146 authors and +127 MB of peak
+    /// RSS for that one message (14× the message, where DESIGN §13 and
+    /// DEPLOYMENT.md B2 budget 2–3×), plus a `from_authors = ?authors`
+    /// record of 12 MB, which is what the fix set out to remove.
+    #[test]
+    fn from_author_count_is_bounded() {
+        // ~800 KB of continuation lines: 60,000 mailboxes, 2 fields.
+        let mut value = String::from("a@x.example");
+        for _ in 1..60_000 {
+            value.push_str(",\r\n a@x.example");
+        }
+        let raw = format!("From: {value}\r\nSubject: s\r\n\r\nbody\r\n");
+        assert!(!too_many_header_fields(raw.as_bytes(), MAX_HEADER_FIELDS));
+        let value = single_from_value(raw.as_bytes()).unwrap();
+        let authors = from_authors(&value).unwrap();
+        assert_eq!(
+            from_domain_of(&value),
+            FromHeader::Parsed("x.example".to_string()),
+            "one author domain, so the list is accepted and used"
+        );
+        assert!(
+            authors.len() <= EXPECTED_MAX_AUTHORS,
+            "{} authors materialized from a {}-byte field",
+            authors.len(),
+            value.len()
+        );
+        // The same list is what the info! record prints, so the record
+        // inherits the bound.
+        assert!(
+            format!("{authors:?}").len() <= 64 * 1024,
+            "the from_authors record is {} MB",
+            format!("{authors:?}").len() / 1_048_576
+        );
+    }
+
+    /// `display_name_claims` keeps every address it finds before cutting
+    /// the list to `MAX_CLAIMS`, so a folded display name costs memory
+    /// per address: measured +86 MB peak for a 17 MB one (5×), with only
+    /// 10 claims ever reported.
+    #[test]
+    fn claim_candidates_are_bounded() {
+        let authors = vec![("x".to_string(), "attacker.example".to_string())];
+        let mut value = String::from("\"");
+        for i in 0..200_000 {
+            value.push_str(&format!("c@v{i}.example "));
+        }
+        value.push_str("\" <x@attacker.example>");
+        assert!(
+            address_domains(value.as_bytes()).len() <= MAX_CLAIMS,
+            "{} candidate domains held to report {} claims",
+            address_domains(value.as_bytes()).len(),
+            MAX_CLAIMS
+        );
+        let claims = display_name_claims(value.as_bytes(), &authors);
+        assert!(claims.len() <= MAX_CLAIMS);
     }
 }

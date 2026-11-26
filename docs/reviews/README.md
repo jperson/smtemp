@@ -14,7 +14,7 @@ description, without finding IDs), and the current design and its gaps in
 | [SECURITY-AUDIT.md](SECURITY-AUDIT.md) | 2026-11-22 | `640b60e` + working tree | F1–F10, and its own L1–L9 |
 | [AUDIT.md](AUDIT.md) | 2026-11-22 | `640b60e` + working tree | Re-checks of REPORT's and SECURITY.md's IDs |
 | [FINDINGS.md](FINDINGS.md) | 2026-11-22 | `8e3a643` | Design and code quality (D-W, C-W); carried into PLAN.md §4 |
-| [AUDIT_20261125.md](AUDIT_20261125.md) | 2026-11-25 | `8a25bd9` | A1–A8 |
+| [AUDIT_20261125.md](AUDIT_20261125.md) | 2026-11-25 | `8a25bd9` | A1–A9 (A9 added on re-verification) |
 | [AUDIT_20261125_QWEN.md](AUDIT_20261125_QWEN.md) | 2026-11-25 | `8a25bd9` | Q1–Q12 (and re-checks of A1–A8) |
 
 The deployment review's D1–D7 lived in DEPLOYMENT.md until it was rewritten
@@ -138,8 +138,11 @@ the section given.
 
 ### AUDIT_20261125.md and AUDIT_20261125_QWEN.md (2026-11-25)
 
-The high- and medium-severity findings are fixed; the low and
-informational ones are still open as the reports describe them.
+The high- and medium-severity findings are fixed, as are A9 (a
+quota-accounting defect introduced by A4's fix) and Q10. Q4 leaves a
+documented residual in the display-name claim cap (its row in the
+report). The other low and informational findings are still open as the
+reports describe them.
 
 | ID | Finding | Status |
 |---|---|---|
@@ -150,7 +153,10 @@ informational ones are still open as the reports describe them.
 | Q2 | Quadratic Public Suffix List walk over a long domain | Fixed (2026-11-25): names over DNS limits (253 octets, 63 per label) have no organizational domain; the walk builds no strings |
 | A3 | Maildir file-name collision lost catch-all copies | Fixed (2026-11-25): an injective tag (`%XX` escapes, a hash past 160 bytes); plain addresses keep their file names |
 | A4 | Fast path and drain shared one `tmp/` staging name | Fixed (2026-11-25): a staging name per attempt |
-| Q3 | Quota overshoot of one message per recipient | Fixed (2026-11-25): a transaction's copies to one mailbox count at RCPT (each extra one at the declared size, or the size limit) |
-| Q4 | Sender strings copied unbounded into the message, metadata and log | Fixed (2026-11-25): DKIM `d=`/`s=`/`i=` length bounds, error text and header tokens cut, at most 10 display-name claims |
+| A9 | Racing deliveries double-count the copy in the cached mailbox size | Fixed (2026-11-25): the copy is committed with a hard link; only the attempt that creates it updates the cache (`EEXIST` is success) |
+| A1 follow-up | Per-author and per-claim state of one folded `From:` unbounded | Fixed (2026-11-25): authors deduplicated, more than 100 distinct refused; local-parts at most 256 octets; at most 11 claim candidates held while scanning |
+| Q3 | Quota overshoot of one message per recipient | Fixed (2026-11-25): a transaction's copies to one mailbox count at RCPT (each extra one at the declared size, or the size limit), and a message larger than its declared `SIZE=` is re-checked against the quotas at its real size at end of data (`452 4.2.2` if the copies don't fit) |
+| Q4 | Sender strings copied unbounded into the message, metadata and log | Fixed (2026-11-25): DKIM `d=`/`s=`/`i=` length bounds, error text and header tokens cut, `From:` domains bounded to DNS limits (else `550`), at most 10 display-name claims, those under a listed public suffix kept first. Residual: fillers under listed suffixes can still displace a claim from the list (the warning still appears); closing it needs an always-reported protected-domain list and a truncation marker |
+| Q10 | DMARC skipped for a `From:` domain with no DNS wire form | Fixed (2026-11-25, with Q4): such a `From:` is refused as unparseable |
 | Q5 | PSL snapshot gap allows cross-registrant DMARC passes | Mitigated (2026-11-25): under an unknown TLD, names of more than two labels align only exactly; a missing zone under a listed TLD still needs the refresh (DEPLOYMENT.md H7). Reclassified under abuse resistance in DESIGN §13 |
-| A5–A7, Q6–Q12 | Low and informational findings | Open, as reported |
+| A5–A7, Q6–Q9, Q11, Q12 | Low and informational findings | Open, as reported |

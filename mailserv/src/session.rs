@@ -236,6 +236,11 @@ pub(crate) struct Transaction {
     /// Bytes of message data received, including any past `limit`.
     #[serde(skip)]
     received: usize,
+    /// The quota of each mailbox the accepted recipients route to that
+    /// has one (lowercased mailbox, quota bytes), as checked at RCPT; see
+    /// [`UserSession::recheck_quotas_for_size`].
+    #[serde(skip)]
+    quotas: Vec<(String, u64)>,
 }
 
 impl Transaction {
@@ -256,6 +261,7 @@ impl Transaction {
             limit,
             data: Vec::new(),
             received: 0,
+            quotas: Vec::new(),
         }
     }
 
@@ -547,6 +553,73 @@ impl<'session> UserSession<'session> {
                 ))
             }
         }
+    }
+
+    /// At end of data, check the mailbox quotas again when the message is
+    /// larger than the size `declared` at MAIL FROM.
+    ///
+    /// [`Self::check_mailbox_quota`] counts the copies a transaction adds
+    /// to one mailbox at the declared size, which the sender chooses: with
+    /// `SIZE=10`, a hundred catch-all recipients all fit, and a hundred
+    /// copies of the real message would be stored. So for a message of
+    /// `received` bytes over its declaration, each mailbox in `quotas`
+    /// (see [`Transaction::quotas`]) must have room for the copies
+    /// `rcpt_to` routes to it at their real size, to the same bound as
+    /// without a declared size: at most one message over the quota. An
+    /// honest estimate (the size at most the declaration) changes nothing.
+    ///
+    /// Returns `None` when every copy fits (or nothing needs checking),
+    /// `452 4.2.2` when one mailbox would go over, and `451` when a usage
+    /// can't be measured.
+    pub(super) async fn recheck_quotas_for_size(
+        &self,
+        declared: Option<u64>,
+        received: u64,
+        rcpt_to: &[spool::SpoolRcpt],
+        quotas: &[(String, u64)],
+    ) -> Option<smtp::Control> {
+        if declared.is_none_or(|declared| received <= declared) {
+            return None;
+        }
+        let sink = self.sink.clone()?;
+        for (mailbox, quota) in quotas {
+            let copies = rcpt_to
+                .iter()
+                .filter(|r| r.mailbox.eq_ignore_ascii_case(mailbox))
+                .count() as u64;
+            let others = copies.saturating_sub(1).saturating_mul(received);
+            let lookup = mailbox.clone();
+            let sink = sink.clone();
+            match tokio::task::spawn_blocking(move || sink.usage(&lookup)).await {
+                Ok(Ok(usage))
+                    if crate::quota::has_room(*quota, usage.saturating_add(others), 0) => {}
+                Ok(Ok(usage)) => {
+                    info!(
+                        mailbox = %mailbox,
+                        usage_bytes = usage,
+                        copies,
+                        received_bytes = received,
+                        declared_bytes = declared,
+                        quota_bytes = quota,
+                        "message deferred: larger than its declared SIZE, and its copies don't fit the mailbox quota"
+                    );
+                    return Some(smtp::Control::tempfail(MAILBOX_FULL));
+                }
+                Ok(Err(e)) => {
+                    warn!(mailbox = %mailbox, error = %format!("{e:#}"), "mailbox usage unavailable; refusing temporarily");
+                    return Some(smtp::Control::tempfail(
+                        b"451 4.3.0 Mailbox check failed, try again later\r\n",
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "mailbox usage task panicked; refusing temporarily");
+                    return Some(smtp::Control::tempfail(
+                        b"451 4.3.0 Mailbox check failed, try again later\r\n",
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Check `user`/`pass` against `auth` (an argon2id check on the
@@ -1046,10 +1119,20 @@ impl smtp::SmtpSession for UserSession<'_> {
                 {
                     return reply;
                 }
+                let quota = self
+                    .sink
+                    .as_ref()
+                    .and(self.storage.quota_for(recipient.quota_bytes));
                 let Some(txn) = self.txn.as_mut() else {
                     return smtp::Control::reject(b"503 5.5.1 Error: need MAIL command\r\n");
                 };
                 txn.limit = limit;
+                if let Some(quota) = quota {
+                    let mailbox = recipient.mailbox.to_ascii_lowercase();
+                    if !txn.quotas.iter().any(|(m, _)| *m == mailbox) {
+                        txn.quotas.push((mailbox, quota));
+                    }
+                }
                 txn.rcpt_to.push(spool::SpoolRcpt {
                     address: addr,
                     mailbox: recipient.mailbox,

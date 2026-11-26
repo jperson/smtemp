@@ -27,6 +27,8 @@ impl UserSession<'_> {
             spf_result,
             rcpt_to,
             data: raw,
+            declared_size,
+            quotas,
             ..
         } = txn;
         // `raw` is the message as received: the DATA lines, with line
@@ -52,6 +54,14 @@ impl UserSession<'_> {
                 "message refused: too many header fields"
             );
             return smtp::Control::reject(TOO_MANY_HEADER_FIELDS);
+        }
+        // The quotas were checked at RCPT against the declared SIZE; a
+        // message larger than declared is checked again at its real size.
+        if let Some(reply) = self
+            .recheck_quotas_for_size(declared_size, raw.len() as u64, &rcpt_to, &quotas)
+            .await
+        {
+            return reply;
         }
 
         // DKIM key lookups and the DMARC policy fetch hold one of this

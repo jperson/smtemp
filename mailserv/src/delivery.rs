@@ -88,7 +88,7 @@ const USAGE_CACHE_ENTRIES: usize = 10_000;
 
 /// Maildir delivery: one maildir per routing mailbox, under
 /// `{root}/{domain}/{local}/` (both lowercased). Each copy is written to
-/// `tmp/`, fsynced, and renamed into `new/` as
+/// `tmp/`, fsynced, and hard-linked into `new/` as
 /// `{queue_id}.{envelope-address tag}.eml` (see [`address_tag`]), so the file name
 /// records which address the copy was for; the sink creates `tmp/` and
 /// `new/` on first delivery.
@@ -183,39 +183,53 @@ impl DeliverySink for MaildirSink {
         }
 
         // A staging name of this attempt's own, so two attempts racing
-        // past the check above never write the same `tmp/` file. Both
-        // write identical bytes, and the second rename atomically
-        // replaces the first's file with the same content, so either
-        // order delivers one copy and both succeed.
+        // past the check above never write the same `tmp/` file. The
+        // commit is a hard link (the maildir convention), which fails
+        // with `EEXIST` instead of replacing: exactly one attempt creates
+        // the target, and only that one counts the copy in the cached
+        // size. The other found the copy already delivered (identical
+        // bytes), which is success, as above.
         let staged = tmp.join(format!("{filename}.{}", uuid::Uuid::new_v4().simple()));
         if let Err(e) = write_durable(&staged, message) {
             let _ = std::fs::remove_file(&staged);
             return Err(e);
         }
-        if let Err(e) = std::fs::rename(&staged, &target) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(e)
-                .with_context(|| format!("cannot commit delivery to {}", target.display()));
-        }
-        // Make the rename itself durable: without this a power cut can
-        // lose the new directory entry after the message was dequeued. A
-        // failure is a failed delivery: the message stays queued, and the
-        // retry finds the file if it did survive (idempotent).
+        let created = match std::fs::hard_link(&staged, &target) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e)
+                    .with_context(|| format!("cannot commit delivery to {}", target.display()));
+            }
+        };
+        // The staged name is only a second link to the delivered file (or
+        // an unused copy); a leftover is swept as debris.
+        let _ = std::fs::remove_file(&staged);
+        // Make the link itself durable: without this a power cut can lose
+        // the new directory entry after the message was dequeued. Done on
+        // both paths, so an attempt that lost the race doesn't report
+        // success before the winner's entry is durable. A failure is a
+        // failed delivery: the message stays queued, and the retry finds
+        // the file if it did survive (idempotent).
         std::fs::File::open(&new)
             .and_then(|dir| dir.sync_all())
             .with_context(|| format!("cannot sync maildir {}", new.display()))?;
         // Keep a cached size current, so a burst of deliveries is counted
-        // before the next scan.
-        let mut cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, bytes)) = cache.get_mut(&maildir) {
-            *bytes = bytes.saturating_add(message.len() as u64);
+        // before the next scan; only by the attempt that created the copy.
+        if created {
+            let mut cache = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, bytes)) = cache.get_mut(&maildir) {
+                *bytes = bytes.saturating_add(message.len() as u64);
+            }
         }
         Ok(())
     }
 
     fn sweep_debris(&self, now: u64, min_age: Duration) -> Result<Vec<String>> {
         // {root}/{domain}/{local}/tmp/*: a file there is a copy whose
-        // rename into new/ never happened. Live deliveries are seconds
+        // link into new/ never happened (or a staged name left beside a
+        // delivered copy, which removing leaves in place). Live deliveries are seconds
         // old; `min_age` keeps them safe.
         let mut removed = Vec::new();
         let list = |dir: &Path| -> Result<Vec<PathBuf>> {
@@ -1147,6 +1161,45 @@ mod tests {
         assert_eq!(
             std::fs::read(mailbox.join("new/q-1.u_example.org.eml")).unwrap(),
             message
+        );
+    }
+
+    /// Racing attempts of one copy both succeed (see above), but the cached
+    /// mailbox size must count the copy once: every attempt that renamed its
+    /// staging file adds `message.len()` to the cache, so a burst inflates
+    /// the reading and the next quota check can defer a message that fits.
+    #[test]
+    fn racing_deliveries_count_the_copy_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = MaildirSink::open(dir.path()).unwrap();
+        let mailbox = "u@example.org";
+        let message = vec![b'm'; 256 * 1024];
+        // A quota check populates the cache; deliveries keep it current.
+        let before = sink.usage(mailbox).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        sink.deliver(&rcpt("u@example.org", mailbox), "q-1", &message)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        let new = dir.path().join("example.org/u/new");
+        let on_disk: u64 = std::fs::read_dir(&new)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(on_disk, message.len() as u64);
+        assert_eq!(
+            sink.usage(mailbox).unwrap(),
+            before + on_disk,
+            "the cached size counts the copy once, not once per attempt"
         );
     }
 

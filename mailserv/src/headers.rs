@@ -1299,4 +1299,39 @@ Authentication-Results: mx.example.org; dmarc=pass\r\nSubject: s\r\n\r\nbody\r\n
         assert_eq!(fits.truncated, None);
         assert_eq!(counted("Bob").truncated, None);
     }
+
+    /// AUDIT_20261126F H1: `sender_identities` must be linear in the
+    /// message, like every other end-of-data scan (DESIGN §5). The
+    /// per-field `MAX_AUTHORS` cap does not bound the total across
+    /// fields: a message may carry `MAX_HEADER_FIELDS` Sender-family
+    /// fields, each with `MAX_AUTHORS` distinct authors, and the
+    /// cross-field deduplication must not be quadratic in that total.
+    /// This probe measures a mid-size hostile input (300 fields × 100
+    /// authors = 30 000 identities); a linear scan takes milliseconds.
+    #[test]
+    fn sender_identities_scan_is_linear_in_the_message() {
+        let mut raw = b"From: alice@example.org\r\n".to_vec();
+        for f in 0..300 {
+            raw.extend_from_slice(b"Sender: ");
+            for a in 0..MAX_AUTHORS {
+                if a > 0 {
+                    raw.extend_from_slice(b", ");
+                }
+                raw.extend_from_slice(format!("s{f}a{a}@d.example").as_bytes());
+            }
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"\r\nbody\r\n");
+        let start = std::time::Instant::now();
+        let identities = sender_identities(&raw).expect("all fields parse");
+        let elapsed = start.elapsed();
+        assert_eq!(identities.len(), 300 * MAX_AUTHORS);
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "sender_identities took {elapsed:?} on 30k identities: \
+             cross-field dedup is super-linear (quadratic Vec::contains); \
+             at the 1000-field cap this stalls an async worker for \
+             minutes while holding the DNS permit (AUDIT_20261126F H1)"
+        );
+    }
 }

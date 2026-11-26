@@ -1269,3 +1269,267 @@ R8.4 operational requirements are in place. P9–P14 should be scheduled
 with owners before GA. The code-level work (P1, P4, P9–P14) is small; the
 long poles are P2 (the full checklist), P3 (an external review) and P5
 (an availability decision).
+
+---
+---
+
+# AUDIT.md — Round-9 Security Audit (2026-11-26F, pre-production verification)
+
+**Question asked:** verify every prior round against the current tree,
+audit the code no prior round has seen, and assess readiness for a
+**production go-live next week**.
+
+**Tree reviewed:** `HEAD 6fee515` ("security round 8"), working tree clean
+before this round. That commit contains the **G1 fix itself**
+(`headers::sender_identities` + the `end_of_data` grant check) — new code
+that Rounds 4–8 prescribed but never audited as implemented. It is where
+this round's one new finding lives.
+
+**Method.**
+- `cargo test --workspace --no-fail-fast` → **378 passed, 1 ignored**
+  before this round's test; every prior-round regression test re-run by
+  name and green (F1–F5, G1 refusal + guard + live characterization,
+  A1/A2 characterizations).
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo audit --deny warnings` → all clean (the one
+  accepted advisory, RUSTSEC-2023-0071, is the documented unreachable
+  RSA-private-key Marvin case; mailserv holds no RSA private key).
+- Built the **release binary from this tree** and ran it with a strict
+  authority file, a mock DoT resolver (NXDOMAIN for everything, TLS
+  verified via `--resolver-ca`), and a submission listener with argon2id
+  credentials and grants (`alice=alice@sender.test|@granted.test`).
+  Probed over TCP/TLS and read delivered `.eml` files off disk. Every
+  live claim below was produced by that binary (pid and build verified,
+  per the Round-5 methodology warning).
+- Extended the `headers` fuzz target to cover `sender_identities` (it had
+  **no fuzz coverage** — see R9.3.1) and ran it with ASan + debug
+  assertions for 60 s: **180 087 executions, no crash, no hang**.
+- **No source behaviour was modified.** The artifacts are this section,
+  one regression test that **fails today**, and the fuzz-target coverage
+  line.
+
+**Bottom line.** Every prior fix holds — including G1, verified live
+against the plain, obsolete-`Sender :` and tab-before-colon spellings.
+But the G1 fix introduced **H1**, a quadratic-time scan in the
+authenticated end-of-data path: one 2.2 MB message from any credential
+holder occupies a tokio async worker for **~12 s** (measured live:
+11.87 s to `250`, 13.57 s to `550` — the cost is paid even when the
+message is refused), and 8 concurrent messages stalled an innocent MX
+connection's `NOOP` for **10.4 s** on this 8-core host. It is
+submission-only (off by default), but it breaks DESIGN §5's
+"work is linear in the message" invariant and must be fixed before any
+submission listener is enabled. The production go/no-go is otherwise
+unchanged from Round 8: the blockers are operational, not protocol.
+
+---
+
+## R9.1 New finding
+
+| ID | Sev | Where | Finding | Regression test (fails today) |
+|----|-----|-------|---------|-------------------------------|
+| **H1** | **Medium** (submission only) | `mailserv/src/headers.rs` (`sender_identities`), called from `session/message.rs:189` (`end_of_data`) | Cross-field deduplication of `Sender:`/`Resent-Sender:`/`Resent-From:` identities is `Vec::contains` — O(n²) in the total identity count, which no cap bounds below ~100 000. Runs synchronously on an async worker while holding the per-IP DNS permit; the connection deadline cannot interrupt it. | `headers::tests::sender_identities_scan_is_linear_in_the_message` |
+
+### H1 (Medium, submission only) — the G1 fix's scan is quadratic, and stalls the runtime
+
+`from_authors` bounds **one field** at `MAX_AUTHORS = 100`, and
+`MAX_HEADER_FIELDS = 1000` bounds the field count. But `sender_identities`
+accumulates across **all** Sender-family fields and deduplicates with
+`identities.contains(&identity)` — a linear scan per insert. A message
+with 999 `Sender:` fields × 100 distinct authors each (2.18 MB, under
+every size, field and author cap) yields 99 900 identities and ~5×10⁹
+string-tuple comparisons.
+
+**Measured (release build, this tree):**
+- standalone scan of the 99 900-identity message: **12.24 s**;
+- live, authenticated submission, all addresses granted: DATA answered
+  `250 Ok` after **11.87 s**;
+- live, all addresses **ungranted**: `550 5.7.1` after **13.57 s** — the
+  dedup runs to completion *before* the first `permits()` call, so the
+  attacker needs only a valid login, not any matching grant;
+- 8 concurrent hostile messages from two source IPs (4 each, the per-IP
+  DNS-permit cap; one credential holder, e.g. one IPv6 /64): an innocent
+  MX connection's `NOOP` round-trip took **10.41 s** (normally <1 ms).
+  Each message pins one of the runtime's worker threads; on the 2-vCPU
+  VPS DEPLOYMENT.md sizes for, **two** concurrent messages stop the whole
+  server — accept loop, DNS client, every other session — for ~12 s,
+  repeatably.
+
+This is exactly the class DESIGN §5 claims closed ("Work is linear in
+the message … each has a regression test"), and the same shape as the
+round-1 S2 finding (DKIM `h=` selection) and the DKIM duplicate-tag fix
+(which uses a set). Two aggravating details:
+
+1. `end_of_data` runs only DKIM *verification* on the blocking pool; the
+   grant scans run inline on the async worker. Any super-linear scan
+   there is a runtime-stall primitive, not just a slow session.
+2. The scan holds the per-IP DNS permit and is uninterruptible by the
+   session deadline (a tokio timeout fires only at an `await`), so the
+   5-minute connection cap provides no relief.
+
+**Scope.** Authenticated sessions only (`if let Some(user) =
+self.authenticated`), i.e. the optional submission listeners, which V1
+leaves off. The unauthenticated MX path never calls `sender_identities`.
+Severity Medium on the same basis as G1; it becomes a go-live blocker
+the moment a submission port is configured.
+
+**Fix direction (small):** deduplicate with a `HashSet` (the DKIM
+tag-list pattern), or check `auth.permits` per identity as it is read and
+reject on the first ungranted one (which also removes the
+refused-message cost), and/or cap the total identity count like
+`MAX_AUTHORS`. Moving the scan to the blocking pool would contain the
+runtime stall but not the CPU amplification; prefer the set.
+
+**Test:** `mailserv/src/headers.rs ::
+sender_identities_scan_is_linear_in_the_message` — 300 fields × 100
+authors (30 000 identities), asserts the scan finishes in 500 ms. Fails
+today: **4.2 s debug / 0.8 s release** at this mid-size input; the full
+1000-field input is ~11× worse (quadratic). The test cites this document
+as `AUDIT_20261126F H1`.
+
+---
+
+## R9.2 Prior rounds re-verified (nothing re-opened)
+
+**Fix presence and regression tests** — all confirmed in the current
+source and green:
+
+| Prior finding | Evidence in this tree |
+|---|---|
+| F1 refusal-drain DoS | `REFUSE_DRAIN_BUF` fixed 8 KiB discard loop (`server.rs`); `refused_connections_do_not_buffer_the_peer_flood` passes |
+| F2 limiter churn | `CONNECTION_MAX_TRACKED = 4096` hard cap; `tracked_ips_are_bounded_under_churn` passes |
+| F3 config typos | `#[serde(deny_unknown_fields)]` on `FileConfig`; `unknown_config_keys_are_a_startup_error` passes |
+| F4 SPF tab separator | `matches!(txt[6], b' ' \| b'\t')` in `is_spf_record`; both `tab_separated_records_*` tests pass |
+| F5 `--domain` validation | `validate_domain` via `valid_helo`, address literals refused; `domain_is_validated_at_startup` passes |
+| G1 sender-family grants | `sender_identities` + `end_of_data` check; refusal, guard and live tests pass — **but see H1 for the cost of the implementation** |
+| A1/A2 characterizations | `a_sender_return_path_survives_alongside_ours`, `foreign_and_quoted_authserv_ids_are_not_stripped` pass (behaviour unchanged, still Low/Info open) |
+
+**Live gates** (release binary from this tree, authority `reject` mode,
+mock DoT resolver):
+
+| Gate | Probe | Result |
+|---|---|---|
+| AUTH never on MX | `AUTH PLAIN` on 4525 | `502 5.5.1`, not advertised |
+| AUTH needs TLS | (Round-5/6 tests re-run) | `538` plaintext, `530` unauthenticated MAIL |
+| Relay closed | `RCPT TO:<someone@foreign.test>` | `550 5.7.1 Relay access denied` |
+| Unknown recipient | `RCPT TO:<nobody@hosted.test>` | uniform `550 5.1.1` |
+| G1 plain | `Sender: ceo@victim.test` under granted envelope | `550 5.7.1` |
+| G1 obsolete spellings | `Sender : …` and `Sender\t: …` (RFC 5322 §4.5 WSP-before-colon) | `550 5.7.1` — `name_eq` strips SP **and** HTAB |
+| G1 Resent-* | `Resent-From:` / `Resent-Sender:` ungranted | `550 5.7.1` |
+| G1 no over-block | granted address, whole-domain grant, `Reply-To:` to anywhere | `250 Ok` |
+| G1 fail-closed | empty `Sender:`, group syntax `Sender: undisclosed:;` | `550 5.7.1` |
+| Quota | after the H1 attack filled the 10 MiB mailbox | RCPT `452 4.2.2`, other recipients unaffected |
+| Authority hot reload | added a mailbox to `authority.json` | accepted within a second, no restart |
+| Trace headers | delivered copy | `Received: … ESMTPSA`, our `Authentication-Results:` topmost, no recipient named |
+| Storage modes | `stat` | `700` on `spool/new`, `spool/tmp`, maildir `new/` |
+| A1 still open | sender-supplied `Return-Path:` | delivered copy carries **two** `Return-Path:` fields (ours line 1, sender's line 10) |
+| W1/P4 still open | second instance without `--authority` | fallback logged at **level 30 (INFO)**, verified live |
+
+---
+
+## R9.3 Informational
+
+1. **Fuzz gap (closed by this round).** The `headers` fuzz target covered
+   `from_header_domain`, `from_authors`, `display_name_claims` and
+   `strip_forged_verdicts` — but **not** `sender_identities`, the newest
+   end-of-data scan. This round added it (with a mailbox-plausibility
+   invariant) and ran 60 s ASan clean. Process note: new end-of-data
+   scans should land with fuzz coverage, as the fixed findings land with
+   regression tests.
+2. **Open Low/informational items re-confirmed in source** (unchanged
+   from Rounds 4–8, all still accurately documented): A1 duplicate
+   `Return-Path:`; W1/P4 static-fallback INFO log; `.expect("authority
+   lock poisoned")` (`authority.rs:634/639`, P11); unbounded
+   `self.checks.acquire().await` (`auth.rs:433`, P9); DNS cache bounded
+   by count not bytes (P10); case-sensitive DNS question echo (P12);
+   staging files without `O_NOFOLLOW` (W2); `catch-all-mailbox` not
+   syntax-checked at load; no TLS hot reload (P13).
+3. **Doc drift (W3) persists.** DESIGN.md §12 and PLAN.md say "347
+   tests"; the tree now has **380** (378 pass, 1 ignored, plus this
+   round's red H1 test). README.md still ends with the stray
+   `claude --resume …` line.
+4. **Design note from H1.** `end_of_data`'s synchronous grant scans run
+   on the async runtime, not the blocking pool. Today only DKIM
+   verification is moved there. The linear-work invariant is what keeps
+   that safe; H1 shows it needs a test per scan, not just per parser.
+
+---
+
+## R9.4 Tests added
+
+| Test | Finding | Location | State |
+|---|---|---|---|
+| `sender_identities_scan_is_linear_in_the_message` | H1 | `mailserv/src/headers.rs` (lib test module) | **fails today** (4.2 s debug / 0.8 s release vs 500 ms bound) |
+| `sender_identities` coverage + invariant | R9.3.1 | `fuzz/fuzz_targets/headers.rs` | passes (60 s ASan, 180 k execs) |
+
+With these: `cargo test --workspace --no-fail-fast` → **378 pass, 1 fail
+(by design), 1 ignored**; fmt, clippy and `cargo audit --deny warnings`
+clean. No source behaviour changed.
+
+---
+
+## R9.5 Production-readiness assessment (go-live next week)
+
+**Verdict: no-go for general production as-is; a limited MTA-only pilot
+is achievable next week if the two small code items below land and the
+DEPLOYMENT.md checklist is actually executed.** This matches Round 8
+and DEPLOYMENT.md §1; this round adds H1 to the code list and re-confirms
+every operational blocker with fresh evidence.
+
+**Code items (small, days not weeks):**
+
+1. **H1** — fix before *any* submission listener is enabled. If the
+   pilot keeps submission off (the documented V1 default), H1 is closed
+   by configuration, exactly as G1 was before its fix. Do not enable
+   587/465 next week with H1 open: one credential holder can stop the
+   server in ~12 s cycles.
+2. **W1/P4** — the accept-all static fallback still logs at INFO. On an
+   internet-facing MX, one dropped `authority` key is an open sink.
+   Refuse to start the port-25 listener without `--authority` (preferred),
+   or at least WARN + alert. F3 closed the typo route; forgetting the
+   flag entirely is still silent.
+3. **CI gate** — the suite is red again (H1's test). Same rule as Round
+   5: land the fix, or `#[ignore]` the test with the finding ID. A red
+   gate that everyone learns to skip is worse than no gate.
+
+**Operational blockers unchanged from Round 8 (P1–P8), none closed this
+round:** the release must be built from a recorded commit with green CI
+(P1); DEPLOYMENT.md Phases A–H and the §4 sign-off are still unexecuted
+(P2); **no independent external review has happened — nine internal
+rounds are not one** (P3); single-host availability with local-maildir
+storage needs a tested restore and a recovery runbook inside senders'
+retry window (P5); soft per-mailbox quotas with no per-domain total need
+a dedicated storage filesystem and alerts well above the free-disk
+floor (P6); the permanent-`550` policy (SPF PermError etc.) needs a
+decision and rate alerting (P7); keep the MX IPv4-only, no AAAA record
+(P8).
+
+**What is genuinely in good shape** (re-verified, not assumed): the
+protocol core and smuggling defences, STARTTLS state handling, the
+fail-closed SPF/DKIM/DMARC chain, the grant model (now including the
+Sender family, modulo its cost), recipient authority and probing
+budgets, durable spool-before-250 with idempotent delivery, privilege
+drop and file modes, credential hashing and hot revocation, and the
+bounded refusal path. The security engineering discipline — every
+finding gets a reproducing test, docs record accepted risk honestly —
+is well above typical for a new SMTP stack.
+
+**Recommended plan for next week:** fix H1 and W1, commit, green CI,
+build and hash the release from that commit, execute DEPLOYMENT Phases
+A–H with submission **off**, IPv4-only, dedicated storage filesystem,
+alerting per R8.4, and a limited friendly-domain pilot under daily log
+review. General availability additionally needs the external review
+(P3), the availability decision (P5), and the P9–P14 maintenance items
+scheduled with owners. Going straight to open-internet production on
+the current tree, with the checklist unexecuted, is not defensible.
+
+---
+
+## R9.6 Notes for the team
+
+- The regression test and fuzz coverage cite this document as
+  `AUDIT_20261126F` (Round 9).
+- Live-probe artifacts (config, mock resolver, probe scripts, logs) were
+  kept out of the repo (`/tmp/audit9/`); all servers and the mock
+  resolver were stopped after the round.
+- No source changes were made during this audit; only the test, the
+  fuzz-target line and this section.

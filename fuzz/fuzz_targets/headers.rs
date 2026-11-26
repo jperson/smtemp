@@ -28,6 +28,13 @@ fuzz_target!(|raw: &[u8]| {
             let _ = headers::display_name_claims(&value, &authors);
         }
     }
+    // The Sender-family grant scan (AUDIT_20261126F H1 coverage): never
+    // panics, and every identity it returns is a plausible mailbox.
+    if let Some(senders) = headers::sender_identities(raw) {
+        for (local, domain) in &senders {
+            assert!(!local.is_empty() && !domain.is_empty());
+        }
+    }
 
     // Stripping only ever removes bytes, and is idempotent.
     let stripped = headers::strip_forged_verdicts(raw, "mx.example.org");

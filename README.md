@@ -396,5 +396,3 @@ drill), see DEPLOYMENT.md Phase F.
 | `dns` | DNS wire codec and pipelined DNS-over-TLS client |
 | `dnsq` | DNS query CLI |
 | `smtp-client` | Demo SMTP client |
-
-claude --resume a3e8080d-b50c-435b-b268-bf8e28005f2d

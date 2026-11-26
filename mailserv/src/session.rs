@@ -80,6 +80,11 @@ pub(crate) const FROM_NOT_OWNED: &[u8] =
 pub(crate) const AUTH_TOO_MANY_FAILURES: &[u8] =
     b"454 4.7.0 Too many failed authentication attempts, try again later\r\n";
 
+/// AUTH refused without checking: every password-check slot stayed busy
+/// for [`auth::AUTH_CHECK_WAIT`] (AUDIT P9). Temporary, and counted as no
+/// failure: the client should retry.
+pub(crate) const AUTH_BUSY: &[u8] = b"454 4.7.0 Authentication service busy, try again later\r\n";
+
 /// Malformed address in a MAIL FROM path.
 pub(crate) const BAD_ADDRESS: &[u8] = b"501 5.1.7 Bad sender address syntax\r\n";
 
@@ -655,7 +660,8 @@ impl<'session> UserSession<'session> {
     /// Returns `235` on success and `535` on a mismatch. Once this
     /// session has failed [`auth::MAX_FAILURES_PER_SESSION`] times, or
     /// its IP has used up its failure budget, returns `454` without
-    /// checking anything.
+    /// checking anything; so does a check slot that stays busy for
+    /// [`auth::AUTH_CHECK_WAIT`] (counted as no failure).
     async fn verify_credentials(
         &mut self,
         auth: &Arc<auth::AuthConfig>,
@@ -680,6 +686,12 @@ impl<'session> UserSession<'session> {
             auth::AuthCheck::Blocked => {
                 warn!(user = %user, "authentication refused: too many failures from this address");
                 smtp::Control::tempfail(AUTH_TOO_MANY_FAILURES)
+            }
+            auth::AuthCheck::Busy => {
+                // No slot freed in time; nothing was checked, so this
+                // counts against neither the session nor the IP budget.
+                warn!(user = %user, "authentication refused: check slots busy");
+                smtp::Control::tempfail(AUTH_BUSY)
             }
         }
     }

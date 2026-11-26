@@ -538,6 +538,20 @@ pub(crate) fn resolve_config(cli: Args, file: FileConfig) -> Result<Config> {
             .or(file.shutdown_grace_ms)
             .unwrap_or(DEFAULT_SHUTDOWN_GRACE_MS),
     };
+    // The static fallback (no authority file) accepts every local-part
+    // at a hosted domain. On a privileged SMTP port — the production MX,
+    // bound as root or with CAP_NET_BIND_SERVICE — that is never an
+    // acceptable configuration, so it is a startup error, not a log line
+    // an operator might miss (AUDIT W1/P4). Unprivileged ports keep the
+    // documented testing fallback, warned about at startup.
+    if config.authority.is_none() && config.port < 1024 {
+        anyhow::bail!(
+            "port {} is a privileged SMTP port: --authority is required there \
+             (without it the static fallback accepts every local-part). \
+             Set authority, or use an unprivileged port (e.g. 2525) for testing",
+            config.port
+        );
+    }
     check_listeners(&config)?;
     Ok(config)
 }
@@ -639,7 +653,7 @@ mod tests {
     fn max_dns_per_ip_resolution() {
         use clap::Parser as _;
         let args = |extra: &[&str]| {
-            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            let mut argv = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             argv.extend_from_slice(extra);
             Args::parse_from(argv)
         };
@@ -670,7 +684,7 @@ mod tests {
     fn dns_connections_resolution() {
         use clap::Parser as _;
         let args = |extra: &[&str]| {
-            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            let mut argv = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             argv.extend_from_slice(extra);
             Args::parse_from(argv)
         };
@@ -698,6 +712,7 @@ mod tests {
         let file: FileConfig = toml::from_str(
             r#"
             domain = "file.example"
+            port = 2525
             resolver = "8.8.8.8"
             "#,
         )
@@ -712,7 +727,7 @@ mod tests {
     fn resolver_ca_resolution() {
         use clap::Parser as _;
         let args = |extra: &[&str]| {
-            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            let mut argv = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             argv.extend_from_slice(extra);
             Args::parse_from(argv)
         };
@@ -735,8 +750,17 @@ mod tests {
     #[test]
     fn production_defaults() {
         use clap::Parser as _;
+        // An authority is set because the default port 25 refuses the
+        // static fallback (AUDIT W1/P4); the defaults themselves are
+        // unchanged.
         let resolved = resolve_config(
-            Args::parse_from(["mailserv", "--domain", "d.example"]),
+            Args::parse_from([
+                "mailserv",
+                "--domain",
+                "d.example",
+                "--authority",
+                "/etc/mailserv/authority.json",
+            ]),
             FileConfig::default(),
         )
         .unwrap();
@@ -770,7 +794,7 @@ mod tests {
             ..FileConfig::default()
         };
         let resolved = resolve_config(
-            Args::parse_from(["mailserv", "--domain", "d.example"]),
+            Args::parse_from(["mailserv", "--domain", "d.example", "--port", "2525"]),
             file.clone(),
         )
         .unwrap();
@@ -782,6 +806,8 @@ mod tests {
                 "mailserv",
                 "--domain",
                 "d.example",
+                "--port",
+                "2525",
                 "--mailbox-quota-bytes",
                 "0",
                 "--min-free-disk-bytes",
@@ -800,7 +826,7 @@ mod tests {
     fn submission_listener_requirements() {
         use clap::Parser as _;
         let resolve = |argv: &[&str], file: FileConfig| {
-            let mut full = vec!["mailserv", "--domain", "d.example"];
+            let mut full = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             full.extend_from_slice(argv);
             resolve_config(Args::parse_from(full), file)
         };
@@ -843,7 +869,7 @@ mod tests {
     fn auth_users_file_resolution() {
         use clap::Parser as _;
         let args = |extra: &[&str]| {
-            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            let mut argv = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             argv.extend_from_slice(extra);
             Args::parse_from(argv)
         };
@@ -868,7 +894,7 @@ mod tests {
     fn user_group_and_grace_resolution() {
         use clap::Parser as _;
         let args = |extra: &[&str]| {
-            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            let mut argv = vec!["mailserv", "--domain", "d.example", "--port", "2525"];
             argv.extend_from_slice(extra);
             Args::parse_from(argv)
         };
@@ -943,6 +969,42 @@ mod tests {
                 FileConfig::default(),
             );
             assert!(err.is_err(), "--domain {bad:?} must be a startup error");
+        }
+    }
+
+    /// AUDIT W1/P4: without an authority file the static fallback accepts
+    /// every local-part, so a privileged SMTP port (the production MX)
+    /// refuses to start without one. Unprivileged ports keep the
+    /// documented testing fallback; an authority satisfies any port.
+    #[test]
+    fn static_fallback_is_refused_on_privileged_smtp_ports() {
+        use clap::Parser as _;
+        let resolve = |extra: &[&str]| {
+            let mut argv = vec!["mailserv", "--domain", "d.example"];
+            argv.extend_from_slice(extra);
+            resolve_config(Args::parse_from(argv), FileConfig::default())
+        };
+
+        // The default port 25, and every privileged port, need an authority.
+        for port in ["25", "1", "587", "1023"] {
+            let err = resolve(&["--port", port]).unwrap_err();
+            assert!(
+                err.to_string().contains("--authority"),
+                "port {port}: {err}"
+            );
+        }
+        // An authority (CLI or file) satisfies the check.
+        assert!(resolve(&["--authority", "/etc/mailserv/authority.json"]).is_ok());
+        let file: FileConfig =
+            toml::from_str("authority = \"/etc/mailserv/authority.json\"").unwrap();
+        assert!(resolve_config(
+            Args::parse_from(["mailserv", "--domain", "d.example"]),
+            file
+        )
+        .is_ok());
+        // Unprivileged ports keep the testing fallback.
+        for port in ["1024", "2525", "65535"] {
+            assert!(resolve(&["--port", port]).is_ok(), "port {port}");
         }
     }
 }

@@ -442,7 +442,9 @@ All of this travels with the message in the spool metadata (`SpoolRcpt`).
     - `catch-all`: unknown addresses go to a designated inbox;
     - `grace`: an expired address accepts for N ≤ 366 days.
 - **`StaticAuthority`** is the development fallback: every local-part at a
-  `--local-domains` domain is accepted and routed to itself.
+  `--local-domains` domain is accepted and routed to itself. A privileged
+  SMTP port (below 1024) refuses to start without an authority file; on
+  any other port the fallback is logged at `warn`.
 - **Caching.** Each session caches **successful** lookups only, so every
   refusal reaches the authority. That keeps the console's refusal stream
   complete.
@@ -659,7 +661,10 @@ users produce a startup warning.
     without a check;
   - each source IP gets 10 failures per 15 minutes, counted across
     sessions (success doesn't reset it); past that, `454` without a check;
-  - checks run on the blocking pool, at most one per CPU at a time;
+  - checks run on the blocking pool, at most one per CPU at a time; an
+    attempt that waits more than 5 s (`AUTH_CHECK_WAIT`) for a free slot
+    is refused with `454 4.7.0`, counted as no failure, so a saturated
+    pool can't hold sessions until their deadline;
   - an unknown login is checked against a dummy hash with the same
     parameters, and the argon2 comparison is constant-time, so timing
     reveals neither whether a login exists nor how close a guess was.

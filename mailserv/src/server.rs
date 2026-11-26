@@ -247,10 +247,13 @@ pub(crate) async fn run(config: Config) -> Result<()> {
         None => {
             let a =
                 authority::StaticAuthority::new(local_domains.iter().cloned().collect::<Vec<_>>());
-            info!(
+            // Testing only: a privileged SMTP port without an authority
+            // file is already a startup error (config::resolve_config).
+            warn!(
                 backend = a.name(),
                 domains = local_domains.len(),
-                "no authority file; static per-address fallback (any local-part accepts)"
+                "no authority file; static per-address fallback (any local-part accepts) \
+                 — testing only, never for an internet-facing MX"
             );
             Arc::new(a)
         }

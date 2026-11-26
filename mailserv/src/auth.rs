@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use argon2::password_hash::rand_core::OsRng;
@@ -88,6 +89,14 @@ const MIN_MEMORY_TIMES_PASSES_KIB: u64 = 35 * 1024;
 /// for the rest of it (without hashing anything).
 pub const MAX_FAILURES_PER_SESSION: u32 = 3;
 
+/// How long an AUTH attempt waits for a free check slot before it is
+/// refused with `454` (AUDIT P9). With every slot busy the wait used to
+/// be unbounded: queued attempts held their sessions and connection
+/// slots until the session deadline. A check takes well under a second
+/// (one argon2id evaluation), so a few seconds of queueing covers a
+/// legitimate burst; past that the client is told to retry, promptly.
+pub const AUTH_CHECK_WAIT: Duration = Duration::from_secs(5);
+
 /// The outcome of [`AuthConfig::check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthCheck {
@@ -97,6 +106,9 @@ pub enum AuthCheck {
     Rejected,
     /// The source IP has used up its failure budget; nothing was checked.
     Blocked,
+    /// No check slot freed within [`AUTH_CHECK_WAIT`]; nothing was
+    /// checked and no failure was counted. Temporary: retry later.
+    Busy,
 }
 
 /// One loaded set of logins: the credential store, the dummy hash for
@@ -395,6 +407,18 @@ impl AuthConfig {
         self.current().credentials.len()
     }
 
+    /// Occupy every password-check slot (test helper): the returned
+    /// permit holds them all until it is dropped, so a `check` must
+    /// wait for [`AUTH_CHECK_WAIT`] and return [`AuthCheck::Busy`].
+    #[cfg(test)]
+    pub(crate) async fn occupy_check_slots(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        self.checks
+            .acquire_many(cpus as u32)
+            .await
+            .expect("check slots are never closed")
+    }
+
     /// Returns the logins whose hash parameters are below OWASP's minimum
     /// recommendations (see [`MIN_MEMORY_KIB`]), sorted, for a warning.
     /// They still work.
@@ -420,9 +444,11 @@ impl AuthConfig {
     ///
     /// Refused at once (no hashing) when `ip` has used up its failure
     /// budget ([`AUTH_FAILURES_PER_IP`] per [`AUTH_FAILURE_WINDOW`]).
-    /// Otherwise waits for one of the CPU-count check slots and runs
-    /// [`AuthConfig::verify`] on the blocking pool; a failure is counted
-    /// against `ip`. The caller enforces [`MAX_FAILURES_PER_SESSION`].
+    /// Otherwise waits up to [`AUTH_CHECK_WAIT`] for one of the CPU-count
+    /// check slots ([`AuthCheck::Busy`] past that, counted as no failure)
+    /// and runs [`AuthConfig::verify`] on the blocking pool; a wrong
+    /// password is counted against `ip`. The caller enforces
+    /// [`MAX_FAILURES_PER_SESSION`].
     ///
     /// Returns the outcome; a panicked check counts as [`AuthCheck::Rejected`].
     pub async fn check(self: &Arc<Self>, ip: IpAddr, user: &str, pass: &str) -> AuthCheck {
@@ -430,8 +456,12 @@ impl AuthConfig {
             return AuthCheck::Blocked;
         }
         let accepted = {
-            let Ok(_slot) = self.checks.acquire().await else {
-                return AuthCheck::Rejected; // never closed
+            let _slot = match tokio::time::timeout(AUTH_CHECK_WAIT, self.checks.acquire()).await {
+                Ok(Ok(slot)) => slot,
+                Ok(Err(_)) => return AuthCheck::Rejected, // never closed
+                // Every slot is busy: refuse promptly instead of holding
+                // the session (and its connection slot) until its deadline.
+                Err(_) => return AuthCheck::Busy,
             };
             let (auth, user, pass) = (Arc::clone(self), user.to_string(), pass.to_string());
             tokio::task::spawn_blocking(move || auth.verify(&user, &pass))
@@ -800,6 +830,33 @@ mod tests {
         }
         assert_eq!(c.check(ip, "alice", "secret").await, AuthCheck::Blocked);
         assert_eq!(c.check(other, "alice", "secret").await, AuthCheck::Accepted);
+    }
+
+    /// AUDIT P9: with every check slot busy, `check` refuses with `Busy`
+    /// within [`AUTH_CHECK_WAIT`] instead of waiting unboundedly, counts
+    /// no failure for it, and the same login authenticates again once a
+    /// slot frees. Time is paused, so the full wait elapses at once.
+    #[tokio::test(start_paused = true)]
+    async fn saturated_check_slots_refuse_promptly() {
+        let creds = test_credentials(&[("alice", "secret")]);
+        let c = Arc::new(AuthConfig::from_credentials(&creds, None).unwrap());
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+
+        // Occupy every check slot (one per CPU).
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let held = c.checks.acquire_many(cpus as u32).await.unwrap();
+
+        assert_eq!(c.check(ip, "alice", "secret").await, AuthCheck::Busy);
+        // Nothing was checked, so nothing is counted against the IP: a
+        // whole budget of busy refusals leaves it unblocked.
+        for _ in 0..AUTH_FAILURES_PER_IP {
+            assert_eq!(c.check(ip, "alice", "wrong").await, AuthCheck::Busy);
+        }
+        assert!(!c.failures.is_blocked(ip));
+
+        // A freed slot restores normal checking.
+        drop(held);
+        assert_eq!(c.check(ip, "alice", "secret").await, AuthCheck::Accepted);
     }
 
     /// The file must not be readable by other users; group access is

@@ -493,6 +493,37 @@ async fn auth_failures_are_limited_per_session() {
     assert_eq!(s.authenticated, None);
 }
 
+/// AUDIT P9: with every password-check slot busy, AUTH is refused with
+/// `454` once [`auth::AUTH_CHECK_WAIT`] passes (time is paused, so the
+/// wait elapses at once), counted as no failure; a freed slot lets the
+/// same credentials authenticate.
+#[tokio::test(start_paused = true)]
+async fn busy_check_slots_refuse_auth_promptly() {
+    use base64::Engine as _;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = session_cfg(dir.path());
+    let auth = cfg.auth.clone().unwrap();
+    let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    s.tls_active = true;
+    s.mode = ListenerMode::Submission;
+
+    let held = auth.occupy_check_slots().await;
+    let right = b64("\0alice\0pw");
+    assert_eq!(
+        s.auth("PLAIN", Some(right.as_bytes())).await.into_reply(),
+        AUTH_BUSY
+    );
+    assert_eq!(s.auth_failures, 0, "a busy refusal counts as no failure");
+    assert_eq!(s.authenticated, None);
+
+    drop(held);
+    assert_eq!(
+        s.auth("PLAIN", Some(right.as_bytes())).await.into_reply(),
+        b"235 2.7.0 Authentication successful\r\n"
+    );
+}
+
 /// Listener policy: the MX never takes AUTH, even over TLS, and
 /// doesn't advertise it; a submission listener refuses MAIL FROM
 /// until the client has authenticated.

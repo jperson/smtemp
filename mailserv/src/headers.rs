@@ -61,19 +61,26 @@ const SENDER_FIELDS: [&str; 3] = ["sender", "resent-sender", "resent-from"];
 
 /// Every `(local-part, domain)` named by a `Sender:`, `Resent-Sender:` or
 /// `Resent-From:` field of `raw`, read with the same scanner and mailbox
-/// parser as the `From:` authors ([`from_authors`]), deduplicated. An
-/// empty list means the message carries none of these fields. Returns
-/// `None` when any such field cannot be read as a mailbox list, so a
-/// caller checking grants can fail closed rather than skip it.
+/// parser as the `From:` authors ([`from_authors`]), deduplicated, in
+/// first-seen order. An empty list means the message carries none of
+/// these fields. Returns `None` when any such field cannot be read as a
+/// mailbox list, so a caller checking grants can fail closed rather than
+/// skip it.
+///
+/// The scan is linear in the message (DESIGN §5): the per-field
+/// [`MAX_AUTHORS`] cap does not bound the total across fields (up to
+/// [`MAX_HEADER_FIELDS`] fields), so the cross-field duplicate check
+/// uses a set, not a scan of the list (AUDIT_20261126F H1).
 pub fn sender_identities(raw: &[u8]) -> Option<Vec<(String, String)>> {
     let mut identities: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for header in mailparse::extract_raw_headers(&raw[..header_block_end(raw)]) {
         if !SENDER_FIELDS.iter().any(|name| header.name_eq(name)) {
             continue;
         }
         let value = unfold(header.raw_value);
         for identity in from_authors(trim_header_fws(&value))? {
-            if !identities.contains(&identity) {
+            if seen.insert(identity.clone()) {
                 identities.push(identity);
             }
         }

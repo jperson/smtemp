@@ -1533,3 +1533,96 @@ the current tree, with the checklist unexecuted, is not defensible.
   resolver were stopped after the round.
 - No source changes were made during this audit; only the test, the
   fuzz-target line and this section.
+
+---
+
+# H1 — Fix status (2026-11-26, Round-9 follow-up)
+
+| ID | Status | Fix |
+|----|--------|-----|
+| **H1** | ✅ **FIXED** | `headers::sender_identities` deduplicates with a `HashSet` alongside the ordered output `Vec` (the DKIM duplicate-tag pattern), instead of `Vec::contains`. The scan is now linear in the message; first-seen order, the `None` fail-closed behaviour and every grant decision are unchanged. No other code touched. |
+
+**Verification (all against the fixed tree):**
+
+- `headers::tests::sender_identities_scan_is_linear_in_the_message` —
+  **passes**: 30 000 identities scan in ~0.1 s debug / ~0.03 s release
+  (was 4.2 s / 0.8 s; the full 99 900-identity input was ~12 s release).
+- `cargo test --workspace --no-fail-fast` → **379 passed, 0 failed,
+  1 ignored** — the suite is green again, including every G1 test
+  (`authenticated_sender_headers_must_be_granted`,
+  `authenticated_granted_sender_headers_and_reply_to_stay_allowed`,
+  `ungranted_sender_headers_are_refused_under_auth`), so the fix does
+  not over-block or weaken the grant model.
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings` clean.
+- **Live, rebuilt release binary**, same config and probes as R9.1:
+  - single hostile message (999 `Sender:` fields × 100 granted authors,
+    2.18 MB): DATA `250 Ok` after **0.15 s** (was 11.87 s);
+  - ungranted variant: `550 5.7.1` after **0.09 s** (was 13.57 s);
+  - 8 concurrent hostile messages from two source IPs: all answered in
+    **≤ 0.39 s**, and the bystander MX `NOOP` round-trips stayed
+    **< 10 ms** throughout (was 10.41 s);
+  - every R9.2 G1 gate re-probed and unchanged: plain/obsolete/tab
+    `Sender`, `Resent-From`/`Resent-Sender` refusals, granted and
+    whole-domain acceptance, `Reply-To:` free, empty/group fail-closed.
+- `headers` fuzz target (with the R9 `sender_identities` coverage),
+  60 s ASan + debug assertions: **155 729 executions, no crash**.
+
+**Go/no-go impact.** The H1 code blocker is closed; submission is no
+longer gated on it (the remaining submission gate is P9, the unbounded
+argon2-slot wait, plus the separate AUTH-path sign-off of R8.4.6). The
+suite is green, so the CI-gate item of R9.5 is satisfied once this fix
+and its tests are committed. The other go-live items are unchanged:
+W1/P4 (static-fallback WARN/startup refusal) and Round 8's operational
+blockers P1–P8.
+
+---
+
+# W1/P4 and P9 — Fix status (2026-11-26, Round-9 follow-up)
+
+| ID | Status | Fix |
+|----|--------|-----|
+| **W1/P4** | ✅ **FIXED** | `config::resolve_config` refuses to start without an authority file when the SMTP port is **privileged (< 1024)** — the production MX shape, bound as root or with `CAP_NET_BIND_SERVICE`. The error names `--authority` and the testing alternative. On unprivileged ports the documented testing fallback stays, now logged at **WARN** with "testing only, never for an internet-facing MX" (`server.rs`). |
+| **P9** | ✅ **FIXED** | `AuthConfig::check` waits at most `AUTH_CHECK_WAIT` (5 s) for a free password-check slot; past that it returns the new `AuthCheck::Busy`, which the session answers with `454 4.7.0 Authentication service busy, try again later`. A busy refusal counts against **neither** the session nor the per-IP failure budget (nothing was checked). A freed slot restores normal checking. |
+
+**Tests added (all pass):**
+
+- `config::tests::static_fallback_is_refused_on_privileged_smtp_ports` —
+  ports 1/25/587/1023 without authority are startup errors naming
+  `--authority`; an authority (CLI or file) satisfies any port;
+  1024/2525/65535 keep the fallback.
+- `auth::tests::saturated_check_slots_refuse_promptly` — every slot
+  occupied: `check` returns `Busy` after the (paused-time) wait, a whole
+  budget of busy refusals leaves the IP unblocked, and a freed slot
+  accepts the right password.
+- `session::tests::busy_check_slots_refuse_auth_promptly` — the same
+  through the SMTP state machine: `454` busy reply, `auth_failures`
+  stays 0, then `235` once a slot frees.
+- Nine existing config tests resolved without authority on the default
+  port 25; their setups now use the documented testing port (or an
+  authority, for `production_defaults`, which still pins port 25).
+- `tokio`'s `test-util` feature was added to mailserv's
+  **dev-dependencies** only (paused-time tests); the release binary is
+  unaffected.
+
+**Verification:** `cargo test --workspace --no-fail-fast` → **382 passed,
+0 failed, 1 ignored**; `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -- -D warnings` clean. Live, rebuilt release binary:
+- `--port 25` without authority → startup error before any bind;
+- `--port 4526` without authority → starts, fallback logged at
+  **level 40 (WARN)**;
+- the full submission probe suite (AUTH, grants, G1 gates) unchanged.
+
+**Docs updated:** README (fallback paragraph, `auth-users-file` row) and
+DESIGN §7 (`StaticAuthority`) / §10 (password checking) now describe the
+startup refusal, the WARN, and the bounded check-slot wait.
+
+**Go/no-go impact.** The two remaining code items from R9.5 are closed.
+With H1, W1/P4 and P9 fixed and the suite green, the code-level gates for
+a pilot are met; submission's remaining gate is the AUTH-path sign-off
+(R8.4.6). What still stands between this tree and production is
+operational: Round 8's P1–P3 (recorded release commit + CI, the
+DEPLOYMENT.md checklist and sign-off, an independent external review),
+P5 (availability/restore), P6 (per-domain storage totals or sized
+filesystems), P7 (permanent-rejection policy and alerting) and P8
+(IPv4-only until IPv6 readiness).

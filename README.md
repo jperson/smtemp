@@ -47,7 +47,9 @@ cargo run -p mailserv -- --domain mail.test --port 2525 \
 
 Without `--authority`, every local-part at `--domain` (and any
 `--local-domains`) is accepted. That's convenient for testing, but **never
-run an internet-facing server without `--authority`**.
+run an internet-facing server without `--authority`**: on a privileged
+SMTP port (below 1024, e.g. the default 25) startup is **refused** without
+an authority file, and on any other port the fallback logs a warning.
 
 **Production** (receive-only: no `--auth-users-file`):
 
@@ -153,7 +155,7 @@ Settings come from three sources; the first one that sets a value wins:
 
 | Flag / config key | Default | Description |
 |---|---|---|
-| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only on the submission ports over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read at startup, before privileges are dropped, and again on `SIGHUP` (`systemctl reload mailserv`) as the service user, so for reloads make it owner root, group the service group, mode `0640` (startup warns when the service user can't read it). A file other users can access is a startup error. A reload that fails keeps the current logins; a login removed by a reload can no longer authenticate or send. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`). Port 25 never offers AUTH (`502`); without a submission port the logins can't be used, which is warned about. The old inline `auth-users` key is a startup error. |
+| `--auth-users-file` / `auth-users-file` | *(none)* | Credentials for AUTH PLAIN/LOGIN, offered only on the submission ports over TLS: a file with one `user:hash` per line, where `hash` is an argon2id string from `mailserv hash-password` (`#` comments and blank lines allowed; a plaintext password is a startup error). Read at startup, before privileges are dropped, and again on `SIGHUP` (`systemctl reload mailserv`) as the service user, so for reloads make it owner root, group the service group, mode `0640` (startup warns when the service user can't read it). A file other users can access is a startup error. A reload that fails keeps the current logins; a login removed by a reload can no longer authenticate or send. Failed attempts are limited to 3 per session and 10 per source IP per 15 minutes (then `454`); an attempt that waits more than 5 s for a free password-check slot is also refused with `454`, counted as no failure. Port 25 never offers AUTH (`502`); without a submission port the logins can't be used, which is warned about. The old inline `auth-users` key is a startup error. |
 | `--auth-senders` / `auth-senders` | *(none)* | What each AUTH login may send as: `user=grant\|grant,…`, each grant an address (`alice@example.org`) or a whole domain (`@example.net`). An authenticated `MAIL FROM` outside the grants gets `553 5.7.1` (the null sender always does), and a `From:` author outside them gets `550 5.7.1`. A login with no grants can't send. Grants for an unknown login, or this flag without `--auth-users-file`, are startup errors. |
 
 | Flag | Description |

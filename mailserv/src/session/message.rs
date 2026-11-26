@@ -182,6 +182,25 @@ impl UserSession<'_> {
                 );
                 return smtp::Control::reject(FROM_NOT_OWNED);
             }
+            // `Sender:`, `Resent-Sender:` and `Resent-From:` also name who
+            // sent the message, and are delivered under our `auth=pass`
+            // verdict, so they are held to the same grants (AUDIT_20261126C
+            // G1). `Reply-To:` stays free. An unreadable one fails closed.
+            let senders = crate::headers::sender_identities(&raw);
+            let permitted = match (&senders, self.auth.as_deref()) {
+                (Some(senders), Some(auth)) => senders
+                    .iter()
+                    .all(|(local, domain)| auth.permits(user, local, domain)),
+                _ => false,
+            };
+            if !permitted {
+                warn!(
+                    auth_user = %user,
+                    sender_identities = ?senders,
+                    "authenticated message refused: Sender/Resent-* identity not granted to this user"
+                );
+                return smtp::Control::reject(FROM_NOT_OWNED);
+            }
         }
         let mut dmarc_summary: Option<DmarcSummary> = None;
 

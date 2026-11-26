@@ -1167,3 +1167,241 @@ async fn refused_connections_do_not_buffer_the_peer_flood() {
         sent >> 20,
     );
 }
+
+/// AUDIT_20261126C G1 (fixed), shown end-to-end through the real
+/// submission listener (STARTTLS, AUTH, DATA, spool, maildir) rather than
+/// at the session boundary: a login granted only
+/// `alice@spfless-domain-xyz.test` submits a message whose `Sender:` and
+/// `Resent-From:` name someone else. Before the fix it was delivered
+/// *under this server's* `auth=pass smtp.auth=alice` verdict with those
+/// identities intact; now the grant check covers the `Sender:`-family
+/// headers, so DATA is refused with `550 5.7.1` and nothing is spooled or
+/// delivered (the session-level twin is
+/// `session::tests::authenticated_sender_headers_must_be_granted`).
+#[tokio::test]
+async fn ungranted_sender_headers_are_refused_under_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = cert.cert.der().clone();
+    let acceptor = Arc::new(
+        tls_acceptor_from_pem(
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap(),
+    );
+    let auth = auth::AuthConfig::from_credentials(
+        &auth::test_credentials(&[("alice", "secret")]),
+        Some("alice=alice@spfless-domain-xyz.test"),
+    )
+    .unwrap();
+    let spool: Arc<dyn spool::SpoolWriter> =
+        Arc::new(spool::DiskSpool::open(dir.path().join("spool"), None).unwrap());
+    let sink: Arc<dyn delivery::DeliverySink> =
+        Arc::new(delivery::MaildirSink::open(dir.path().join("maildir")).unwrap());
+    let addr = spawn_server_in(
+        ListenerMode::Submission,
+        Some(acceptor),
+        Some(Arc::new(auth)),
+        None,
+        Some(spool),
+        Some(sink),
+        None,
+    )
+    .await;
+
+    use base64::Engine as _;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+    let tcp = TestTcpStream::connect(addr).await.unwrap();
+    let mut client = BufReader::new(tcp);
+    read_reply(&mut client).await;
+    client.write_all(b"EHLO client.test\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client.write_all(b"STARTTLS\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    let mut roots = RootCertStore::empty();
+    roots.add(cert_der).unwrap();
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tls = TestTlsConnector::from(Arc::new(config))
+        .connect(
+            ServerName::try_from("localhost").unwrap(),
+            client.into_inner(),
+        )
+        .await
+        .unwrap();
+    let mut client = BufReader::new(tls);
+
+    // TLS discards the pre-upgrade state, so the identity is re-declared.
+    client.write_all(b"EHLO client.test\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(format!("AUTH PLAIN {}\r\n", b64("\0alice\0secret")).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_reply(&mut client).await[0],
+        "235 2.7.0 Authentication successful\r\n"
+    );
+
+    // The granted envelope sender, an ungranted identity in the headers
+    // that name a sender, and a local recipient so the message delivers.
+    client
+        .write_all(b"MAIL FROM:<alice@spfless-domain-xyz.test>\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client
+        .write_all(b"RCPT TO:<bob@example.org>\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client.write_all(b"DATA\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(
+            b"From: alice@spfless-domain-xyz.test\r\n\
+              Sender: ceo@victim.example\r\n\
+              Resent-From: finance@victim.example\r\n\
+              Subject: wire the money\r\n\r\n\
+              hello\r\n.\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_reply(&mut client).await[0],
+        "550 5.7.1 From address not owned by authenticated user\r\n"
+    );
+    client.write_all(b"QUIT\r\n").await.unwrap();
+    read_reply(&mut client).await;
+
+    // Refused before the spool write: nothing queued, nothing delivered.
+    let queued = std::fs::read_dir(dir.path().join("spool/new"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(queued, 0, "refused message must not be spooled");
+    let inbox = dir.path().join("maildir/example.org/bob/new");
+    let delivered = std::fs::read_dir(&inbox).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(delivered, 0, "refused message must not be delivered");
+}
+
+/// AUDIT_20261126D A1 (Low): a delivered message keeps the sender's
+/// `Return-Path:` alongside the one this server adds, because
+/// `strip_forged_verdicts` removes only the verdict headers it names
+/// (`Authentication-Results:` for our authserv-id and
+/// `X-Display-Name-Warning:`). RFC 5322 §3.6.3 makes the final delivery
+/// agent responsible for removing any existing `Return-Path:` before
+/// adding its own, so the copy we hand the user — and the copy the drain
+/// sends to another MX — carries two, the lower one naming whatever
+/// address the sender chose. This pins the current behaviour: it fails
+/// once the trace-header step drops the inbound `Return-Path:` (then the
+/// assertion must become a count of 1, naming the envelope sender).
+#[tokio::test]
+async fn a_sender_return_path_survives_alongside_ours() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool: Arc<dyn spool::SpoolWriter> =
+        Arc::new(spool::DiskSpool::open(dir.path().join("spool"), None).unwrap());
+    let sink: Arc<dyn delivery::DeliverySink> =
+        Arc::new(delivery::MaildirSink::open(dir.path().join("maildir")).unwrap());
+    let addr = spawn_server(None, None, None, Some(spool), Some(sink), None).await;
+
+    let tcp = TestTcpStream::connect(addr).await.unwrap();
+    let mut client = BufReader::new(tcp);
+    read_reply(&mut client).await;
+    client.write_all(b"EHLO evil.test\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(b"MAIL FROM:<actual@spfless-domain-xyz.test>\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client
+        .write_all(b"RCPT TO:<bob@example.org>\r\n")
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client.write_all(b"DATA\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(
+            b"From: boss@spfless-domain-xyz.test\r\n\
+              Return-Path: <claimed@bigbank.example>\r\n\
+              Subject: hi\r\n\r\nbody\r\n.\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client.write_all(b"QUIT\r\n").await.unwrap();
+
+    let inbox = dir.path().join("maildir/example.org/bob/new");
+    let names = wait_for_files(&inbox, 1).await;
+    assert_eq!(names.len(), 1, "bob's inbox: {names:?}");
+    let text = String::from_utf8(std::fs::read(inbox.join(&names[0])).unwrap()).unwrap();
+    // Ours is first (the one an RFC 5322 reader takes), and the claimed
+    // one is still in the block below it.
+    assert_eq!(
+        text.matches("Return-Path:").count(),
+        2,
+        "both Return-Path fields are delivered: {text}"
+    );
+    assert!(text.starts_with("Return-Path: <actual@spfless-domain-xyz.test>"));
+    assert!(text.contains("Return-Path: <claimed@bigbank.example>"));
+}
+
+/// The AR strip is exact on the authserv-id: a `Return-Path`-style
+/// near-miss (`"mail.example.org"` quoted, or a different id) is left in
+/// place, since this server can only speak for its own id. Also pinned
+/// here so a future widening of the strip is a deliberate change.
+#[tokio::test]
+async fn foreign_and_quoted_authserv_ids_are_not_stripped() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool: Arc<dyn spool::SpoolWriter> =
+        Arc::new(spool::DiskSpool::open(dir.path().join("spool"), None).unwrap());
+    let sink: Arc<dyn delivery::DeliverySink> =
+        Arc::new(delivery::MaildirSink::open(dir.path().join("maildir")).unwrap());
+    let addr = spawn_server(None, None, None, Some(spool), Some(sink), None).await;
+
+    let tcp = TestTcpStream::connect(addr).await.unwrap();
+    let mut client = BufReader::new(tcp);
+    read_reply(&mut client).await;
+    client.write_all(b"EHLO evil.test\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(b"MAIL FROM:<a@spfless-domain-xyz.test>\r\n")
+        .await
+        .unwrap();
+    client
+        .write_all(b"RCPT TO:<bob@example.org>\r\n")
+        .await
+        .unwrap();
+    client.write_all(b"DATA\r\n").await.unwrap();
+    read_reply(&mut client).await;
+    client
+        .write_all(
+            b"From: boss@spfless-domain-xyz.test\r\n\
+              Authentication-Results: other.example; auth=pass smtp.auth=root\r\n\
+              Authentication-Results: \"mail.example.org\"; auth=pass smtp.auth=root\r\n\
+              Authentication-Results: mail.example.org; dmarc=pass\r\n\
+              Subject: hi\r\n\r\nbody\r\n.\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut client).await[0], "250 Ok\r\n");
+    client.write_all(b"QUIT\r\n").await.unwrap();
+
+    let inbox = dir.path().join("maildir/example.org/bob/new");
+    let names = wait_for_files(&inbox, 1).await;
+    let text = String::from_utf8(std::fs::read(inbox.join(&names[0])).unwrap()).unwrap();
+    // Ours is added; the exact-claiming forgery is removed; the two
+    // near-misses survive verbatim.
+    assert_eq!(
+        text.matches("Authentication-Results:").count(),
+        3,
+        "our header plus the two untouchable forgeries: {text}"
+    );
+    assert!(text.contains("Authentication-Results: other.example; auth=pass"));
+    assert!(text.contains("Authentication-Results: \"mail.example.org\"; auth=pass"));
+    assert!(!text.contains("Authentication-Results: mail.example.org; dmarc=pass"));
+}

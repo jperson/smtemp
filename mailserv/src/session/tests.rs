@@ -625,9 +625,11 @@ async fn authenticated_sender_headers_must_be_granted() {
         "Sender: ceo@victim.example",
         "Resent-From: ceo@victim.example",
         "Resent-Sender: ceo@victim.example",
-        // Not even the granted address itself disguised in the header is
-        // the point of the check: an *ungranted* identity must refuse.
-        "Sender: anyone@alice.example",
+        // A near miss of a granted domain: alice holds `@alice.example`,
+        // not its subdomains, so this identity is ungranted and must
+        // refuse. (`anyone@alice.example` itself *is* granted, and the
+        // guard test below requires it to be accepted.)
+        "Sender: anyone@sub.alice.example",
     ] {
         let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
         s.authenticated = Some("alice".into());
@@ -645,6 +647,46 @@ async fn authenticated_sender_headers_must_be_granted() {
         }
         let reply = s.end_data().await.into_reply();
         assert_eq!(reply, FROM_NOT_OWNED, "message with {header:?}");
+        assert!(s.txn.is_none(), "transaction cleared");
+    }
+}
+
+/// AUDIT_20261126C G1, the fix *boundary* (guard, passes today and after
+/// the fix). The check must be "is this identity granted", not "the
+/// message may not carry a `Sender:`": a grant holder that puts a
+/// **granted** address in `Sender:`/`Resent-Sender:` must still be
+/// accepted, and `Reply-To:` (redirecting replies is ordinary mail
+/// practice) must stay free. This test exists so a fix for G1 that
+/// over-blocks would fail loudly rather than pass the single
+/// refusal-only regression test.
+#[tokio::test]
+async fn authenticated_granted_sender_headers_and_reply_to_stay_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = session_cfg(dir.path());
+    cfg.dns = spawn_nxdomain_resolver().await;
+    for header in [
+        "Sender: alice@example.org",
+        "Resent-Sender: alice@example.org",
+        "Resent-From: alice@example.org",
+        "Sender: someone@alice.example",
+        "Reply-To: someone@elsewhere.example",
+    ] {
+        let mut s = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        s.authenticated = Some("alice".into());
+        assert!(s.mail_from("<alice@example.org>").await.is_accept());
+        assert!(s.rcpt_to("<a@small.example>").await.is_accept());
+        for line in [
+            format!("From: alice@example.org\r\n{header}\r\n"),
+            "\r\n".into(),
+            "body\r\n".into(),
+        ] {
+            assert!(matches!(
+                s.recv_data(line.as_bytes()).await,
+                smtp::DataControl::Continue
+            ));
+        }
+        let reply = s.end_data().await.into_reply();
+        assert_eq!(reply, UserSession::OK.to_vec(), "message with {header:?}");
         assert!(s.txn.is_none(), "transaction cleared");
     }
 }

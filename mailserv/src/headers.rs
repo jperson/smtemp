@@ -54,6 +54,33 @@ pub fn single_from_value(raw: &[u8]) -> Result<Vec<u8>, FromHeader> {
     }
 }
 
+/// The header fields other than `From:` that name who sent a message
+/// (RFC 5322 §3.6.2, §3.6.6). `Reply-To:` is deliberately absent: it
+/// redirects replies, it does not claim authorship.
+const SENDER_FIELDS: [&str; 3] = ["sender", "resent-sender", "resent-from"];
+
+/// Every `(local-part, domain)` named by a `Sender:`, `Resent-Sender:` or
+/// `Resent-From:` field of `raw`, read with the same scanner and mailbox
+/// parser as the `From:` authors ([`from_authors`]), deduplicated. An
+/// empty list means the message carries none of these fields. Returns
+/// `None` when any such field cannot be read as a mailbox list, so a
+/// caller checking grants can fail closed rather than skip it.
+pub fn sender_identities(raw: &[u8]) -> Option<Vec<(String, String)>> {
+    let mut identities: Vec<(String, String)> = Vec::new();
+    for header in mailparse::extract_raw_headers(&raw[..header_block_end(raw)]) {
+        if !SENDER_FIELDS.iter().any(|name| header.name_eq(name)) {
+            continue;
+        }
+        let value = unfold(header.raw_value);
+        for identity in from_authors(trim_header_fws(&value))? {
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    }
+    Some(identities)
+}
+
 /// Unfold the raw header value `value` (RFC 5322 §2.2.3): remove the line
 /// breaks of folded lines, keeping the whitespace after them.
 fn unfold(value: &[u8]) -> Vec<u8> {

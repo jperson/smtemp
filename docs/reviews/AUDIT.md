@@ -687,9 +687,9 @@ covers, under this server's `auth=pass` verdict.
 
 | ID | Sev | Where | Finding | Regression test (fails today) |
 |----|-----|-------|---------|-------------------------------|
-| **G1** | **Medium** (submission only) | `mailserv/src/session/message.rs` (`end_of_data`), `mailserv/src/auth.rs` (`SenderGrants`) | An authenticated login's grants are checked against `MAIL FROM` and every `From:` author — but **not** against `Sender:`, `Resent-From:` or `Resent-Sender:`. A login granted only `alice@example.org` can submit a message with `Sender: ceo@victim.example` and it is delivered carrying our `Authentication-Results: … auth=pass smtp.auth=alice`. | `session::tests::authenticated_sender_headers_must_be_granted` |
+| **G1** ✅ **FIXED** (see §R7) | **Medium** (submission only) | `mailserv/src/session/message.rs` (`end_of_data`), `mailserv/src/auth.rs` (`SenderGrants`) | An authenticated login's grants are checked against `MAIL FROM` and every `From:` author — but **not** against `Sender:`, `Resent-From:` or `Resent-Sender:`. A login granted only `alice@example.org` can submit a message with `Sender: ceo@victim.example` and it is delivered carrying our `Authentication-Results: … auth=pass smtp.auth=alice`. | `session::tests::authenticated_sender_headers_must_be_granted` |
 
-### G1 (Medium, submission only) — the grant model stops at `From:`
+### G1 (Medium, submission only) — the grant model stops at `From:` — ✅ FIXED (see §R7)
 
 Round 2 (§3.1) already flagged this as a regression introduced by the
 grant fixes and prescribed the fix: *"Constrain `Sender:` and
@@ -879,3 +879,393 @@ With it: `cargo test --workspace --no-fail-fast` → **373 pass, 1 fail
   than assuming it: all hold. The tree's remaining pre-GA work is
   DEPLOYMENT.md's checklist (Phases A–H), the PSL refresh cadence
   (H7), and the open §13 gaps, all accurately documented.
+
+---
+
+# AUDIT.md — Round-5 Security Audit (2026-11-26D, pre-GA verification)
+
+**Tree reviewed:** `HEAD a6893aa` ("AUDIT"), working tree clean before this
+round. Only test code and this document were changed (no `src` behaviour was
+touched).
+
+**Method.** A fresh full read of the trust boundaries, then verification
+against the *current build* rather than a remembered one:
+
+- `cargo test --workspace` → **293 passed, 1 failed, 1 ignored** (the failure
+  is `session::tests::authenticated_sender_headers_must_be_granted`, the
+  Round-4 G1 regression test, red by design).
+- `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` → clean.
+- `cargo build -p mailserv`, then ran the **real binary** with a real config
+  (`port = 2525`, `submission-port = 2587`, `submissions-port = 2465`,
+  argon2id credentials from `mailserv hash-password`, an authority file, a
+  spool dir and a maildir root) and drove it over TCP/TLS, reading the
+  delivered `.eml` files back off disk.
+
+> **Methodology warning for the next reader.** A server left running from an
+> earlier round answered the first probes and produced results that were
+> *wrong for this tree* (plaintext AUTH "accepted", a 5000-header message
+> "accepted with a truncation marker"). Every live claim below was re-run
+> against a binary built from `a6893aa`. Confirm the pid and build time
+> before trusting any probe output.
+
+**Bottom line.** G1 is real, reachable end-to-end, and still unfixed; it and
+the red `cargo test` it produces are the only go-live blockers found in this
+round. Everything else here is Low or informational. The gates that matter —
+AUTH/TLS gating, sender grants, closed relay, verdict-header stripping,
+header/author/claim bounds, the DNS budgets and fail-closed DMARC/SPF
+verdicts, per-IP and per-session limits, credential hot-revocation, spool
+permissions — all held up under fresh probing.
+
+## R5.1 Findings
+
+| ID | Sev | Where | Finding | Test |
+|----|-----|-------|---------|------|
+| **G1** ✅ **FIXED** (see §R7) | **Medium** (submission only) | `session.rs:959-971` (envelope), `session/message.rs:166-183` (`From:` authors) — `SenderGrants::permits` has no other caller | Confirmed real and unfixed: the grant model stops at `MAIL FROM` and the `From:` authors. `Sender:`, `Resent-From:` and `Resent-Sender:` are not read anywhere in `mailserv/src` (outside tests), so an ungranted identity rides through unmodified. | `server::tests::ungranted_sender_headers_reach_the_maildir_under_auth_pass` (passes today; must flip to a refusal when fixed) |
+| **A1** | Low | `delivery.rs:465` (`with_trace_headers`), `headers.rs:334` (`strip_forged_verdicts`) | A delivered message carries **two** `Return-Path:` fields: ours on top, the sender's own below. `strip_forged_verdicts` removes only `Authentication-Results:` naming our authserv-id and every `X-Display-Name-Warning:`, and `with_trace_headers` then prepends its own — so the second, sender-chosen one survives into the maildir. RFC 5322 §3.6.3 makes the program that adds `Return-Path:` remove the existing ones first. | `server::tests::a_sender_return_path_survives_alongside_ours` |
+| **A2** | Info | `headers.rs:417-426` (`is_forged_verdict`) | The strip is exact-on-authserv-id by design, so a forgery that *almost* names us survives verbatim: `Authentication-Results: "mail.example.org"; auth=pass smtp.auth=root` (quoted-string id) is delivered untouched. RFC 8601 §5 makes a verifier ignore it, and our own header is the topmost one, so this is defense in depth rather than exposure. | `server::tests::foreign_and_quoted_authserv_ids_are_not_stripped` |
+| **A3** | Info | `headers.rs` (`display_name_claims`) | Claims are read from RFC 5322 **comments** too: `From: <alice@example.org> (paypal.com ceo@paypal.com)` produces an `X-Display-Name-Warning:` naming `paypal.com`, although no MUA displays a comment. Conservative direction (false positive, never a miss), but it is a disclosure-header vector for a name nobody sees; worth a sentence in DEPLOYMENT.md's log-noise expectations. | covered by the live probe below |
+| **A4** | Info | `docs/reviews/AUDIT.md` R4.2 | All six Round-4 informational items are still open in the tree: `.expect("authority lock poisoned")` at `authority.rs:634/639`, the unbounded `self.checks.acquire().await` at `auth.rs:433`, the DNS cache capped by count (4096) not bytes (`dns/src/lib.rs:322,379`), and the stray `claude --resume …` line still at the end of `README.md`. | — |
+
+### G1 — verified live, end to end
+
+Submission listener, `auth-senders = "alice=alice@example.org|@alice.example"`,
+`AUTH PLAIN` as `alice`, envelope `MAIL FROM:<alice@example.org>` (`250`),
+`RCPT TO:<big@big.example>` (`250`), then:
+
+```
+From: alice@example.org
+Sender: ceo@victim.example
+Resent-From: finance@victim.example
+```
+
+`DATA` answered `250 Ok`; the message was spooled and delivered. The copy in
+`mail/big.example/big/new/…eml`:
+
+```
+Authentication-Results: mx.example.org;
+	auth=pass smtp.auth=alice;
+	dkim=none;
+	dmarc=fail header.from=example.org
+From: alice@example.org
+Sender: ceo@victim.example
+Resent-From: finance@victim.example
+```
+
+So this server stamps its own `auth=pass smtp.auth=alice` on a message whose
+declared sender is an address no grant covers. Two aggravating details the
+Round-4 text did not:
+
+1. **`dmarc=fail` is recorded and still sent.** The authenticated exemption
+   turns the failure into a delivery, so the outbound copy advertises a
+   DMARC failure of our own hosted domain *together with* `auth=pass`. A
+   receiving system that weighs `auth=`/`Authres` over `dmarc=` (some MUAs'
+   "verified sender" badges do) reads the wrong one of the two.
+2. **`Sender:` outranks `From:` for a lot of downstream automation** —
+   bounce/autoreply addressing and some "sender" columns — so the claimed
+   identity is not merely cosmetic.
+
+The fix stays exactly as Round 4 prescribed: apply the existing
+`authors`-vs-grants check to `Sender:` and `Resent-Sender:` (single-address
+headers, same `auth::split_address`), and treat a `Resent-From:` whose
+domain is not granted as a `display_name_claims`-style disclosure or a
+refusal. `Reply-To:` stays free. Small, and local to `end_of_data`.
+
+### A1 — why it is Low, not Medium
+
+The pilot has no outbound path (DEPLOYMENT.md §1: "No outbound mail"), so the
+duplicate field lands only in the local maildir, and the harm requires a
+downstream forward/auto-responder on the *reading* side that takes the last
+`Return-Path:` rather than the first. One `strip` addition in
+`strip_forged_verdicts` (`header.name_eq("return-path")`) closes it; then the
+characterization test above must be updated to assert exactly one
+`Return-Path:` naming the envelope sender.
+
+## R5.2 Re-verified live (nothing here re-opens a prior finding)
+
+Each row was checked against the running binary, not only by reading.
+
+| Gate | Probe | Result |
+|---|---|---|
+| AUTH never on the MX port | `EHLO` on 2525, then `AUTH PLAIN <creds>` | not advertised; `502 5.5.1 Authentication not supported` |
+| AUTH needs TLS on submission | plaintext `EHLO`/`AUTH` on 2587 | not advertised; `538 5.7.11 Encryption required…`; `MAIL FROM` → `530 5.7.0 Authentication required` |
+| Grants bind the envelope | authenticated `MAIL FROM:<ceo@victim.example>` | `553 5.7.1 Sender address not owned by authenticated user` |
+| Grants bind the `From:` authors | `From: CEO <ceo@victim.example>` under a granted envelope | `550 5.7.1 From address not owned by authenticated user` (unit-level; the header-only variants above are what G1 misses) |
+| Relay closed for everyone | unauthenticated `RCPT TO:<someone@foreign.example>` | `550 5.7.1 Relay access denied` |
+| AUTH attempt budgets | 4 bad passwords in one session | 3× `535 5.7.8`, then `454 4.7.0 Too many failed authentication attempts` |
+| Credential hot-revocation | rewrite `users`, `kill -HUP` | log `credentials reloaded`; the removed login now gets `535`, the added one `235`; grants left for a removed login are reported inert (and are a startup error), as documented |
+| Header-field bound | 5000 header fields | `552 5.3.4 Message header has too many fields` — refused before any DNS work (`MAX_HEADER_FIELDS = 1000`) |
+| Claim-list bound | 12 display-name claims in `From:` authors | first 10 listed plus `(truncated: 10 of the 12 addresses at other domains shown)` (`MAX_CLAIMS = 10`) |
+| Verdict-header strip | lowercase, mixed-case, trailing-dot authserv-id, folded continuation, forged `X-Display-Name-Warning:` | all removed; only our own `Authentication-Results:` remains; foreign-authserv-id records kept (correct per RFC 8601) |
+| Trace headers | delivered copy | `Received:` with `ESMTP`/`ESMTPSA` per RFC 3848, queue id, no CR/LF injection through HELO |
+| Spool permissions | `ls -l spool` | `drwx------` for both `new/` and `tmp/`; startup warns when a storage dir is group/world-accessible |
+
+## R5.3 Tests added
+
+All in test files; no source behaviour changed.
+
+| Test | Kind | Pins |
+|---|---|---|
+| `server::tests::ungranted_sender_headers_reach_the_maildir_under_auth_pass` | characterization (passes today) | G1 reachable through the real submission listener: TLS, AUTH, spool, maildir |
+| `server::tests::a_sender_return_path_survives_alongside_ours` | characterization (passes today) | A1 duplicate `Return-Path:` in the delivered copy |
+| `server::tests::foreign_and_quoted_authserv_ids_are_not_stripped` | characterization (passes today) | A2 the strip is exact-on-authserv-id |
+
+Each carries a doc comment saying what must change when the underlying
+behaviour is fixed, so a fix that forgets the test is still a loud failure.
+
+## R5.4 Go / no-go
+
+**Not yet go-live, for two reasons, both small:**
+
+1. **G1** — fix the grant check before enabling a submission listener. It is
+   off by default (no `submission-port`/`submissions-port` without a
+   credentials file, `config.rs:554-568`), so the pilot can start **MTA-only**
+   today with this risk closed by configuration.
+2. **The test suite is red.** `.github/workflows/ci.yml` runs plain
+   `cargo test --workspace`, which fails on the G1 test. Either land the G1
+   fix (then the suite is green and the new tests must be updated as noted
+   above) or, if the fix is to wait, mark that test
+   `#[ignore = "AUDIT_20261126C G1: unfixed; submission ports stay off until it lands"]`
+   so CI means "green" again and the gap stays named. Leaving a red test with
+   no CI marker is the worst of the three: the gate stops being trusted.
+
+Everything else found in this round is Low/informational and appropriate for
+the maintenance list alongside Round 4's §R4.2.
+
+---
+
+# AUDIT.md — Round-6 Security Audit (2026-11-26E, pre-GA re-verification)
+
+**Tree reviewed:** `HEAD a6893aa` ("AUDIT") plus the Round-5 test
+additions. No `src` behaviour was touched; only tests and this document.
+
+**Method.** Re-read PLAN.md, DESIGN.md and README.md end to end, then
+verified the claims against a freshly built binary rather than a memory of
+one:
+
+- `cargo test --workspace` → **294 passed, 1 failed, 1 ignored** (the
+  failure is G1's `session::tests::authenticated_sender_headers_must_be_granted`,
+  red by design);
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean;
+- all six libFuzzer targets (`headers`, `dkim_tags`, `spf_record`,
+  `dmarc_record`, `dns_message`, `smtp_session`) built against this tree
+  with ASan + debug assertions and run for 60–120 s each: **no crash, no
+  hang, no leak** (≈4.0 M executions total). The DNS codec, SMTP framing,
+  header scanner, DKIM/SPF/DMARC parsers held;
+- the real binary driven over TCP and TLS with a `submission-port`, an
+  argon2id credentials file and `auth-senders = "alice=alice@example.org"`,
+  reading the delivered `.eml` back off disk.
+
+**Bottom line.** One Medium finding is open (G1, Round 4) and it is the
+only reason the suite is red. Nothing new of Medium or above was found this
+round: every trust boundary that Round 5 exercised by hand also held under
+ASan fuzzing, and every security-relevant claim in PLAN.md, DESIGN.md and
+README.md that was tested matched the code. Three Low/informational items
+are added below. The go/no-go is unchanged from Round 5: **do not enable a
+submission listener, and do not ship, until G1 is fixed and the suite is
+green.**
+
+## R6.1 Findings
+
+| ID | Sev | Where | Finding | Test |
+|----|-----|-------|---------|------|
+| **G1** ✅ **FIXED** (see §R7) | **Medium** (submission only) | `session.rs:959-971` (envelope), `session/message.rs:166-183` (`From:` authors) | Re-confirmed real and unfixed. The grant check still stops at `MAIL FROM` and the `From:` authors; `Sender:`, `Resent-From:` and `Resent-Sender:` are never checked. Live: a login granted only `alice@example.org` submitted a message carrying all three ungranted identities, delivered with `auth=pass smtp.auth=alice` and `dmarc=fail header.from=example.org`. | `session::tests::authenticated_sender_headers_must_be_granted` (red) |
+| **W1** | Low | `server.rs:253` | The accept-everything static fallback (no `--authority`) is logged at **INFO**, not WARN, even on the MX port. The F3 fix made a typo'd `authority` key a startup error, but the two ways to end up with the fallback — forgetting the flag, or a tool that drops it — produce only an `"level":30` line among the startup log. Verified live: a server with no authority logs `"no authority file; static per-address fallback (any local-part accepts)"` at level 30. On an internet-facing MX that is the difference between a closed server and an open relay-of-last-resort; it warrants WARN. | — (log-level observation) |
+| **W2** | Info | `fsutil.rs:57` (`create_private_file`) | Staging files are created with `O_CREAT|O_TRUNC` and **no `O_NOFOLLOW`**, so a pre-existing symlink at the target is followed and its target truncated. Not remotely reachable: spool names embed `new_queue_id()`'s UUID and maildir staging names embed a v4 UUID, and both trees are `0700`, so only a process already running as the service user can plant the link. The privilege-drop path is protected (`create_owned_dir_all` uses `O_DIRECTORY|O_NOFOLLOW`); this is the one file-creation site that is not. Defense-in-depth only. | — |
+| **W3** | Info | `README.md`, `PLAN.md`, `.github/workflows/ci.yml` | Documentation and CI drift. README and PLAN say "347 tests"; the tree has 296 (294 pass). More important: CI runs plain `cargo test --workspace`, which is red on `HEAD`, so the required checks cannot pass. Round 5 already flagged the red gate; this records that the stated count is also wrong. | — |
+
+### G1 — fresh live reproduction (this round)
+
+Config: `submission-port = 2587`, `auth-users-file` with `alice`,
+`auth-senders = "alice=alice@example.org"`, `local-domains = "small.example"`.
+STARTTLS → `AUTH PLAIN` → `235`, `MAIL FROM:<alice@example.org>` → `250`,
+`RCPT TO:<a@small.example>` → `250`, then:
+
+```
+From: alice@example.org
+Sender: ceo@victim.example
+Resent-From: finance@victim.example
+Resent-Sender: cfo@victim.example
+Reply-To: free@anywhere.example
+```
+
+`DATA` → `250 Ok`; the delivered copy:
+
+```
+Authentication-Results: mx.example.org;
+	auth=pass smtp.auth=alice;
+	dkim=none;
+	dmarc=fail header.from=example.org
+From: alice@example.org
+Sender: ceo@victim.example
+Resent-From: finance@victim.example
+Resent-Sender: cfo@victim.example
+Reply-To: free@anywhere.example
+```
+
+`Reply-To:` remaining free is correct and is pinned by the new guard test
+below; the three sender-naming headers are the finding. The fix remains the
+Round-4 prescription: run the existing `auth.permits` check over `Sender:`
+and `Resent-Sender:` (single addr-specs, same `split_address`) and over a
+`Resent-From:` whose domain is not granted.
+
+## R6.2 What held under ASan fuzzing and live probing
+
+| Area | Evidence |
+|---|---|
+| SMTP framing / smuggling | `smtp_session` fuzzer 120 s / 312 k execs, no crash or hang; the `<CRLF>.<CRLF>`-only terminator, bare-LF `.` re-stuffing and Discard cycle are covered by unit tests that pass |
+| Header scanner | `headers` fuzzer 60 s / 184 k execs; the shared `extract_raw_headers`/`find_separator` path is the only one the server uses |
+| DKIM / SPF / DMARC parsers | 60 s each (541 k / 918 k / 1.54 M execs), no crash |
+| DNS codec | 60 s / 454 k execs, no crash (hostile pointers, rdata overruns, short reads) |
+| Envelope strictness | `valid_reverse_path` runs on **every** non-null `MAIL FROM` *before* the authenticated branch, so the MSA path is not looser than the MX path (`<<a@b>`, `a b@b`, address literals all `501`) |
+| STARTTLS state reset | `tls_established` clears `helo`, `spf_helo`, `authenticated`, `auth_pending`, `auth_login_user` and the envelope |
+| AUTH gating | MX port `502`; plaintext submission `538`; unauthenticated `MAIL FROM` `530`; re-AUTH `503`; 3/session then `454` — all in tests and re-checked against the live binary in Round 5 |
+
+## R6.3 Test added
+
+| Test | Kind | Pins |
+|---|---|---|
+| `session::tests::authenticated_granted_sender_headers_and_reply_to_stay_allowed` | guard (passes today and after a correct fix) | A granted address in `Sender:`/`Resent-Sender:`/`Resent-From:` stays accepted, and `Reply-To:` stays free, so a G1 fix that over-blocks fails loudly instead of passing the refusal-only test |
+
+The existing refusal test already covers `Sender:`, `Resent-From:` **and**
+`Resent-Sender:` (Round 5 did not need to extend it).
+
+## R6.4 Go / no-go
+
+Unchanged: **not go-live.**
+
+1. **Fix G1** before enabling `submission-port`/`submissions-port`. The
+   pilot can run **MTA-only** today (the ports are off unless configured),
+   which closes the finding by configuration.
+2. **Make CI mean something.** Right now `cargo test --workspace` fails on
+   `HEAD`; either land the G1 fix (and the new guard test keeps the fix
+   honest) or mark the red test
+   `#[ignore = "AUDIT_20261126C G1: unfixed; submission ports stay off"]`
+   so the gate is green and the gap stays named.
+3. **W1** at go-live: promote the static-fallback log to WARN (or refuse to
+   start on a privileged port without `--authority`). It is the cheapest
+   single change that reduces the worst misconfiguration on the real MX
+   port.
+
+W2 and W3 are maintenance. Everything else in Round 5 §R5.2 and Round 4
+§R4.2 still stands.
+
+---
+
+# R7 — Fix status (2026-11-26)
+
+| ID | Status | Fix |
+|----|--------|-----|
+| **G1** | ✅ **FIXED** | `headers::sender_identities` reads every `Sender:`, `Resent-Sender:` and `Resent-From:` mailbox with the same raw scanner and mailbox parser as the `From:` authors; `end_of_data` (`session/message.rs`, right after the `From:` author check) requires each to pass `auth.permits(...)` for authenticated sessions and answers `550 5.7.1 From address not owned by authenticated user` otherwise. A field that cannot be parsed fails closed. `Reply-To:` stays free; the unauthenticated MX path is unchanged. |
+
+**Test changes made with the fix:**
+
+- `session::tests::authenticated_sender_headers_must_be_granted` — **test bug
+  fixed.** Its fourth case, `Sender: anyone@alice.example`, names an address
+  the test login *is* granted (`@alice.example`), so it contradicted both the
+  grant model (`authenticated_mail_from_must_be_granted` accepts
+  `anything@alice.example`) and the Round-6 guard test (which requires
+  `Sender: someone@alice.example` to be accepted). It now uses the ungranted
+  near-miss `anyone@sub.alice.example` (subdomains are not granted, as the
+  envelope test already pins). Passes.
+- `session::tests::authenticated_granted_sender_headers_and_reply_to_stay_allowed`
+  — unchanged; passes (the fix does not over-block).
+- `server::tests::ungranted_sender_headers_reach_the_maildir_under_auth_pass`
+  → renamed `ungranted_sender_headers_are_refused_under_auth` and flipped as
+  its doc comment prescribed: DATA now gets `550 5.7.1`, and nothing is
+  spooled or delivered.
+
+`cargo test --workspace` is green; `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` are clean. No High or
+Medium finding remains open; the Low/informational items (A1–A4, W1–W3,
+R4.2) are unchanged.
+
+---
+
+# AUDIT.md — Round-8 Production-Readiness Review (2026-11-26)
+
+**Question asked:** is this ready to go live on the public internet as a
+production MX: real traffic, real customers, real consequences if it fails
+or is abused? **Not** the friendly-domains pilot that DEPLOYMENT.md §1 and
+Rounds 4–6 judged against.
+
+**Tree reviewed:** `HEAD a6893aa` plus the uncommitted G1 fix (§R7).
+**Method:** re-read Rounds 1–7, DEPLOYMENT.md, PLAN.md and DESIGN.md §13,
+and checked every open item named below against the current source. No
+source code was changed in this round; only this section was added.
+`cargo test --workspace`, `cargo fmt --check` and `clippy -D warnings` are
+green on the working tree. **Not done in this round:** a live run of the
+binary, the fuzzers, or any part of the DEPLOYMENT.md checklist.
+
+## R8.1 Verdict
+
+**No-go for production today.** The code's security core is in good shape:
+no High or Medium code finding is open. But the project's own readiness
+record (DEPLOYMENT.md §1) rates it *"Not ready for general production. Ready
+for a limited pilot"*, and several of the limitations it accepts for a pilot
+rely on a few friendly domains, low volume, and an operator reading the logs
+every day. Real internet traffic removes all three, so those limitations
+become blockers. The production blockers are P1–P8; P9–P14 must be decided
+or fixed before GA or soon after.
+
+## R8.2 Production blockers (must be closed before port 25 takes real traffic)
+
+| ID | Sev (prod) | Area | Finding | Required action |
+|----|-----------|------|---------|-----------------|
+| **P1** | **High** | Release process | The G1 fix (§R7) is uncommitted, so no recorded commit exists with a green suite. DEPLOYMENT.md A1/A3 require the release to be built from a recorded commit with CI green. | Commit G1, confirm `.github/workflows/ci.yml` is green on that commit, and build and hash the release binary from it (A1–A3). |
+| **P2** | **High** | Operations | Every row of the DEPLOYMENT.md §4 sign-off table is empty: host sizing (B), config review (C), DNS/TLS (D), the hardened systemd unit (E), external smoke tests (F), alerting (G), and a tested backup restore (H). | Complete Phases A–H and fill in §4 with owner, date and evidence. A production go also needs on-call coverage, which the pilot's "operator watching the logs" does not provide. |
+| **P3** | **High** | Assurance | No independent security review has been done (PLAN.md §1, §2.4.6). All six audit rounds were internal. This is a new SMTP stack, DNS-over-TLS client and SPF/DKIM/DMARC implementation, parsing hostile input from the whole internet. | Commission an external review (code plus a black-box test of the deployed host) before GA, and track its findings here. |
+| **P4** | **High** | Misconfiguration → open accept-all | **W1 still open** (`mailserv/src/server.rs:253`). Without an `authority` file the server falls back to accepting every local-part at hosted domains, and logs this only at INFO. One missing flag turns the production MX into an accept-everything sink: backscatter, spam storage and disk exhaustion. | On the SMTP (port 25) listener, refuse to start without `--authority`, or at minimum log at WARN or ERROR and alert on it. Startup refusal is preferred for production. |
+| **P5** | **High** | Availability | A single host is the only MX. Final storage is local maildir only, which blocks multiple MX hosts (DESIGN.md §13; PLAN §5 "designed, not started"). A host or disk failure means mail is deferred by senders, then bounced after their retry window (typically 4–5 days); a lost disk loses everything not yet backed up. | Decide and document the availability target (RTO/RPO). At minimum: a tested restore (H1), host monitoring with paging, and a recovery runbook proven within the senders' retry window. A secondary MX is only safe if it applies the same authority and spam policy. A naive backup MX is a classic way around policy, so don't add one casually. |
+| **P6** | **Medium** | Abuse: disk / quota | Quotas are soft (one message over), don't count queued mail, and there is no per-domain total (PLAN §2.4.1). With open-internet senders, many mailboxes together can fill the disk until the free-disk floor defers **all** mail for **all** customers. | Implement per-domain totals and count queued mail (§2.4.1), or put each customer domain on its own size-limited filesystem. Alert well above the free-disk floor. |
+| **P7** | **Medium** | Legitimate mail lost | Some legitimate mail receives a **permanent** `550`, for example from a domain with a malformed SPF record (PermError, as RFC 7208 requires). The pilot contains this with a daily human review of rejections (G2); at production volume that review doesn't scale, and senders see the bounce as a failure of our service. | Decide the policy for PermError and other permanent refusals (refuse, or tag and deliver), make it configurable, and add metrics and alerts on the rate of permanent rejections, broken down by reason. |
+| **P8** | **Medium** | IPv6 / limits | SPF `a`/`mx` don't query AAAA, and per-IP limits aren't grouped by IPv6 /64 (PLAN §6). The deployment is therefore IPv4-only (B4). Publishing an AAAA record for the MX would both fail SPF for legitimate IPv6 senders and let one /64 escape every per-IP limit. | Keep the MX IPv4-only, with **no AAAA record for the MX host**, and have this verified by a smoke test, until §6 IPv6 readiness lands. |
+
+## R8.3 Fix before GA or shortly after (each with a production rationale)
+
+| ID | Sev (prod) | Source | Finding (verified in current source) | Action |
+|----|-----------|--------|--------------------------------------|--------|
+| **P9** | Medium | R4.2 #2 | `AuthConfig::check` waits without a bound for an argon2 slot (`mailserv/src/auth.rs:433`). Only matters if submission is enabled; then a burst of AUTH attempts holds sessions and connection slots until the session deadline. | `try_acquire` or a short timeout mapped to `454`, before submission is ever enabled in production. |
+| **P10** | Medium | R4.2 #3 | DNS cache bounded by count (`MAX_CACHE_ENTRIES = 4096`, `dns/src/lib.rs:322`), not by bytes. Up to ~256 MB is reachable with attacker-chosen names, which matters against a `MemoryMax`-limited unit (E1). | Add a total byte budget next to the count, or include 256 MB of headroom explicitly in B2 sizing. |
+| **P11** | Medium | R4.2 #1 | `FileAuthority` uses `.expect("authority lock poisoned")` (`mailserv/src/authority.rs:634,639`). A panic under the write lock turns every RCPT into `451` until restart: an outage for every domain. | Recover with `PoisonError::into_inner`, as every other lock in the code does. |
+| **P12** | Low | R4.2 #4 | DNS question-echo validation compares labels case-sensitively (`dns/src/lib.rs:143`). A conformant resolver that changes the case of the echoed name (for example 0x20 randomization upstream) would tear down every DoT connection, and with lookups failing, mail would be deferred. | Compare names case-insensitively. Also confirm the chosen resolver's behaviour during Phase F. |
+| **P13** | Low | DEPLOYMENT §2 | No TLS certificate reload; renewal needs a restart. In production every renewal is a brief outage, and a missed restart is an expired certificate. | Reload on SIGHUP. Until then, the D3 renewal hook must restart the service and verify the new certificate. Monitor certificate expiry. |
+| **P14** | Low | A1, W2, R4.2 #5 | A sender-supplied duplicate `Return-Path:` survives delivery (`headers.rs` strips only verdict headers). Staging files are created without `O_NOFOLLOW` (`fsutil.rs:50`). `catch-all-mailbox` is not validated when the authority file loads. | All are small. Close them in the first maintenance release. |
+
+Housekeeping (no production risk, but it erodes trust in the docs): README
+and PLAN.md still say "347 tests" (W3), and `README.md` still ends with the
+stray `claude --resume …` line (A4 / R4.2 #6).
+
+## R8.4 Operational requirements a production MX needs that the pilot didn't
+
+These are not code findings, but a production go/no-go should not be signed
+without them:
+
+1. **Monitoring and paging** for: process down, port 25 unreachable from an
+   external vantage point, queue depth and age, dead-letter count,
+   free-disk floor approach, DNS/DoT error rate, the rate of `451`s
+   (DNS trouble defers everything), permanent-rejection rate (P7) and
+   certificate expiry.
+2. **Capacity limits sized for hostile load**, not pilot load:
+   `max-connections`, per-IP connection, connection-rate and DNS limits,
+   `max-data-bytes` against memory (peak ≈ 2–3× per session, DEPLOYMENT
+   §2) and the `MemoryMax` of the systemd unit (E1).
+3. **Upstream DNS dependency:** DMARC and SPF fail closed, so a resolver
+   outage defers all inbound mail. Have more than one DoT resolver, or a
+   documented failover.
+4. **PSL refresh cadence (H7)** scheduled and owned, not ad hoc.
+5. **Incident runbooks** for: disk full, resolver outage, mail backlog,
+   certificate expiry, a compromised credential (if submission is ever
+   enabled), and a restore from backup.
+6. **Submission stays off** in production until P9 is fixed and a separate
+   review of the AUTH path signs it off. G1 is fixed, but that review is
+   still the gate.
+
+## R8.5 Go / no-go
+
+**No-go** until P1–P8 are closed and recorded in DEPLOYMENT.md §4, and the
+R8.4 operational requirements are in place. P9–P14 should be scheduled
+with owners before GA. The code-level work (P1, P4, P9–P14) is small; the
+long poles are P2 (the full checklist), P3 (an external review) and P5
+(an availability decision).

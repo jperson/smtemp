@@ -16,6 +16,7 @@ description, without finding IDs), and the current design and its gaps in
 | [FINDINGS.md](FINDINGS.md) | 2026-11-22 | `8e3a643` | Design and code quality (D-W, C-W); carried into PLAN.md §4 |
 | [AUDIT_20261125.md](AUDIT_20261125.md) | 2026-11-25 | `8a25bd9` | A1–A9 (A9 added on re-verification) |
 | [AUDIT_20261125_QWEN.md](AUDIT_20261125_QWEN.md) | 2026-11-25 | `8a25bd9` | Q1–Q12 (and re-checks of A1–A8) |
+| [AUDIT_20261126.md](AUDIT_20261126.md) | 2026-11-26 | `a5f1c32` (the two "security fixes" commits) | R1–R10, and re-checks of A1–A9 and Q1–Q12 |
 
 The deployment review's D1–D7 lived in DEPLOYMENT.md until it was rewritten
 as a pure checklist; read them with `git show b6bfaf9:DEPLOYMENT.md`.
@@ -155,8 +156,29 @@ reports describe them.
 | A4 | Fast path and drain shared one `tmp/` staging name | Fixed (2026-11-25): a staging name per attempt |
 | A9 | Racing deliveries double-count the copy in the cached mailbox size | Fixed (2026-11-25): the copy is committed with a hard link; only the attempt that creates it updates the cache (`EEXIST` is success) |
 | A1 follow-up | Per-author and per-claim state of one folded `From:` unbounded | Fixed (2026-11-25): authors deduplicated, more than 100 distinct refused; local-parts at most 256 octets; at most 11 claim candidates held while scanning |
-| Q3 | Quota overshoot of one message per recipient | Fixed (2026-11-25): a transaction's copies to one mailbox count at RCPT (each extra one at the declared size, or the size limit), and a message larger than its declared `SIZE=` is re-checked against the quotas at its real size at end of data (`452 4.2.2` if the copies don't fit) |
+| Q3 | Quota overshoot of one message per recipient | Fixed (2026-11-25): a transaction's copies to one mailbox count at RCPT (each extra one at the declared size, or the size limit), and a message larger than its declared `SIZE=` is re-checked against the quotas at its real size at end of data (`452 4.2.2` if the copies don't fit). **The fix introduced R8: at the shipped defaults the reservation equals the quota, so a catch-all mailbox defers every recipient after the first** |
 | Q4 | Sender strings copied unbounded into the message, metadata and log | Fixed (2026-11-25): DKIM `d=`/`s=`/`i=` length bounds, error text and header tokens cut, `From:` domains bounded to DNS limits (else `550`), at most 10 display-name claims, those under a listed public suffix kept first. A cut list is marked `truncated` in the header and metadata. Residual, accepted for V1 (DESIGN §13): fillers under listed suffixes can still displace a specific domain from the list; the warning and the marker still appear |
 | Q10 | DMARC skipped for a `From:` domain with no DNS wire form | Fixed (2026-11-25, with Q4): such a `From:` is refused as unparseable |
 | Q5 | PSL snapshot gap allows cross-registrant DMARC passes | Mitigated (2026-11-25): under an unknown TLD, names of more than two labels align only exactly; a missing zone under a listed TLD still needs the refresh (DEPLOYMENT.md H7). Reclassified under abuse resistance in DESIGN §13 |
-| A5–A7, Q6–Q9, Q11, Q12 | Low and informational findings | Open, as reported |
+| A5–A7, Q6–Q9, Q11, Q12 | Low and informational findings | Still open as of `a5f1c32` (re-checked in [AUDIT_20261126.md](AUDIT_20261126.md) §6) |
+
+## AUDIT_20261126.md (2026-11-26, tree `a5f1c32`)
+
+The A1–A9 and Q1–Q12 fix claims were re-verified and hold (except where
+the table above notes a residual). This pass added R1–R10, none of which
+was present in the earlier reports; each has a regression test in
+`mailserv/src/session/tests.rs`, so those eight tests fail until the
+finding is fixed.
+
+| ID | Finding | Status |
+|---|---|---|
+| R1 | A leading folding continuation extends the server's own `Authentication-Results:` / `X-Display-Name-Warning:` in the stored, delivered message | Open (High) |
+| R2 | An unusable `MAIL FROM` domain skips the SPF rejection and records `spf=none` | Open (Medium) |
+| R3 | The per-session recipient cache has no bound (~38k accepted RCPT/s, ~260 B each) | Open (Medium) |
+| R4 | DMARC `sp=` bypassed by a `From:` domain with a trailing dot | Open (Medium) |
+| R5 | Per-connection DKIM verdicts are unbounded and serialized into one log record | Open (Medium) |
+| R6 | DKIM parse memory bounded by the message, not by the documented caps | Open (Low) |
+| R7 | A forged verdict header survives stripping inside a continuation line | Open (Medium-Low) |
+| R8 | Catch-all mailboxes defer every recipient after the first at the default quota | Open (Medium, a Q3 regression) |
+| R9 | The DNS cache is bounded in entries, not bytes | Open (Low) |
+| R10 | Numeric limits are not range-checked (`0` shuts the service) | Open (Info) |

@@ -148,11 +148,18 @@ impl DmarcRecord {
     /// Returns the policy that applies to `domain` when this record was
     /// published for `record_domain`: `sp=` (if set) for subdomains of
     /// `record_domain`, `p=` otherwise.
+    ///
+    /// Both names are normalized as [`policy_candidates`] normalizes the
+    /// From domain before the walk that found the record (trimmed, every
+    /// trailing dot removed, lowercased), so the two can never disagree
+    /// about whether the record was inherited: `sub.example.com.` is a
+    /// subdomain of `example.com` like `sub.example.com`.
     pub fn policy_for(&self, record_domain: &str, domain: &str) -> DmarcPolicy {
+        let (record_domain, domain) = (normalize_domain(record_domain), normalize_domain(domain));
         let is_subdomain = domain != record_domain
             && domain
-                .to_ascii_lowercase()
-                .ends_with(&format!(".{}", record_domain.to_ascii_lowercase()));
+                .strip_suffix(record_domain.as_str())
+                .is_some_and(|rest| rest.ends_with('.'));
         match (is_subdomain, self.subdomain_policy) {
             (true, Some(sp)) => sp,
             _ => self.policy,
@@ -328,6 +335,12 @@ impl FoundPolicy {
 /// message into dozens of queries.
 pub const MAX_POLICY_QUERIES: usize = 8;
 
+/// Returns `domain` as policy discovery compares it: trimmed, every
+/// trailing dot removed, lowercased.
+fn normalize_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Returns the names [`fetch_policy`] queries for `from_domain` (trimmed,
 /// lowercased, trailing dot removed), in order: the domain itself, then
 /// its ancestors down to two labels. A domain with more labels than the
@@ -335,10 +348,7 @@ pub const MAX_POLICY_QUERIES: usize = 8;
 /// DMARCbis's tree walk does), so at most [`MAX_POLICY_QUERIES`] names are
 /// returned.
 pub fn policy_candidates(from_domain: &str) -> Vec<String> {
-    let domain = from_domain
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let domain = normalize_domain(from_domain);
     let labels: Vec<&str> = domain.split('.').collect();
     let mut names = vec![domain.clone()];
     let first_ancestor = if labels.len() > MAX_POLICY_QUERIES {
@@ -570,6 +580,22 @@ mod tests {
             r.policy_for("example.org", "notexample.org"),
             DmarcPolicy::None
         );
+        // Spelled the way the ancestor walk normalizes them away
+        // (AUDIT_20261126 R4): trailing dots and case change nothing.
+        for sub in [
+            "mail.example.org.",
+            "mail.example.org..",
+            "MAIL.Example.ORG",
+        ] {
+            assert_eq!(
+                r.policy_for("example.org", sub),
+                DmarcPolicy::Reject,
+                "{sub}"
+            );
+        }
+        for own in ["example.org.", "Example.ORG..", " example.org "] {
+            assert_eq!(r.policy_for("example.org", own), DmarcPolicy::None, "{own}");
+        }
     }
 
     #[derive(Default, Clone)]

@@ -18,7 +18,7 @@ impl UserSession<'_> {
     /// refusal of the first check that fails (`550`, or `451` for DNS
     /// trouble and a failed spool write); `503` without a transaction.
     pub(super) async fn end_of_data(&mut self) -> smtp::Control {
-        let Some(txn) = self.txn.take() else {
+        let Some(txn) = self.end_transaction() else {
             return smtp::Control::reject(NO_RECIPIENTS);
         };
         self.message_count += 1;
@@ -108,7 +108,10 @@ impl UserSession<'_> {
                 "dkim verification"
             );
         }
-        self.dkim.extend(dkim_summaries.iter().cloned());
+        // The session record keeps the last message's verdicts only: kept
+        // for every message, they would grow with the connection, and the
+        // record is one log line (AUDIT_20261126 R5).
+        self.dkim.clone_from(&dkim_summaries);
 
         // DMARC (RFC 7489): evaluate the From-header domain against the
         // SPF and DKIM results, and apply the published policy. Authenticated
@@ -224,10 +227,9 @@ impl UserSession<'_> {
                     path_domain(&mail_from)
                 };
                 // DMARC consumes ONLY this message's DKIM results.
-                // `self.dkim` accumulates across the connection for the
-                // session log; using it here would let a replayed genuine
-                // signature from an earlier message make a later unsigned
-                // spoof pass DMARC.
+                // `self.dkim` is for the session log; nothing from an earlier
+                // message may be used here, or a replayed genuine signature
+                // could make a later unsigned spoof pass DMARC.
                 let dkim: Vec<(String, bool)> = dkim_summaries
                     .iter()
                     .map(|d| (d.domain.clone(), d.verified))

@@ -283,11 +283,14 @@ pub fn mailbox_address(mailbox: &[u8]) -> Option<(String, String)> {
     // A DNS name's length bounds (RFC 1035 §2.3.4): a longer name has no
     // wire form, so no DMARC lookup could ever be made for it (and it
     // would be carried whole into the log and the spool metadata).
+    // An empty label (`a..b`, or a second trailing dot) is not a domain
+    // either (RFC 1035 §2.3.1), and the DMARC walk would trim it while
+    // the policy choice saw it (AUDIT_20261126 R4).
     if domain.is_empty()
         || domain.len() > MAX_DOMAIN_LEN
         || domain
             .split(|&b| b == b'.')
-            .any(|l| l.len() > MAX_LABEL_LEN)
+            .any(|l| l.is_empty() || l.len() > MAX_LABEL_LEN)
         || !domain
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
@@ -309,28 +312,103 @@ use std::borrow::Cow;
 /// adds that). Other headers, the body and line endings are kept
 /// byte-for-byte.
 ///
-/// Returns the message without those fields, borrowing `raw` (no copy)
-/// when there were none, which is the usual case. Fields are found by the
-/// shared raw scanner and cut out by their exact spans, so lines it
-/// doesn't count as a field (malformed ones) are kept as they are.
+/// Two kinds of line are removed as well, because the stored message is
+/// this block placed directly under the verdict headers this server
+/// writes, and folding would otherwise carry sender text into them or
+/// past them:
+///
+/// * continuation lines (starting with SP or HTAB) before the first
+///   field. RFC 5322 has no place for them, so they belong to no field
+///   here, but once prepended to they would continue *our* last header
+///   (AUDIT_20261126 R1);
+/// * continuation lines that read, after their leading whitespace, as one
+///   of [`OUR_VERDICT_HEADERS`] (`Name:`, case-insensitive). They are
+///   part of the field above, so field stripping keeps them, but a reader
+///   that splits header lines would see our verdict there (R7).
+///
+/// Returns the message without those fields and lines, borrowing `raw`
+/// (no copy) when there were none, which is the usual case. Fields are
+/// found by the shared raw scanner and cut out by their exact spans, so
+/// other lines it doesn't count as a field (malformed ones) are kept as
+/// they are.
 pub fn strip_forged_verdicts<'r>(raw: &'r [u8], authserv_id: &str) -> Cow<'r, [u8]> {
-    let block = &raw[..header_block_end(raw)];
-    let forged: Vec<std::ops::Range<usize>> = mailparse::extract_raw_headers(block)
-        .into_iter()
-        .filter(|h| is_forged_verdict(h, authserv_id))
-        .map(|h| h.span)
-        .collect();
+    // Lines first: a removed line can change a field's authserv-id (it
+    // may sit before it), so the fields are judged on what remains, and
+    // stripping twice changes nothing.
+    let lines = smuggling_lines(&raw[..header_block_end(raw)]);
+    let raw: Cow<'r, [u8]> = if lines.is_empty() {
+        Cow::Borrowed(raw)
+    } else {
+        Cow::Owned(without_spans(raw, &lines))
+    };
+    let forged: Vec<std::ops::Range<usize>> =
+        mailparse::extract_raw_headers(&raw[..header_block_end(&raw)])
+            .into_iter()
+            .filter(|h| is_forged_verdict(h, authserv_id))
+            .map(|h| h.span)
+            .collect();
     if forged.is_empty() {
-        return Cow::Borrowed(raw);
+        return raw;
     }
+    Cow::Owned(without_spans(&raw, &forged))
+}
+
+/// Returns `raw` without the bytes of `spans` (in order, non-overlapping).
+fn without_spans(raw: &[u8], spans: &[std::ops::Range<usize>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut cursor = 0;
-    for span in forged {
+    for span in spans {
         out.extend_from_slice(&raw[cursor..span.start]);
         cursor = span.end;
     }
     out.extend_from_slice(&raw[cursor..]);
-    Cow::Owned(out)
+    out
+}
+
+/// The header fields only this server may write (see
+/// [`strip_forged_verdicts`]), lowercased.
+const OUR_VERDICT_HEADERS: [&str; 2] = ["authentication-results", "x-display-name-warning"];
+
+/// Returns the spans (with their line terminators) of the continuation
+/// lines of header block `block` that [`strip_forged_verdicts`] removes:
+/// those before the first non-continuation line, and those that read as
+/// one of [`OUR_VERDICT_HEADERS`]. In order, non-overlapping.
+fn smuggling_lines(block: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    let mut leading = true;
+    let mut start = 0;
+    while start < block.len() {
+        let end = block[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(block.len(), |p| start + p + 1);
+        let line = &block[start..end];
+        let continuation = matches!(line.first(), Some(b' ' | b'\t'));
+        if !continuation {
+            leading = false;
+        } else if leading || names_our_verdict(line) {
+            lines.push(start..end);
+        }
+        start = end;
+    }
+    lines
+}
+
+/// Whether the continuation line `line` reads, after its leading
+/// whitespace, as a field of one of [`OUR_VERDICT_HEADERS`]: the name
+/// (case-insensitive), optional whitespace (the obsolete `Name :` form),
+/// then a colon.
+fn names_our_verdict(line: &[u8]) -> bool {
+    let is_wsp = |b: &u8| matches!(b, b' ' | b'\t');
+    let text = &line[line.iter().take_while(|b| is_wsp(b)).count()..];
+    OUR_VERDICT_HEADERS.iter().any(|name| {
+        text.len() >= name.len()
+            && text[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            && text[name.len()..]
+                .iter()
+                .find(|b| !is_wsp(b))
+                .is_some_and(|&b| b == b':')
+    })
 }
 
 /// Whether the header field `header` is one of [`OUR_VERDICT_HEADERS`]
@@ -807,6 +885,69 @@ Authentication-Results: mx.example.org; body text stays\r\n";
             matches!(strip_forged_verdicts(clean, "mx.example.org"), Cow::Borrowed(b) if b == clean),
             "no copy"
         );
+    }
+
+    /// AUDIT_20261126 R4: a `From:` domain with an empty label has no DNS
+    /// form, so it is not a domain; one trailing dot is still the
+    /// fully-qualified spelling.
+    #[test]
+    fn from_domain_has_no_empty_labels() {
+        assert_eq!(
+            mailbox_address(b"ceo@sub.paypal.com."),
+            Some(("ceo".into(), "sub.paypal.com".into()))
+        );
+        for bad in [
+            &b"ceo@sub.paypal.com.."[..],
+            b"ceo@sub..paypal.com",
+            b"ceo@.paypal.com",
+            b"ceo@.",
+        ] {
+            assert_eq!(
+                mailbox_address(bad),
+                None,
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// AUDIT_20261126 R1/R7: a continuation line before the first field
+    /// (it would extend the header written above the message) and a
+    /// continuation line that reads as one of our verdict headers are
+    /// removed; other folding is kept exactly.
+    #[test]
+    fn folded_lines_cannot_carry_verdicts() {
+        let raw = b"\tspf=pass smtp.mailfrom=victim.example\r\n \r\n\
+Subject: hi\r\n\
+\tAuthentication-Results: mx.example.org; dmarc=pass\r\n\
+\x20x-display-name-warning : none\n\
+\tstill the subject\r\n\
+From: a@x.example\r\n\
+\r\n\
+\tAuthentication-Results: body text stays\r\n";
+        let expected = b"Subject: hi\r\n\
+\tstill the subject\r\n\
+From: a@x.example\r\n\
+\r\n\
+\tAuthentication-Results: body text stays\r\n";
+        let out = strip_forged_verdicts(raw, "mx.example.org");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(expected)
+        );
+        // A line inside a removed field is removed once, with it.
+        let nested =
+            b"X-Display-Name-Warning: a\r\n\tAuthentication-Results: b\r\nSubject: s\r\n\r\n";
+        assert_eq!(
+            strip_forged_verdicts(nested, "mx.example.org").as_ref(),
+            &b"Subject: s\r\n\r\n"[..]
+        );
+        // Ordinary folding mentioning the names elsewhere is untouched.
+        let clean = b"Subject: about\r\n\tAuthentication-Results headers\r\n\r\nbody\r\n";
+        assert!(matches!(
+            strip_forged_verdicts(clean, "mx.example.org"),
+            Cow::Borrowed(_)
+        ));
     }
 
     /// A display name (or comment) naming an address in another

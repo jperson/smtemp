@@ -79,6 +79,54 @@ pub fn unsafe_local_part(addr: &str) -> Option<&'static str> {
     None
 }
 
+/// Is `addr` (brackets removed, see [`clean_path`]) an acceptable
+/// non-null `MAIL FROM` address: an RFC 5321 `Mailbox` whose domain can
+/// be looked up?
+///
+/// The local-part is a `Dot-string` (atext atoms separated by single
+/// dots) or a `Quoted-string` of printable ASCII; the domain follows the
+/// [`valid_helo`] domain rules (LDH labels plus `_`, one trailing dot
+/// allowed) and must not be an address literal. Everything after the
+/// *last* `@` is the SPF identity, so without this check an envelope such
+/// as `ceo@victim.example@` or `ceo@victim.example;` would name the
+/// victim domain while giving SPF nothing it can query, and skip the
+/// SPF Fail rejection (AUDIT_20261126 R2).
+pub fn valid_reverse_path(addr: &str) -> bool {
+    let Some((local, domain)) = addr.rsplit_once('@') else {
+        return false;
+    };
+    valid_local_part(local) && !domain.starts_with('[') && valid_helo(domain)
+}
+
+/// Is `local` an RFC 5321 `Local-part`: a `Dot-string` or a
+/// `Quoted-string` (§4.1.2), ASCII only (SMTPUTF8 is not offered)?
+fn valid_local_part(local: &str) -> bool {
+    if let Some(inner) = local.strip_prefix('"') {
+        let Some(inner) = inner.strip_suffix('"') else {
+            return false;
+        };
+        // qtextSMTP (%d32-33 / %d35-91 / %d93-126) or a quoted-pair
+        // (`\` followed by %d32-126).
+        let mut bytes = inner.bytes();
+        while let Some(b) = bytes.next() {
+            match b {
+                b'\\' => {
+                    if !bytes.next().is_some_and(|q| (32..=126).contains(&q)) {
+                        return false;
+                    }
+                }
+                32..=33 | 35..=91 | 93..=126 => {}
+                _ => return false,
+            }
+        }
+        return true;
+    }
+    !local.is_empty()
+        && local
+            .split('.')
+            .all(|atom| !atom.is_empty() && atom.bytes().all(|b| is_mailbox_safe(b) || b == b'/'))
+}
+
 /// Is `h` an acceptable HELO/EHLO identity?
 ///
 /// RFC 5321 §4.1.1.1: the argument is a `Domain` or an `address-literal`.
@@ -197,6 +245,45 @@ mod tests {
             "\"quoted\"@x.test",
         ] {
             assert!(unsafe_local_part(bad).is_some(), "{bad} must be refused");
+        }
+    }
+
+    /// A MAIL FROM address must be a mailbox whose domain SPF can query
+    /// (AUDIT_20261126 R2).
+    #[test]
+    fn reverse_path_validation() {
+        for ok in [
+            "ceo@paypal.com",
+            "ceo@paypal.com.",
+            "first.last+tag@sub.example.org",
+            "o'brien@x.test",
+            "a/b@x.test",
+            "\"john doe\"@x.test",
+            "\"a@b\\\"c\"@x.test",
+            "bounce@localhost",
+        ] {
+            assert!(valid_reverse_path(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "ceo@paypal.com@",
+            "ceo@paypal.com;",
+            "ceo@paypal.com@x",
+            "@paypal.com",
+            "ceo",
+            "ceo@",
+            "ceo@paypal..com",
+            "ceo@paypal.com..",
+            ".ceo@paypal.com",
+            "c..eo@paypal.com",
+            "ceo.@paypal.com",
+            "c eo@paypal.com",
+            "\"unterminated@paypal.com",
+            "\"bad\\\"@paypal.com",
+            "ceo@[192.0.2.1]",
+            "@a,@b:ceo@paypal.com",
+            "caf\u{e9}@paypal.com",
+        ] {
+            assert!(!valid_reverse_path(bad), "{bad:?} should be refused");
         }
     }
 

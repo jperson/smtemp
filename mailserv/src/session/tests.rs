@@ -734,9 +734,11 @@ async fn mailbox_quota_defers_only_the_full_recipient() {
 
 /// Copies of one message routed to one mailbox count against its quota
 /// before anything is stored: each copy after the first at its declared
-/// size, or at the transaction's size limit when none was declared. (All
-/// were checked against the same reading: 100 recipients put 20 MB into
-/// a 10 MiB mailbox.)
+/// size, or, when none was declared, at its real size at end of data.
+/// (All were checked against the same reading: 100 recipients put 20 MB
+/// into a 10 MiB mailbox.) Counting undeclared copies at the size limit
+/// instead deferred every copy after the first at the shipped defaults
+/// (AUDIT_20261126 R8).
 #[tokio::test]
 async fn catch_all_copies_share_one_quota() {
     let dir = tempfile::tempdir().unwrap();
@@ -775,20 +777,23 @@ async fn catch_all_copies_share_one_quota() {
         smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
     );
 
-    // Undeclared: the first copy is the one allowed overshoot, and each
-    // further one is counted at the 2000-byte limit: 0, 2000 and 4000
-    // pending fit (under 5000), 6000 doesn't.
+    // Undeclared: nothing is known at RCPT, so every copy is accepted
+    // there (the empty mailbox is under its quota)...
     session.clear_envelope();
     session.begin("x@sender.example");
-    for a in ["a", "b", "c"] {
+    for a in ["a", "b", "c", "d"] {
         let reply = session.rcpt_to(&format!("<{a}@catch.example>")).await;
         assert!(reply.is_accept(), "{a}: {reply:?}");
     }
+    assert_eq!(session.t().rcpt_to.len(), 4);
+    // ...and the copies are counted at their real size at end of data:
+    // the first is the one allowed overshoot, and 3 × 1800 more doesn't
+    // fit under 5000.
+    session.t().data = format!("From: x@sender.example\r\n\r\n{}", "x".repeat(1800)).into_bytes();
     assert_eq!(
-        session.rcpt_to("<d@catch.example>").await,
+        session.end_data().await,
         smtp::Control::tempfail(crate::quota::MAILBOX_FULL)
     );
-    assert_eq!(session.t().rcpt_to.len(), 3);
 }
 
 /// A `SIZE` the sender lies about is never caught, and Q3's accounting
@@ -1235,4 +1240,433 @@ From: ceo@victim.example\r\nSubject: s\r\n\r\nbody\r\n";
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit regression tests (2026-11-26, docs/reviews/AUDIT_20261126.md)
+// ---------------------------------------------------------------------------
+
+/// Unfold the header block of a stored message the way a mail reader
+/// does: a line beginning with whitespace continues the field before it.
+/// Returns the value of the named field, unfolded, lowercased.
+fn delivered_header(message: &str, name: &str) -> String {
+    let block = message.split("\r\n\r\n").next().unwrap_or(message);
+    let mut value = String::new();
+    let mut found = false;
+    for line in block.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if found {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        let Some((field, rest)) = line.split_once(':') else {
+            found = false;
+            continue;
+        };
+        found = field.trim().eq_ignore_ascii_case(name);
+        if found {
+            value = rest.trim().to_string();
+        }
+    }
+    value
+}
+
+/// R1 (High). The message's own first line is placed verbatim after the
+/// headers this server prepends, so when it is a folding continuation it
+/// becomes part of *our* `Authentication-Results:` header. The sender can
+/// then add clauses (anything after a `;`) that the next hop reads as
+/// this server's authenticated verdict — the exact thing
+/// [`strip_forged_verdicts`] exists to prevent, reached from the other
+/// side. Nothing refuses a message that begins with a continuation line.
+#[tokio::test]
+async fn a_leading_continuation_cannot_extend_our_verdict_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let cfg = SessionConfig {
+        dns: spawn_nxdomain_resolver().await,
+        spool: Some(Arc::new(spool::DiskSpool::open(&spool_dir, None).unwrap())),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@attacker.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    assert!(session.start_data().await.is_accept());
+    // RFC 5322 forbids folding the first line, so this text belongs to no
+    // field of the sender's message: `strip_forged_verdicts` and the From
+    // scan both ignore it. Delivered, it extends our header instead.
+    for line in [
+        b"\tspf=pass smtp.mailfrom=paypal.com; dmarc=pass header.from=paypal.com\r\n".as_slice(),
+        b"From: x@attacker.example\r\n".as_slice(),
+        b"Subject: t\r\n".as_slice(),
+        b"\r\n".as_slice(),
+        b"body\r\n".as_slice(),
+    ] {
+        assert!(
+            matches!(session.recv_data(line).await, smtp::DataControl::Continue),
+            "{}",
+            String::from_utf8_lossy(line)
+        );
+    }
+    let reply = session.end_data().await;
+    assert!(reply.is_accept(), "{reply:?}");
+
+    let new = spool_dir.join("new");
+    let eml = std::fs::read_dir(&new)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "eml"))
+        .expect("a spooled message");
+    let text = String::from_utf8(std::fs::read(&eml).unwrap()).unwrap();
+    let ar = delivered_header(&text, "Authentication-Results");
+    assert!(
+        !ar.contains("paypal.com"),
+        "the sender wrote clauses into our trusted header: {ar}"
+    );
+}
+
+/// The same fold attaches to `X-Display-Name-Warning:` when the message
+/// carries one (it is the last header written).
+#[tokio::test]
+async fn a_leading_continuation_cannot_extend_the_display_name_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let cfg = SessionConfig {
+        dns: spawn_nxdomain_resolver().await,
+        spool: Some(Arc::new(spool::DiskSpool::open(&spool_dir, None).unwrap())),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@attacker.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    session.t().data = b"\t; dmarc=pass (our mail is safe)\r\n\
+          From: \"ceo@victim.example\" <x@attacker.example>\r\n\
+          Subject: t\r\n\r\nbody\r\n"
+        .to_vec();
+    assert!(session.end_data().await.is_accept());
+    let new = spool_dir.join("new");
+    let eml = std::fs::read_dir(&new)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "eml"))
+        .unwrap();
+    let text = String::from_utf8(std::fs::read(&eml).unwrap()).unwrap();
+    let warn = delivered_header(&text, "X-Display-Name-Warning");
+    assert!(
+        warn.contains("victim.example"),
+        "our warning is missing: {warn}"
+    );
+    assert!(
+        !warn.contains("our mail is safe"),
+        "the sender appended to our warning: {warn}"
+    );
+}
+
+/// R2 (Medium). A MAIL FROM whose address has no queryable domain (an
+/// empty one, or one with characters DNS refuses) is accepted with SPF
+/// `none`, so the sender dodges the Fail rejection this server promises
+/// (DESIGN §5: "Fail or PermError -> 550") and the delivered
+/// `Authentication-Results:` records `spf=none` for a domain that
+/// publishes `-all`. `MAIL FROM` applies no address-syntax rule at all:
+/// [`mailserv::address::clean_path`] only refuses control characters, and
+/// the domain is whatever follows the last `@`. The same envelope, sent
+/// as `<ceo@paypal.com>`, is refused with `550`.
+#[tokio::test]
+async fn a_mail_from_domain_that_cannot_be_looked_up_is_not_spf_checked() {
+    let dns = spawn_mock_resolver(
+        |name, qtype| match (name, qtype) {
+            ("paypal.com", 16) => MockAnswer::Txt("v=spf1 -all"),
+            _ => MockAnswer::Rcode(3),
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        dns,
+        ..size_limit_session(dir.path())
+    };
+    // Measured replies, release build: 550 is the SPF refusal, 250 is an
+    // accepted envelope whose sender domain was never queried.
+    for path in [
+        "<ceo@paypal.com@>",  // empty domain after the last '@'
+        "<ceo@paypal.com;>",  // a domain DNS refuses: never queried
+        "<ceo@paypal.com@x>", // a one-label domain: no record, no Fail
+    ] {
+        let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+        let control = session.mail_from(path).await;
+        assert!(
+            !control.is_accept(),
+            "MAIL FROM:{path} was accepted with {:?}; the sender domain's \
+             `-all` record was never evaluated",
+            session.txn.as_ref().map(|t| t.spf_result)
+        );
+    }
+    // (For reference: the plain address is refused.)
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    assert!(matches!(
+        session.mail_from("<ceo@paypal.com>").await,
+        smtp::Control::Reject(_)
+    ));
+}
+
+/// R7 (Medium-Low). A forged verdict header survives
+/// [`strip_forged_verdicts`] by sitting in a folded continuation of the
+/// field before it. The shared raw scanner is right (RFC 5322: it is part
+/// of `Subject:`), but the line reaches the mailbox verbatim, where a
+/// consumer that splits header lines on newlines — the class of bug the
+/// bare-CR refusal exists for, reached through legitimate folding — reads
+/// an `Authentication-Results:` from our authserv-id that we never sent.
+#[tokio::test]
+async fn a_forged_verdict_cannot_hide_in_a_continuation_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let cfg = SessionConfig {
+        dns: spawn_nxdomain_resolver().await,
+        spool: Some(Arc::new(spool::DiskSpool::open(&spool_dir, None).unwrap())),
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@attacker.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    session.t().data = concat!(
+        "Subject: hi\r\n",
+        "\tAuthentication-Results: mail.test; dmarc=pass header.from=victim.example\r\n",
+        "\tX-Display-Name-Warning: no risk here\r\n",
+        "From: \"ceo@victim.example\" <x@attacker.example>\r\n",
+        "\r\n",
+        "body\r\n",
+    )
+    .as_bytes()
+    .to_vec();
+    assert!(session.end_data().await.is_accept());
+
+    let new = spool_dir.join("new");
+    let eml = std::fs::read_dir(&new)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "eml"))
+        .unwrap();
+    let text = String::from_utf8(std::fs::read(&eml).unwrap()).unwrap();
+    // Exactly one AR line and one warning line, however a reader splits
+    // the block: ours.
+    let claimed = |name: &str| {
+        text.split("\r\n")
+            .filter(|l| l.trim_start().to_ascii_lowercase().starts_with(name))
+            .count()
+    };
+    assert_eq!(
+        claimed("authentication-results:"),
+        1,
+        "a line-splitting reader sees a second AR: {text}"
+    );
+    assert_eq!(
+        claimed("x-display-name-warning:"),
+        1,
+        "a line-splitting reader sees a second warning: {text}"
+    );
+}
+
+/// R3 (Medium). The per-session recipient cache is never bounded, and it
+/// survives every transaction: one connection may keep an entry (with the
+/// authority's `mailbox`, `user` and `public_key` clones) for every
+/// distinct address it has ever been accepted for.
+#[tokio::test]
+async fn the_recipient_cache_is_bounded_per_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catch-authority.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "domains": { "catch.example": { "mode": "catch-all",
+                "catch-all-mailbox": "inbox@catch.example" } },
+            "mailboxes": { "inbox@catch.example": { "user": "inbox",
+                "public-key": "age1qyq", "key-generation": 3 } }
+        }"#,
+    )
+    .unwrap();
+    let cfg = SessionConfig {
+        authority: Arc::new(authority::FileAuthority::open(&path).unwrap()),
+        dns: spawn_nxdomain_resolver().await,
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    // 200 transactions, 100 distinct recipients each: MAIL FROM:<> with an
+    // address-literal HELO costs no DNS, and a message with no From: is
+    // refused before any lookup, so the only cost is the recipient check.
+    for round in 0..200 {
+        session.begin("");
+        for i in 0..100 {
+            let rcpt = format!("u{round}-{i}@catch.example");
+            assert!(
+                session.rcpt_to(&format!("<{rcpt}>")).await.is_accept(),
+                "{rcpt}"
+            );
+        }
+        session.t().data = b"Subject: no from\r\n\r\nbody\r\n".to_vec();
+        session.end_data().await;
+    }
+    assert!(
+        session.rcpt_cache.len() <= 100 * 10,
+        "{} accepted recipients kept by one connection \
+         (about {} KB of authority data)",
+        session.rcpt_cache.len(),
+        std::mem::size_of::<authority::Recipient>() * session.rcpt_cache.len() / 1024,
+    );
+}
+
+/// End of data for one `From:` header, as an unauthenticated MX session.
+async fn sp_policy_verdict(cfg: &SessionConfig, from: &str) -> smtp::Control {
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, cfg);
+    session.begin("x@sender.example");
+    assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+    session.t().data = format!("From: {from}\r\nSubject: t\r\n\r\nbody\r\n").into_bytes();
+    session.end_data().await
+}
+
+/// R4 (Medium). `FoundPolicy::policy_for` decides "subdomain" with a
+/// literal `.record_domain` suffix test, while the record was *found* by
+/// the ancestor walk of `policy_candidates`, which trims trailing dots.
+/// A `From:` domain that keeps a trailing dot (`x@sub.paypal.com..`,
+/// which [`mailserv::headers::mailbox_address`] accepts because it checks
+/// a domain's characters and length but not for empty labels) is
+/// therefore treated as the record's own domain: the stricter `sp=`
+/// never applies, and a `p=none; sp=reject` publisher rejects nothing.
+#[tokio::test]
+async fn a_subdomain_policy_applies_whatever_the_from_domain_spelling() {
+    let dns = spawn_mock_resolver(
+        |name, qtype| match (name, qtype) {
+            ("_dmarc.paypal.com", 16) => MockAnswer::Txt("v=DMARC1; p=none; sp=reject"),
+            _ => MockAnswer::Rcode(3),
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        dns,
+        ..size_limit_session(dir.path())
+    };
+
+    // The plain subdomain: sp=reject applies, the message is refused.
+    let plain = sp_policy_verdict(&cfg, "ceo@sub.paypal.com").await;
+    assert!(
+        matches!(plain, smtp::Control::Reject(_)),
+        "expected the subdomain policy: {plain:?}"
+    );
+    // The same subdomain with a trailing dot left in the domain: the
+    // parent's p=none is used instead, and the message is accepted.
+    let dotted = sp_policy_verdict(&cfg, "ceo@sub.paypal.com..").await;
+    assert!(
+        matches!(dotted, smtp::Control::Reject(_),),
+        "a trailing dot skips sp=reject and the message is delivered: {dotted:?}"
+    );
+}
+
+/// R5 (Medium). Two per-connection accumulators have no bound at all:
+/// `UserSession::dkim` (every signature verdict of every message on the
+/// connection, kept for the session record) and the recipient cache. The
+/// connection summary is then `serde_json::to_string(&session)`, so a
+/// sender controls the size of one log record — and of the connection's
+/// retained memory — by how many messages it sends.
+#[tokio::test]
+async fn the_session_record_stays_bounded_across_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = SessionConfig {
+        dns: spawn_mock_resolver(
+            |name, qtype| match (name, qtype) {
+                (n, 16) if n.starts_with("_dmarc.") => MockAnswer::Txt("v=DMARC1; p=none"),
+                (n, 16) if n.ends_with("._domainkey.x.example") => {
+                    MockAnswer::Txt("v=DKIM1; k=rsa; p=AAAA")
+                }
+                _ => MockAnswer::Rcode(3),
+            },
+            Duration::from_secs(5),
+        )
+        .await,
+        ..size_limit_session(dir.path())
+    };
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    let message = b"DKIM-Signature: v=1; a=rsa-sha256; d=x.example; s=sel; h=From; \
+                    bh=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; b=AAAA\r\n\
+                    DKIM-Signature: v=1; a=rsa-sha256; d=x.example; s=sel2; h=From; \
+                    bh=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; b=AAAA\r\n\
+                    DKIM-Signature: v=1; a=rsa-sha256; d=x.example; s=sel3; h=From; \
+                    bh=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=; b=AAAA\r\n\
+                    From: x@attacker.example\r\nSubject: t\r\n\r\nbody\r\n";
+    for _ in 0..500 {
+        session.begin("x@sender.example");
+        assert!(session.rcpt_to("<c@big.example>").await.is_accept());
+        session.t().data = message.to_vec();
+        session.end_data().await;
+    }
+    let record = serde_json::to_string(&session).unwrap();
+    assert!(
+        session.dkim.len() <= 5 * 100 && record.len() < 64 * 1024,
+        "{} dkim verdicts and a {} KB session record from {} messages",
+        session.dkim.len(),
+        record.len() / 1024,
+        session.message_count,
+    );
+}
+
+/// R8 (Medium). The Q3 quota fix reserves the transaction's *size limit*
+/// for every copy already accepted to one mailbox. The shipped defaults
+/// make that reservation equal the default mailbox quota
+/// (`mailbox-quota-bytes` = `max-data-bytes` = 10 MiB), so a mailbox whose
+/// quota is the default accepts exactly one recipient per transaction
+/// under catch-all (or with aliases): every later one is deferred with
+/// `452 4.2.2`, however small the message is, forever. Reproduced live:
+/// three recipients at a catch-all domain of an idle 1-byte mailbox got
+/// `250`, `452`, `452`.
+#[tokio::test]
+async fn catch_all_recipients_fit_the_default_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catch-authority.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "domains": { "catch.example": { "mode": "catch-all",
+                "catch-all-mailbox": "inbox@catch.example" } },
+            "mailboxes": {}
+        }"#,
+    )
+    .unwrap();
+    let max_data = 64 * 1024;
+    let mut cfg = size_limit_session(dir.path());
+    cfg.max_data = max_data;
+    cfg.authority = Arc::new(authority::FileAuthority::open(&path).unwrap());
+    cfg.dns = spawn_nxdomain_resolver().await;
+    cfg.sink = Some(Arc::new(
+        delivery::MaildirSink::open(dir.path().join("maildir")).unwrap(),
+    ));
+    cfg.storage = Arc::new(crate::quota::StorageLimits {
+        mailbox_quota: Some(max_data as u64),
+        ..crate::quota::StorageLimits::unlimited()
+    });
+    let mut session = UserSession::new("127.0.0.1:40000".parse().unwrap(), false, &cfg);
+    session.begin("x@sender.example");
+    let mut deferred = Vec::new();
+    for i in 0..3 {
+        let rcpt = format!("person{i}@catch.example");
+        let reply = session.rcpt_to(&format!("<{rcpt}>")).await;
+        if !reply.is_accept() {
+            deferred.push((rcpt, reply));
+        }
+    }
+    assert!(
+        deferred.is_empty(),
+        "three recipients of one small message to a catch-all mailbox, in an \
+         empty mailbox whose quota is the default (= the size limit): {deferred:?}"
+    );
+    // The message itself is a tenth of the limit: all three copies fit.
+    session.t().data = format!(
+        "From: x@sender.example\r\n\r\n{}",
+        "x".repeat(max_data / 10)
+    )
+    .into_bytes();
+    assert!(session.end_data().await.is_accept());
 }

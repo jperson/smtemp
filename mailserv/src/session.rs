@@ -14,7 +14,9 @@ use tokio::time::Instant;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::address::{clean_path, path_domain, size_param, unsafe_local_part, valid_helo};
+use crate::address::{
+    clean_path, path_domain, size_param, unsafe_local_part, valid_helo, valid_reverse_path,
+};
 use crate::authority::{self, Resolution};
 use crate::headers::{
     display_name_claims_counted, from_authors, from_header_domain, header_has_bare_cr,
@@ -320,8 +322,10 @@ pub(crate) struct UserSession<'session> {
     /// SPF verdict for the HELO/EHLO identity; `None` before HELO and for
     /// address-literal HELOs.
     spf_helo: Option<SpfResult>,
-    /// DKIM verdicts of every message on this connection, for the session
-    /// log. Never used for DMARC, which only sees the current message's.
+    /// DKIM verdicts of the last message on this connection that reached
+    /// the DKIM check, for the session log (at most
+    /// `dkim::MAX_SIGNATURES`; per message, so the record stays bounded).
+    /// Never used for DMARC, which only sees the current message's.
     dkim: Vec<DkimSummary>,
     /// Number of completed message transactions on this connection.
     pub(crate) message_count: usize,
@@ -349,9 +353,14 @@ pub(crate) struct UserSession<'session> {
     /// policy, and the address-to-mailbox mapping.
     #[serde(skip_serializing)]
     authority: Arc<dyn authority::RecipientResolver>,
-    /// Per-connection cache of *accepted* resolutions, keyed by
-    /// lowercased address. Refusals are never cached — every refusal
-    /// must reach the authority (the "exactly once" invariant).
+    /// Cache of *accepted* resolutions for the transaction in progress,
+    /// keyed by lowercased address. Refusals are never cached — every
+    /// refusal must reach the authority (the "exactly once" invariant).
+    /// Emptied whenever a transaction ends ([`Self::end_transaction`]), so
+    /// it holds at most [`MAX_RCPT`] entries and one connection can't grow
+    /// it with every address it has ever been accepted for
+    /// (AUDIT_20261126 R3); the next transaction asks the authority again,
+    /// which also picks up a mailbox revoked in the meantime.
     #[serde(skip_serializing)]
     rcpt_cache: HashMap<String, authority::Recipient>,
     /// Spool backend for accepted messages; None drops them (tests).
@@ -436,7 +445,15 @@ impl<'session> UserSession<'session> {
     /// verdicts and buffered data (the allocation too: an aborted 10 MiB
     /// transfer must not keep its memory for the rest of the session).
     fn clear_envelope(&mut self) {
-        self.txn = None;
+        drop(self.end_transaction());
+    }
+
+    /// End the transaction in progress: take it out of the session (`None`
+    /// without one) and drop the state that belongs to it alone, the
+    /// recipient cache.
+    fn end_transaction(&mut self) -> Option<Transaction> {
+        self.rcpt_cache = HashMap::new();
+        self.txn.take()
     }
 
     /// Log a message refused for its size (`stage`: mail_from, rcpt_to,
@@ -489,12 +506,18 @@ impl<'session> UserSession<'session> {
     ///
     /// The copies this transaction has already accepted for the same
     /// mailbox (catch-all addresses, aliases) count too, though nothing is
-    /// stored yet: each at the declared size, or at the transaction's size
-    /// limit `limit` when none was declared. Otherwise every recipient of
+    /// stored yet, each at the declared size. Otherwise every recipient of
     /// one message would be checked against the same reading, and one
     /// message to 100 addresses could put 100 copies into a full mailbox.
     /// The first copy is still checked at its declared size (0 if none),
     /// so a mailbox ends up at most one message over its quota.
+    ///
+    /// Without a declared size nothing is known yet about what the copies
+    /// cost, so none is reserved here; [`Self::recheck_quotas_for_size`]
+    /// checks them at end of data at their real size, to the same bound.
+    /// (Reserving the size limit instead defers every copy after the first
+    /// whenever the quota is no larger than the limit, as at the shipped
+    /// defaults: AUDIT_20261126 R8.)
     ///
     /// Returns `None` when the recipient may be accepted (or there is no
     /// quota or sink), `452 4.2.2` when the mailbox is full, and `451` when
@@ -504,7 +527,6 @@ impl<'session> UserSession<'session> {
         address: &str,
         mailbox: &str,
         authority_quota: Option<u64>,
-        limit: usize,
     ) -> Option<smtp::Control> {
         let (Some(quota), Some(sink)) =
             (self.storage.quota_for(authority_quota), self.sink.clone())
@@ -519,7 +541,7 @@ impl<'session> UserSession<'session> {
                 .filter(|r| r.mailbox.eq_ignore_ascii_case(mailbox))
                 .count()
         }) as u64;
-        let pending = pending_copies.saturating_mul(declared.unwrap_or(limit as u64));
+        let pending = pending_copies.saturating_mul(incoming);
         let lookup = mailbox.to_string();
         let usage = tokio::task::spawn_blocking(move || sink.usage(&lookup)).await;
         match usage {
@@ -557,17 +579,19 @@ impl<'session> UserSession<'session> {
     }
 
     /// At end of data, check the mailbox quotas again when the message is
-    /// larger than the size `declared` at MAIL FROM.
+    /// larger than the size `declared` at MAIL FROM, or when no size was
+    /// declared.
     ///
     /// [`Self::check_mailbox_quota`] counts the copies a transaction adds
     /// to one mailbox at the declared size, which the sender chooses: with
     /// `SIZE=10`, a hundred catch-all recipients all fit, and a hundred
-    /// copies of the real message would be stored. So for a message of
-    /// `received` bytes over its declaration, each mailbox in `quotas`
-    /// (see [`Transaction::quotas`]) must have room for the copies
-    /// `rcpt_to` routes to it at their real size, to the same bound as
-    /// without a declared size: at most one message over the quota. An
-    /// honest estimate (the size at most the declaration) changes nothing.
+    /// copies of the real message would be stored. Without `SIZE=` it
+    /// counts them at nothing. So for a message of `received` bytes over
+    /// its declaration (or with none), each mailbox in `quotas` (see
+    /// [`Transaction::quotas`]) must have room for the copies `rcpt_to`
+    /// routes to it at their real size: at most one message over the
+    /// quota. An honest estimate (the size at most the declaration)
+    /// changes nothing.
     ///
     /// Returns `None` when every copy fits (or nothing needs checking),
     /// `452 4.2.2` when one mailbox would go over, and `451` when a usage
@@ -579,7 +603,7 @@ impl<'session> UserSession<'session> {
         rcpt_to: &[spool::SpoolRcpt],
         quotas: &[(String, u64)],
     ) -> Option<smtp::Control> {
-        if declared.is_none_or(|declared| received <= declared) {
+        if declared.is_some_and(|declared| received <= declared) {
             return None;
         }
         let sink = self.sink.clone()?;
@@ -602,7 +626,7 @@ impl<'session> UserSession<'session> {
                         received_bytes = received,
                         declared_bytes = declared,
                         quota_bytes = quota,
-                        "message deferred: larger than its declared SIZE, and its copies don't fit the mailbox quota"
+                        "message deferred: its copies at their real size don't fit the mailbox quota"
                     );
                     return Some(smtp::Control::tempfail(MAILBOX_FULL));
                 }
@@ -899,6 +923,16 @@ impl smtp::SmtpSession for UserSession<'_> {
             );
             return smtp::Control::reject(MESSAGE_TOO_BIG);
         }
+        // RFC 5321 §4.1.2: a non-null reverse-path is a mailbox with a
+        // domain. Anything else is refused before SPF: its "domain" would
+        // be whatever follows the last `@`, which may name a real domain
+        // while giving SPF nothing to query (`ceo@victim.example@`), and
+        // the evaluation would come out `none` instead of `fail`
+        // (AUDIT_20261126 R2).
+        if !addr.is_empty() && !valid_reverse_path(addr) {
+            info!(mail_from = ?addr, "mail from refused: invalid address syntax");
+            return smtp::Control::reject(BAD_ADDRESS);
+        }
         let addr = addr.to_string();
 
         // RFC 7208 Section 2.4: the SPF identity is the MAIL FROM
@@ -1115,7 +1149,7 @@ impl smtp::SmtpSession for UserSession<'_> {
                     );
                 }
                 if let Some(reply) = self
-                    .check_mailbox_quota(&addr, &recipient.mailbox, recipient.quota_bytes, limit)
+                    .check_mailbox_quota(&addr, &recipient.mailbox, recipient.quota_bytes)
                     .await
                 {
                     return reply;
